@@ -32,7 +32,7 @@ class MonthlySummaryRow(BaseModel):
     avg_amount: Decimal
     std_amount: Decimal
     max_amount: Decimal
-    day_gaps: float
+    #day_gaps: float
     pct_trx_gap: float
     monthly_debit: Decimal
     monthly_credit: Decimal

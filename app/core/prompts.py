@@ -48,7 +48,7 @@ def account_assessment_payload(
         "Compare each month against the account's own 6-month pattern -- do this reasoning yourself, no "
         "precomputed anomaly scores are supplied. Specifically check for: month-over-month spikes in "
         "total_amount or txn_count_monthly; rising pct_burst (bursty/clustered transaction timing); irregular "
-        "day_gaps or pct_trx_gap (e.g. dormancy followed by sudden activity); shifts in debit/credit balance "
+        "pct_trx_gap (e.g. dormancy followed by sudden activity); shifts in debit/credit balance "
         "(monthly_debit vs monthly_credit, debit_count_monthly vs credit_count_monthly), e.g. flipping from "
         "credit-heavy to debit-heavy, or high matched turnover suggesting pass-through/mule-like behaviour; a "
         "high max_amount vs avg_amount ratio, i.e. one outlier transaction dominating a month; and any "

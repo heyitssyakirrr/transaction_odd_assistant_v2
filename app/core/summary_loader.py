@@ -26,7 +26,8 @@ class CustomerProfileError(RuntimeError):
 
 _REQUIRED_COLUMNS = [
     "acct_num", "year_month", "txn_count_monthly", "pct_burst", "total_amount",
-    "avg_amount", "std_amount", "max_amount", "day_gaps", "pct_trx_gap",
+    "avg_amount", "std_amount", "max_amount", #"day_gaps", 
+    "pct_trx_gap",
     "monthly_debit", "monthly_credit", "debit_count_monthly", "credit_count_monthly",
     "monthly_avg_debit", "monthly_avg_credit",
 ]
@@ -39,25 +40,26 @@ def parse_monthly_summary_csv(csv_content: str) -> list[MonthlySummaryRow]:
     No derived metrics, no scoring -- that's the LLM's job downstream.
     """
     reader = csv.DictReader(io.StringIO(csv_content))
-    fieldnames = reader.fieldnames or []
+    fieldnames = [(name or "").strip().lower() for name in (reader.fieldnames or [])]
     missing = [col for col in _REQUIRED_COLUMNS if col not in fieldnames]
     if missing:
         raise SummaryCsvError(f"CSV is missing required column(s): {', '.join(missing)}")
 
     rows: list[MonthlySummaryRow] = []
     for row_number, raw_row in enumerate(reader, start=1):
+        row = {(key or "").strip().lower(): value for key, value in raw_row.items()}
         try:
             rows.append(
                 MonthlySummaryRow(
-                    acct_num=str(raw_row["acct_num"]).strip(),
-                    year_month=str(raw_row["year_month"]).strip(),
+                    acct_num=str(row["acct_num"]).strip(),
+                    year_month=str(row["year_month"]).strip(),
                     txn_count_monthly=int(raw_row["txn_count_monthly"]),
                     pct_burst=float(raw_row["pct_burst"]),
                     total_amount=_decimal(raw_row["total_amount"]),
                     avg_amount=_decimal(raw_row["avg_amount"]),
                     std_amount=_decimal(raw_row["std_amount"]),
                     max_amount=_decimal(raw_row["max_amount"]),
-                    day_gaps=float(raw_row["day_gaps"]),
+                    #day_gaps=float(raw_row["day_gaps"]),
                     pct_trx_gap=float(raw_row["pct_trx_gap"]),
                     monthly_debit=_decimal(raw_row["monthly_debit"]),
                     monthly_credit=_decimal(raw_row["monthly_credit"]),

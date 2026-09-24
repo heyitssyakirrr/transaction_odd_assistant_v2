@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent # change based on where u put the file
 
 
 def _load_dotenv(path: Path) -> None:
