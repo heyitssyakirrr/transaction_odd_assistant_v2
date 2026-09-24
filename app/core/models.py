@@ -22,10 +22,11 @@ class MonthlySummaryRow(BaseModel):
     numeric field here as-is -- it never derives, recomputes, or scores
     from raw transactions itself.
     """
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     acct_num: str = Field(min_length=1, max_length=64)
-    year_month: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")  # "YYYYMM", e.g. 202604    txn_count_monthly: int = Field(ge=0)
+    year_month: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")  # "YYYYMM", e.g. 202604    
+    txn_count_monthly: int = Field(ge=0)
     pct_burst: float
     total_amount: Decimal
     avg_amount: Decimal
@@ -47,7 +48,7 @@ class CustomerProfileRecord(BaseModel):
     Multiple rows per account are expected: each is the profile as it stood
     for [valid_from_dttm, valid_to_dttm). A null valid_to_dttm means current.
     """
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     acct_num: str
     customer_num: str
