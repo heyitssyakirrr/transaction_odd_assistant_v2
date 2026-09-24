@@ -43,9 +43,10 @@ class Settings:
     llm_log_raw_response_max_chars: int = int(os.getenv("LLM_LOG_RAW_RESPONSE_MAX_CHARS", "20000"))
     llm_queue_maxsize: int = int(os.getenv("LLM_QUEUE_MAXSIZE", "60"))
     llm_queue_enqueue_timeout_seconds: float = float(os.getenv("LLM_QUEUE_ENQUEUE_TIMEOUT_SECONDS", "5"))
-    chunk_size: int = int(os.getenv("CHUNK_SIZE", "300"))
-    max_target_chunks: int = int(os.getenv("MAX_TARGET_CHUNKS", "6"))
-    max_target_chunks_per_review: int = int(os.getenv("MAX_TARGET_CHUNKS_PER_REVIEW", "2"))
+    customer_info_parquet_path: str = os.getenv(
+        "CUSTOMER_INFO_PARQUET_PATH",
+        str(BASE_DIR / "data" / "customer_info.parquet"), 
+    )
     max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "2200"))
     # Zero omits the parameter; only enable if the loader accepts frequency_penalty.
     llm_frequency_penalty: float = float(os.getenv("LLM_FREQUENCY_PENALTY", "0"))
@@ -58,9 +59,6 @@ class Settings:
             "LLM_CONCURRENCY": self.llm_concurrency,
             "LLM_QUEUE_MAXSIZE": self.llm_queue_maxsize,
             "LLM_QUEUE_ENQUEUE_TIMEOUT_SECONDS": self.llm_queue_enqueue_timeout_seconds,
-            "CHUNK_SIZE": self.chunk_size,
-            "MAX_TARGET_CHUNKS": self.max_target_chunks,
-            "MAX_TARGET_CHUNKS_PER_REVIEW": self.max_target_chunks_per_review,
             "MAX_RESPONSE_TOKENS": self.max_response_tokens,
             "LLM_LOG_RAW_RESPONSE_MAX_CHARS": self.llm_log_raw_response_max_chars,
         }
@@ -84,6 +82,11 @@ class Settings:
     @property
     def report_directory_path(self) -> Path:
         path = Path(self.report_directory)
+        return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def customer_info_path(self) -> Path:
+        path = Path(self.customer_info_parquet_path)
         return path if path.is_absolute() else BASE_DIR / path
 
     @property

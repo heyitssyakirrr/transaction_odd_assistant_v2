@@ -6,7 +6,7 @@
 // ever deals with "get a valid CSV to the API", nothing about rendering
 // findings.
 
-const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
 const RESULT_STORAGE_KEY = "dd:last-result";
 const DEFAULT_FILE_HINT = "Drop CSV file here";
 
@@ -68,7 +68,7 @@ function handleFileSelected(file) {
   }
 
   if (file.size > MAX_UPLOAD_BYTES) {
-    showError(`"${file.name}" is larger than the 15 MB limit for this workspace.`);
+    showError(`"${file.name}" is larger than the 2 MB limit for this workspace.`);
     els.fileInput.value = "";
     els.fileName.textContent = DEFAULT_FILE_HINT;
     return;
@@ -93,7 +93,7 @@ async function handleSubmit(event) {
   setBusy(true);
 
   try {
-    const response = await fetch("/v1/transactions/analyze-file", {
+    const response = await fetch("/v1/accounts/analyze-file", {
       method: "POST",
       body: payload,
     });

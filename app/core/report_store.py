@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from app.core.models import AnalysisResult
+from app.core.models import AccountAssessment
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,7 @@ class ReportStore:
         self._directory = directory
         self._directory.mkdir(parents=True, exist_ok=True)
 
-    def save(self, result: AnalysisResult) -> SavedReport:
+    def save(self, result: AccountAssessment) -> SavedReport:
         # A timestamp alone collides when the same customer CSV is processed
         # twice in one second. The random suffix makes report names safe for
         # concurrent requests without exposing source data in the filename.
@@ -82,7 +82,7 @@ class ReportStore:
     }
     _RISK_BORDER_COLORS = {"low": "#1c7a4d", "medium": "#8a6100", "high": "#b3261e"}
 
-    def _render_html(self, result: AnalysisResult) -> str:
+    def _render_html(self, result: AccountAssessment) -> str:
         findings = "".join(
             f"""
             <article class="finding" style="border-left-color: {self._SEVERITY_COLORS.get(finding.severity, ("#d3d6db", "#fff"))[0]}">
@@ -91,10 +91,10 @@ class ReportStore:
                 <span class="severity" style="color: {self._SEVERITY_COLORS.get(finding.severity, ("#3d4148", "#f4f3f1"))[0]}; background: {self._SEVERITY_COLORS.get(finding.severity, ("#3d4148", "#f4f3f1"))[1]}">{html.escape(finding.severity)}</span>
               </div>
               <p>{html.escape(finding.rationale)}</p>
-              <p class="confidence">Model confidence: {round(finding.confidence * 100)}%</p>
               <ul>
                 {''.join(
-                    f'<li><span class="txn-ids">{html.escape(", ".join(item.transaction_ids))}</span>'
+                    f'<li><span class="txn-ids">{html.escape(item.year_month)} &middot; '
+                    f'{html.escape(item.feature)}={html.escape(item.value)}</span>'
                     f'{html.escape(item.statement)}</li>'
                     for item in finding.evidence
                 )}
@@ -103,11 +103,6 @@ class ReportStore:
             """
             for finding in result.findings
         ) or "<p class='muted'>No traceable material findings were returned.</p>"
-
-        mitigating_section = ""
-        if result.mitigating_factors:
-            items = "".join(f"<li>{html.escape(item)}</li>" for item in result.mitigating_factors)
-            mitigating_section = f"<h2>Mitigating factors</h2><ul>{items}</ul>"
 
         risk_border = self._RISK_BORDER_COLORS.get(result.risk_level, "#d3d6db")
 
@@ -180,16 +175,14 @@ ul.plain {{ padding-left: 20px; }}
 <body>
 <header>
   <h1>Transaction Due-Diligence Assessment</h1>
-  <small>Case: {html.escape(result.case_id)}<br>Generated: {html.escape(result.generated_at.isoformat())}</small>
+  <small>Case: {html.escape(result.case_id)} &middot; Account: {html.escape(result.acct_num)}<br>Generated: {html.escape(result.generated_at.isoformat())}</small>
 </header>
 <section class="decision">
   <h2>Recommendation: {html.escape(result.decision.replace("_", " ").title())} ({html.escape(result.risk_level.title())} risk)</h2>
-  <p>{html.escape(result.decision_rationale)}</p>
 </section>
 <h2>Executive summary</h2>
 <p>{html.escape(result.executive_summary)}</p>
-<p><small>{result.transactions_processed} transactions reviewed across {result.chunks_processed} LLM segments.</small></p>
-{mitigating_section}
+<p><small>{result.months_reviewed} month(s) reviewed in this account's summary.</small></p>
 <h2>Material findings</h2>
 {findings}
 <h2>Limitations</h2>

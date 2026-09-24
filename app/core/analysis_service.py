@@ -1,36 +1,35 @@
 from __future__ import annotations
 
-import asyncio
-import re
-from collections.abc import Awaitable
+import logging
 from datetime import datetime, timezone
 from typing import Literal, TypeVar
 from uuid import uuid4
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings
-from app.core.models import AnalysisResult, AnalyzeTransactionsRequest, CaseSynthesis, ChunkReport, EvidenceItem, EvidenceReview, Finding, LlmClient, StrList
-from app.core.prompts import ANALYST_SYSTEM_PROMPT, chunk_payload, evidence_payload, final_payload, synthesis_payload
-from app.core.transaction_adapter import normalize_transactions
-from app.core.transaction_view import compact_row
 from app.core.llm_work_queue import LlmWorkQueue
+from app.core.models import AccountAnalysisRequest, AccountAssessment, AccountFinding, LlmClient, StrList
+from app.core.prompts import ANALYST_SYSTEM_PROMPT, account_assessment_payload
 
-
-class ModelOutputError(ValueError):
-    """Raised when the LLM response is not valid for the required stage schema."""
-
+logger = logging.getLogger("app.analysis_service")
 
 ModelType = TypeVar("ModelType", bound=BaseModel)
 
-_ALIAS_PATTERN = re.compile(r"\bT\d+\b")
+
+class ModelOutputError(ValueError):
+    """Raised when the LLM response is not valid for the required schema."""
 
 
 class AnalysisService:
-    """LLM-led AML workflow: chunk review, synthesis, verification, final result.
+    """LLM-led AML workflow over a pre-aggregated monthly account summary.
 
-    Application code only normalizes, orders, partitions and routes data. It
-    does not calculate an AML score, detect anomalies or write a summary.
+    Single LLM call per account: no chunking, no cross-chunk synthesis, and
+    no separate raw-evidence verification pass -- that machinery existed to
+    handle thousands of raw, unstructured transaction rows, which no longer
+    applies to a 6-row monthly summary. This service only builds the payload
+    and validates that cited year_month values exist in the supplied rows;
+    it never scores or computes anomalies itself.
     """
 
     def __init__(self, llm: LlmClient, settings: Settings, llm_queue: LlmWorkQueue) -> None:
@@ -38,81 +37,44 @@ class AnalysisService:
         self._settings = settings
         self._llm_queue = llm_queue
 
-    async def analyze_transactions(self, request: AnalyzeTransactionsRequest) -> AnalysisResult:
-        normalized = normalize_transactions(request.transactions, request.column_mapping)
-        rows = [compact_row(row) for row in normalized]
-        # Long IDs cost ~17 tokens each (digits tokenise one by one); the LLM only sees T1..Tn.
-        alias_to_id: dict[str, str] = {}
-        for index, row in enumerate(rows, start=1):
-            alias = f"T{index}"
-            alias_to_id[alias] = str(row["transaction_id"])
-            row["transaction_id"] = alias
-        chunks = self._split(rows)
-
-        reports = await self._gather_or_cancel([
-            self._review_chunk(request.case_id, index + 1, len(chunks), chunk)
-            for index, chunk in enumerate(chunks)
-        ], max_in_flight=self._settings.llm_concurrency)
-        synthesis = await self._ask(
-            request.case_id, "synthesis",
-            synthesis_payload([report.model_dump(mode="json") for report in reports], self._settings.max_target_chunks),
-            CaseSynthesis,
-        )
-        selected = self._valid_chunk_ids(synthesis.selected_chunk_ids, len(chunks))
-        reviews = await self._gather_or_cancel([
-            self._verify_evidence(request.case_id, synthesis, group, chunks)
-            for group in self._groups(selected, self._settings.max_target_chunks_per_review)
-        ], max_in_flight=self._settings.llm_concurrency)
-        final = await self._ask(
-            request.case_id, "final",
-            final_payload(synthesis.model_dump(mode="json"), [review.model_dump(mode="json") for review in reviews]),
-            _FinalOutput,
+    async def analyze_account(self, request: AccountAnalysisRequest) -> AccountAssessment:
+        valid_year_months = {row.year_month for row in request.monthly_summary}
+        payload = account_assessment_payload(
+            monthly_summary=[row.model_dump(mode="json") for row in request.monthly_summary],
+            customer_profile=[record.model_dump(mode="json") for record in request.customer_profile],
         )
 
-        verified_ids = {
-            transaction_id
-            for review in reviews
-            for finding in review.verified_findings
-            for evidence in finding.evidence
-            for transaction_id in evidence.transaction_ids
-        }
-        findings = self._restore_ids(self._validated_findings(final.verified_findings, verified_ids), alias_to_id)
-        decision, rationale = final.decision, self._restore_text(final.decision_rationale, alias_to_id)
-        if decision in {"enhanced_due_diligence", "escalate"} and not findings:
-            decision = "monitor"
-            rationale = "No material final finding was retained without verified raw-transaction evidence. Authorised human review is required."
+        raw_output = await self._ask(request.case_id, "account-assessment", payload, _RawAssessment)
 
-        return AnalysisResult(
+        findings = self._validated_findings(raw_output.findings, valid_year_months)
+        # Business rule, not model judgment: low risk closes with human
+        # verification; medium/high continue due diligence.
+        decision = "close_case" if raw_output.risk_level == "low" else "continue_due_diligence"
+        if decision == "continue_due_diligence" and not findings:
+            # Never continue due diligence on a risk_level that didn't
+            # survive grounding validation for at least one finding.
+            decision = "close_case"
+            logger.warning(
+                "case=%s: decision downgraded to close_case; risk_level=%s but no finding retained a "
+                "valid year_month citation",
+                request.case_id, raw_output.risk_level,
+            )
+
+        return AccountAssessment(
             case_id=request.case_id,
+            acct_num=request.acct_num,
             status="needs_review",
             decision=decision,
-            decision_rationale=rationale,
-            executive_summary=self._restore_text(final.executive_summary, alias_to_id),
+            risk_level=raw_output.risk_level,
+            executive_summary=raw_output.executive_summary,
             findings=findings,
-            mitigating_factors=[],
-            limitations=list(dict.fromkeys(final.limitations + synthesis.limitations + [
-                "Assessment uses only the uploaded transaction statement.",
+            limitations=list(dict.fromkeys(raw_output.limitations + [
+                "Assessment uses only the uploaded monthly summary and linked customer profile history.",
                 "LLM output is decision support and requires authorised human review.",
             ])),
-            transactions_processed=len(rows),
-            chunks_processed=len(chunks),
-            risk_level=final.risk_level,
+            months_reviewed=len(request.monthly_summary),
             generated_at=datetime.now(timezone.utc),
         )
-
-    async def _review_chunk(self, case_id: str, chunk_id: int, total: int, chunk: list[dict[str, object]]) -> ChunkReport:
-        report = await self._ask(case_id, f"chunk-{chunk_id}-of-{total}", chunk_payload(chunk_id, total, chunk), ChunkReport)
-        report.chunk_id = chunk_id
-        report.findings = self._validated_findings(report.findings, {str(row["transaction_id"]) for row in chunk})
-        return report
-
-    async def _verify_evidence(self, case_id: str, synthesis: CaseSynthesis, chunk_ids: list[int], chunks: list[list[dict[str, object]]]) -> EvidenceReview:
-        hypotheses = [item.model_dump(mode="json") for item in synthesis.case_hypotheses if set(item.related_chunk_ids).intersection(chunk_ids)]
-        raw_chunks = [{"chunk_id": chunk_id, "transactions": chunks[chunk_id - 1]} for chunk_id in chunk_ids]
-        review = await self._ask(case_id, f"evidence-chunks-{'-'.join(map(str, chunk_ids))}", evidence_payload(hypotheses, raw_chunks), EvidenceReview)
-        valid_ids = {str(row["transaction_id"]) for raw_chunk in raw_chunks for row in raw_chunk["transactions"]}
-        review.verified_findings = self._validated_findings(review.verified_findings, valid_ids)
-        return review
 
     async def _ask(self, case_id: str, stage: str, payload: dict[str, object], model: type[ModelType]) -> ModelType:
         raw = await self._llm_queue.submit(
@@ -126,85 +88,26 @@ class AnalysisService:
         except ValidationError as exc:
             raise ModelOutputError(f"LLM JSON does not match the required schema: {exc}") from exc
 
-    def _split(self, rows: list[dict[str, object]]) -> list[list[dict[str, object]]]:
-        if not rows:
-            raise ValueError("The statement contains no valid transactions.")
-        return [rows[index:index + self._settings.chunk_size] for index in range(0, len(rows), self._settings.chunk_size)]
-
-    def _valid_chunk_ids(self, proposed: list[int], total: int) -> list[int]:
-        selected: list[int] = []
-        for chunk_id in proposed:
-            if isinstance(chunk_id, int) and 1 <= chunk_id <= total and chunk_id not in selected:
-                selected.append(chunk_id)
-        return selected[:self._settings.max_target_chunks]
-
     @staticmethod
-    def _groups(values: list[int], size: int) -> list[list[int]]:
-        return [values[index:index + size] for index in range(0, len(values), size)]
-
-    @staticmethod
-    async def _gather_or_cancel(
-        awaitables: list[Awaitable[ModelType]], *, max_in_flight: int
-    ) -> list[ModelType]:
-        """Run a stage with bounded fan-out and cancel it if one job fails.
-
-        A large statement submits only a few chunks at a time rather than
-        filling the shared queue ahead of other customer cases. This preserves
-        capacity for independently submitted work while the global queue still
-        enforces the absolute LLM limit.
-        """
-        semaphore = asyncio.Semaphore(max_in_flight)
-
-        async def guarded(item: Awaitable[ModelType]) -> ModelType:
-            async with semaphore:
-                return await item
-
-        tasks = [asyncio.create_task(guarded(item)) for item in awaitables]
-        try:
-            return await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-    @staticmethod
-    def _validated_findings(findings: list[Finding], allowed_ids: set[str]) -> list[Finding]:
-        retained: list[Finding] = []
+    def _validated_findings(findings: list[AccountFinding], allowed_year_months: set[str]) -> list[AccountFinding]:
+        retained: list[AccountFinding] = []
         for finding in findings:
-            evidence = [
-                EvidenceItem(transaction_ids=item.transaction_ids, statement=item.statement)
-                for item in finding.evidence
-                if item.transaction_ids and set(item.transaction_ids).issubset(allowed_ids)
-            ]
+            evidence = [item for item in finding.evidence if item.year_month in allowed_year_months]
             if evidence:
                 finding.finding_id = finding.finding_id or str(uuid4())
                 finding.evidence = evidence
                 retained.append(finding)
         return retained
 
-    @staticmethod
-    def _restore_text(text: str, alias_to_id: dict[str, str]) -> str:
-        return _ALIAS_PATTERN.sub(lambda match: alias_to_id.get(match.group(0), match.group(0)), text)
 
-    @classmethod
-    def _restore_ids(cls, findings: list[Finding], alias_to_id: dict[str, str]) -> list[Finding]:
-        for finding in findings:
-            finding.rationale = cls._restore_text(finding.rationale, alias_to_id)
-            finding.evidence = [
-                EvidenceItem(
-                    transaction_ids=[alias_to_id[alias] for alias in item.transaction_ids],
-                    statement=cls._restore_text(item.statement, alias_to_id),
-                )
-                for item in finding.evidence
-            ]
-        return findings
+class _RawAssessment(BaseModel):
+    """Wire shape returned by the LLM, before finding-level grounding validation.
 
-
-class _FinalOutput(BaseModel):
-    decision: Literal["no_action", "monitor", "request_information", "enhanced_due_diligence", "escalate"]
-    decision_rationale: str
-    executive_summary: str
+    decision is deliberately not asked of the model: it's a deterministic
+    mapping from risk_level (see analyze_account), so the two fields can
+    never disagree with each other.
+    """
     risk_level: Literal["low", "medium", "high"]
-    verified_findings: list[Finding]
-    limitations: StrList
+    executive_summary: str = Field(max_length=1_200)
+    findings: list[AccountFinding] = Field(default_factory=list, max_length=10)
+    limitations: StrList = Field(default_factory=list, max_length=8)

@@ -15,97 +15,83 @@ def _as_list(value: Any) -> Any:
 StrList = Annotated[list[str], BeforeValidator(_as_list)]
 
 
-class TransactionColumnMapping(BaseModel):
-    transaction_id: str
-    timestamp: str
-    amount: str
-    direction: str
-    currency: str | None = None
-    counterparty: str | None = None
-    description: str | None = None
-    channel: str | None = None
-    merchant_category: str | None = None
-    balance: str | None = None
+class MonthlySummaryRow(BaseModel):
+    """One month of pre-aggregated per-account transaction features.
+
+    Produced upstream by the aggregation job. This service treats every
+    numeric field here as-is -- it never derives, recomputes, or scores
+    from raw transactions itself.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    acct_num: str = Field(min_length=1, max_length=64)
+    year_month: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")  # "YYYYMM", e.g. 202604    txn_count_monthly: int = Field(ge=0)
+    pct_burst: float
+    total_amount: Decimal
+    avg_amount: Decimal
+    std_amount: Decimal
+    max_amount: Decimal
+    day_gaps: float
+    pct_trx_gap: float
+    monthly_debit: Decimal
+    monthly_credit: Decimal
+    debit_count_monthly: int = Field(ge=0)
+    credit_count_monthly: int = Field(ge=0)
+    monthly_avg_debit: Decimal
+    monthly_avg_credit: Decimal
 
 
-class AnalyzeTransactionsRequest(BaseModel):
+class CustomerProfileRecord(BaseModel):
+    """One SCD Type 2 version of a customer's profile from custmer_info.
+
+    Multiple rows per account are expected: each is the profile as it stood
+    for [valid_from_dttm, valid_to_dttm). A null valid_to_dttm means current.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    acct_num: str
+    customer_num: str
+    occupation_cd: str | None = None
+    citizen_cd: str | None = None
+    indv_org_type: str | None = None
+    last_maint_dt: datetime | None = None
+    valid_from_dttm: datetime
+    valid_to_dttm: datetime | None = None
+
+
+class AccountAnalysisRequest(BaseModel):
     case_id: str = Field(min_length=1, max_length=128)
     source_filename: str = Field(min_length=1, max_length=255)
-    column_mapping: TransactionColumnMapping
-    transactions: list[dict[str, Any]] = Field(
-        min_length=1,
-        max_length=10_000,
-    )
+    acct_num: str = Field(min_length=1, max_length=64)
+    monthly_summary: list[MonthlySummaryRow] = Field(min_length=1, max_length=6)
+    customer_profile: list[CustomerProfileRecord] = Field(default_factory=list, max_length=50)
 
 
-class NormalizedTransaction(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    transaction_id: str = Field(min_length=1, max_length=128)
-    timestamp: datetime
-    amount: Decimal = Field(ge=0)
-    direction: Literal["credit", "debit"]
-    currency: str | None = None
-    counterparty: str | None = None
-    description: str | None = None
-    channel: str | None = None
-    merchant_category: str | None = None
-    balance: Decimal | None = None
-
-
-class EvidenceItem(BaseModel):
-    transaction_ids: list[str] = Field(default_factory=list)
+class MonthlyEvidenceItem(BaseModel):
+    year_month: str
+    feature: str
+    value: str
     statement: str
 
 
-class Finding(BaseModel):
+class AccountFinding(BaseModel):
     finding_id: str = ""
     category: str
     severity: Literal["low", "medium", "high", "critical"]
-    confidence: float = Field(ge=0, le=1)
+    evidence: list[MonthlyEvidenceItem] = Field(default_factory=list)
     rationale: str
-    evidence: list[EvidenceItem] = Field(default_factory=list)
 
 
-class ChunkReport(BaseModel):
-    chunk_id: int = Field(ge=1)
-    material_activity_summary: str = Field(min_length=1, max_length=1_400)
-    findings: list[Finding] = Field(default_factory=list, max_length=8)
-    entities_of_interest: StrList = Field(default_factory=list, max_length=20)
-    cross_chunk_review_needed: bool
-
-
-class CaseHypothesis(BaseModel):
-    hypothesis_id: str = Field(min_length=1, max_length=40)
-    pattern: str = Field(min_length=1, max_length=500)
-    severity: Literal["low", "medium", "high", "critical"]
-    related_chunk_ids: list[int] = Field(min_length=1, max_length=6)
-    rationale: str = Field(min_length=1, max_length=900)
-
-
-class CaseSynthesis(BaseModel):
-    whole_statement_summary: str = Field(min_length=1, max_length=1_800)
-    case_hypotheses: list[CaseHypothesis] = Field(default_factory=list, max_length=10)
-    selected_chunk_ids: list[int] = Field(default_factory=list, max_length=6)
-    limitations: StrList = Field(default_factory=list, max_length=8)
-
-
-class EvidenceReview(BaseModel):
-    verified_findings: list[Finding] = Field(default_factory=list, max_length=10)
-    disproved_or_uncertain_hypotheses: StrList = Field(default_factory=list, max_length=10)
-
-
-class AnalysisResult(BaseModel):
+class AccountAssessment(BaseModel):
     case_id: str
+    acct_num: str
     status: Literal["completed", "needs_review"]
-    decision: Literal["no_action", "monitor", "request_information", "enhanced_due_diligence", "escalate"]
-    decision_rationale: str
-    executive_summary: str
-    findings: list[Finding]
-    mitigating_factors: list[str] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
-    transactions_processed: int
-    chunks_processed: int
+    decision: Literal["close_case", "continue_due_diligence"]
     risk_level: Literal["low", "medium", "high"]
+    executive_summary: str
+    findings: list[AccountFinding]
+    limitations: list[str] = Field(default_factory=list)
+    months_reviewed: int
     generated_at: datetime
 
 

@@ -58,7 +58,7 @@ app.mount(
     name="static",
 )
 
-app.include_router(build_router(service, report_store))
+app.include_router(build_router(service, report_store, settings.customer_info_path))
 
 
 @app.get("/", include_in_schema=False)

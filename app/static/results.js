@@ -1,7 +1,3 @@
-// Results page — renders whatever the upload page stored right before it
-// navigated here. If nothing is stored (direct link, page refresh after
-// clearing storage, etc.), we show the empty state instead of a blank page.
-
 const RESULT_STORAGE_KEY = "dd:last-result";
 const SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
 
@@ -12,14 +8,11 @@ const els = {
   generatedAt: document.querySelector("#generated-at"),
   decisionCard: document.querySelector("#decision-card"),
   decision: document.querySelector("#decision"),
-  decisionRationale: document.querySelector("#decision-rationale"),
   riskBadge: document.querySelector("#risk-badge"),
-  transactionCount: document.querySelector("#transaction-count"),
-  segmentsCount: document.querySelector("#segments-count"),
+  acctNum: document.querySelector("#acct-num"),
+  monthsReviewed: document.querySelector("#months-reviewed"),
   riskLevel: document.querySelector("#risk-level"),
   summary: document.querySelector("#summary"),
-  mitigatingSection: document.querySelector("#mitigating-section"),
-  mitigatingFactors: document.querySelector("#mitigating-factors"),
   findings: document.querySelector("#findings"),
   findingsCount: document.querySelector("#findings-count"),
   limitations: document.querySelector("#limitations"),
@@ -60,18 +53,16 @@ function renderResult(data) {
 
   els.decisionCard.className = `decision-card risk-${data.risk_level}`;
   els.decision.textContent = formatEnum(data.decision);
-  els.decisionRationale.textContent = data.decision_rationale;
 
   els.riskBadge.textContent = `${data.risk_level.toUpperCase()} RISK`;
   els.riskBadge.className = `risk-badge risk-${data.risk_level}`;
 
-  els.transactionCount.textContent = data.transactions_processed.toLocaleString();
-  els.segmentsCount.textContent = data.chunks_processed.toLocaleString();
+  els.acctNum.textContent = data.acct_num;
+  els.monthsReviewed.textContent = data.months_reviewed;
   els.riskLevel.textContent = data.risk_level.toUpperCase();
 
   els.summary.textContent = data.executive_summary;
 
-  renderMitigatingFactors(data.mitigating_factors || []);
   renderFindings(data.findings || []);
 
   els.limitations.innerHTML = (data.limitations || [])
@@ -82,18 +73,6 @@ function renderResult(data) {
   els.reportJsonLink.href = data.report_json;
 }
 
-function renderMitigatingFactors(factors) {
-  if (!factors.length) {
-    els.mitigatingSection.classList.add("hidden");
-    return;
-  }
-
-  els.mitigatingSection.classList.remove("hidden");
-  els.mitigatingFactors.innerHTML = factors
-    .map((item) => `<li>${escapeHtml(item)}</li>`)
-    .join("");
-}
-
 function renderFindings(findings) {
   els.findingsCount.textContent = findings.length
     ? `${findings.length} finding${findings.length === 1 ? "" : "s"}`
@@ -101,7 +80,7 @@ function renderFindings(findings) {
 
   if (!findings.length) {
     els.findings.innerHTML =
-      "<p class='muted'>No material finding with verified transaction evidence was returned.</p>";
+      "<p class='muted'>No material finding with a verified year_month citation was returned.</p>";
     return;
   }
 
@@ -115,7 +94,7 @@ function renderFindings(findings) {
         .map(
           (item) => `
             <li>
-              <span class="transaction-ids">${escapeHtml(item.transaction_ids.join(", "))}</span>
+              <span class="transaction-ids">${escapeHtml(item.year_month)} &middot; ${escapeHtml(item.feature)}=${escapeHtml(item.value)}</span>
               <span>${escapeHtml(item.statement)}</span>
             </li>`
         )
@@ -128,8 +107,7 @@ function renderFindings(findings) {
             <span class="severity ${escapeHtml(finding.severity)}">${escapeHtml(finding.severity)}</span>
           </div>
           <p>${escapeHtml(finding.rationale)}</p>
-          <p class="confidence">Model confidence: ${Math.round(finding.confidence * 100)}%</p>
-          <h5>Verified evidence</h5>
+          <h5>Evidence</h5>
           <ul>${evidenceItems}</ul>
         </article>`;
     })

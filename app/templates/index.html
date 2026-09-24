@@ -23,9 +23,9 @@
       <p class="eyebrow">Transaction review</p>
       <h1>Analyse customer statements with <em>clarity and confidence</em></h1>
       <p class="upload-hero-lead">
-        Upload one customer statement. Common transaction columns are detected
-        automatically, and the system runs an evidence-led AML review. You'll be
-        taken to a results page once the assessment is ready.
+        Upload one account's 6-month monthly summary. Linked customer profile
+        history is joined automatically, and the system runs a single-pass
+        AML review. You'll be taken to a results page once the assessment is ready.
       </p>
     </section>
 
@@ -39,13 +39,15 @@
         <label id="file-field" class="file-field" for="file">
           <span class="file-field-icon" aria-hidden="true">&uarr;</span>
           <span id="file-name" class="file-field-title">Drop CSV file here</span>
-          <span class="file-field-hint">or click to browse &middot; .csv up to 15 MB</span>
+          <span class="file-field-hint">or click to browse &middot; .csv up to 2 MB</span>
           <input id="file" type="file" accept=".csv,text/csv" required>
         </label>
 
         <p class="upload-note">
-          Expected columns include Date, Description, Debit, Credit, Amount,
-          Balance, Reference, and Transaction ID.
+          Expected columns: acct_num, year_month, txn_count_monthly, pct_burst,
+          total_amount, avg_amount, std_amount, max_amount, day_gaps, pct_trx_gap,
+          monthly_debit, monthly_credit, debit_count_monthly, credit_count_monthly,
+          monthly_avg_debit, monthly_avg_credit.
         </p>
 
         <div id="error" class="error hidden" role="alert"></div>
