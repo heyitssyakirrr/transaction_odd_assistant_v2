@@ -87,7 +87,7 @@ class OpenAICompatibleClient:
             )
 
         headers = self._build_headers()
-        body = self._build_body(system_prompt, user_payload, use_response_format=False)
+        body = self._build_body(system_prompt, user_payload, use_response_format=True)
         self._validate_context_budget(body)
         payload = await self._post_with_retries(body, headers)
 
@@ -141,7 +141,7 @@ class OpenAICompatibleClient:
         if self._settings.llm_frequency_penalty:
             body["frequency_penalty"] = self._settings.llm_frequency_penalty
         if use_response_format:
-            body["response_format"] = {"type": "json_object"}
+            body["response_format"] = {"type": "json_schema"}
         return body
 
     async def _post_with_retries(self, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
