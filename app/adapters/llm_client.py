@@ -79,7 +79,14 @@ class OpenAICompatibleClient:
             verify=False
         )
 
-    async def complete_json(self, *, system_prompt: str, user_payload: dict[str, Any]) -> dict[str, Any]:
+    async def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
+    ) -> dict[str, Any]:
         if not self._settings.llm_base_url:
             raise LlmServiceError(
                 "LLM_BASE_URL is not configured. Copy .env.example to .env in the "
@@ -87,7 +94,13 @@ class OpenAICompatibleClient:
             )
 
         headers = self._build_headers()
-        body = self._build_body(system_prompt, user_payload, use_response_format=True)
+        body = self._build_body(
+            system_prompt,
+            user_payload,
+            use_response_format=True,
+            response_schema=response_schema,
+            schema_name=schema_name,
+        )
         self._validate_context_budget(body)
         payload = await self._post_with_retries(body, headers)
 
@@ -120,15 +133,24 @@ class OpenAICompatibleClient:
         return headers
 
     def _build_body(
-        self, system_prompt: str, user_payload: dict[str, Any], *, use_response_format: bool
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        *,
+        use_response_format: bool,
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> dict[str, Any]:
-        # Match the shape confirmed to work against this same LLM loader
-        # elsewhere in the org: a single "user" message (no "system" role),
-        # no response_format (avoid triggering schema-guided decoding, which
-        # has been observed to crash the backend worker on this loader), and
-        # an explicit stream flag. use_response_format is kept as a manual
-        # opt-in switch for later, once confirmed supported by the platform
-        # team, rather than something this client turns on by default.
+        # use_response_format opts into schema-guided decoding. A bare
+        # {"type": "json_schema"} with no nested "json_schema" object is NOT
+        # a valid response_format and is silently ignored/no-ops on most
+        # OpenAI-compatible loaders (confirmed against this org's loader:
+        # sending it produced unconstrained, occasionally malformed JSON,
+        # identical to sending nothing at all). The real schema MUST be
+        # nested under json_schema.schema, generated from the same Pydantic
+        # model that will validate the response (see analysis_service._ask),
+        # so drift between the prompt's schema and the enforced schema is
+        # impossible by construction.
         combined_prompt = f"{system_prompt}\n\n{json.dumps(user_payload, ensure_ascii=False, default=str)}"
         body: dict[str, Any] = {
             "model": self._settings.llm_model,
@@ -140,8 +162,15 @@ class OpenAICompatibleClient:
         }
         if self._settings.llm_frequency_penalty:
             body["frequency_penalty"] = self._settings.llm_frequency_penalty
-        if use_response_format:
-            body["response_format"] = {"type": "json_schema"}
+        if use_response_format and response_schema:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": response_schema,
+                    "strict": True,
+                },
+            }
         return body
 
     async def _post_with_retries(self, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:

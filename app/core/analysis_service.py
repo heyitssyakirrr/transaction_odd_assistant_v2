@@ -112,9 +112,17 @@ class AnalysisService:
         }
 
     async def _ask(self, case_id: str, stage: str, payload: dict[str, object], model: type[ModelType]) -> ModelType:
+        # Generate the schema from the SAME Pydantic model that will validate
+        # the response below, so the schema sent to the loader for guided
+        # decoding and the schema enforced client-side can never drift apart.
         raw = await self._llm_queue.submit(
             name=f"case={case_id} stage={stage}",
-            operation=lambda: self._llm.complete_json(system_prompt=ANALYST_SYSTEM_PROMPT, user_payload=payload),
+            operation=lambda: self._llm.complete_json(
+                system_prompt=ANALYST_SYSTEM_PROMPT,
+                user_payload=payload,
+                response_schema=model.model_json_schema(),
+                schema_name=model.__name__,
+            ),
         )
         try:
             if set(raw) == {"response_schema"} and isinstance(raw["response_schema"], dict):
