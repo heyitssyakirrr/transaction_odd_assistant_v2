@@ -530,6 +530,21 @@ button:disabled { cursor: wait; opacity: .65; }
 }
 
 .muted { color: var(--muted); }
+
+.section-hint { margin: -6px 0 14px; font-size: 13px; color: var(--muted); }
+
+.plain-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+.plain-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13.5px;
+}
+.plain-list-label { font-weight: 600; color: var(--ink); }
 .hidden { display: none !important; }
 
 @keyframes spin { to { transform: rotate(360deg); } }

@@ -47,6 +47,12 @@ class Settings:
         "CUSTOMER_INFO_PARQUET_PATH",
         str(BASE_DIR / "data" / "customer_info.parquet"), 
     )
+    # CSV with columns CODE, D_CUST_OCCUPAT -- maintained by compliance,
+    # loaded and cached at analysis time (see app/core/reference_data.py).
+    occupation_code_csv_path: str = os.getenv(
+        "OCCUPATION_CODE_CSV_PATH",
+        str(BASE_DIR / "data" / "occupation_codes.csv"),
+    )
     max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "2200"))
     # Zero omits the parameter; only enable if the loader accepts frequency_penalty.
     llm_frequency_penalty: float = float(os.getenv("LLM_FREQUENCY_PENALTY", "0"))
@@ -87,6 +93,11 @@ class Settings:
     @property
     def customer_info_path(self) -> Path:
         path = Path(self.customer_info_parquet_path)
+        return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def occupation_code_path(self) -> Path:
+        path = Path(self.occupation_code_csv_path)
         return path if path.is_absolute() else BASE_DIR / path
 
     @property

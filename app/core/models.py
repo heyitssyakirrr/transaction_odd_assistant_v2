@@ -83,6 +83,28 @@ class AccountFinding(BaseModel):
     rationale: str
 
 
+class MonthlyComparisonNote(BaseModel):
+    """The LLM's own plain-language comparison of one feature across the
+    account's 6 months, produced BEFORE findings so findings are visibly
+    grounded in a comparison rather than appearing from nowhere.
+    """
+    feature: str
+    pattern_summary: str = Field(max_length=200)
+    notable_months: StrList = Field(default_factory=list)
+
+
+class ProfileTimelineNote(BaseModel):
+    """A customer_profile change and whether its timing overlaps a
+    transaction-pattern change noted in monthly_comparison. The changed
+    field's *value* (occupation, citizenship) is never itself a risk
+    signal -- only the timing of the change is.
+    """
+    field: str
+    change_summary: str = Field(max_length=200)
+    change_dttm: datetime | None = None
+    coincides_with_txn_pattern: bool = False
+
+
 class AccountAssessment(BaseModel):
     case_id: str
     acct_num: str
@@ -90,6 +112,8 @@ class AccountAssessment(BaseModel):
     decision: Literal["close_case", "continue_due_diligence"]
     risk_level: Literal["low", "medium", "high"]
     executive_summary: str
+    monthly_comparison: list[MonthlyComparisonNote] = Field(default_factory=list)
+    profile_notes: list[ProfileTimelineNote] = Field(default_factory=list)
     findings: list[AccountFinding]
     limitations: list[str] = Field(default_factory=list)
     months_reviewed: int
