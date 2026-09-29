@@ -55,7 +55,7 @@ class Settings:
     )
     # The compact single-account decision has a deliberately small completion
     # budget. A larger limit lets a misconfigured chat template run away.
-    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "700"))
+    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "1200"))
     # Qwen's low-variance sampling defaults. Set only parameters accepted by
     # the bank's OpenAI-compatible loader.
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0"))

@@ -93,8 +93,7 @@ class ReportStore:
               <p>{html.escape(finding.rationale)}</p>
               <ul>
                 {''.join(
-                    f'<li><span class="txn-ids">{html.escape(item.year_month)} &middot; '
-                    f'{html.escape(item.feature)}={html.escape(item.value)}</span></li>'
+                    f'<li><span class="txn-ids">{html.escape(item.label)}={html.escape(item.value)}</span></li>'
                     for item in finding.evidence
                 )}
               </ul>
@@ -102,6 +101,23 @@ class ReportStore:
             """
             for finding in result.findings
         ) or "<p class='muted'>No traceable material findings were returned.</p>"
+
+        review_checks = "".join(
+            f"""
+            <article class="finding">
+              <div class="finding-head">
+                <h3>{html.escape(check.check.replace('_', ' ').title())}</h3>
+                <span class="severity" style="color: #3d4148; background: #f4f3f1">{html.escape(check.outcome.replace('_', ' ').upper())}</span>
+              </div>
+              <p>{html.escape(check.rationale)}</p>
+              <ul>{''.join(f'<li><span class="txn-ids">{html.escape(item.label)}={html.escape(item.value)}</span></li>' for item in check.evidence)}</ul>
+            </article>
+            """
+            for check in result.review_checks
+        )
+        reviewer_questions = "".join(
+            f"<li>{html.escape(question)}</li>" for question in result.reviewer_questions
+        ) or "<li class='muted'>No additional reviewer question was returned.</li>"
 
         risk_border = self._RISK_BORDER_COLORS.get(result.risk_level, "#d3d6db")
 
@@ -182,8 +198,12 @@ ul.plain {{ padding-left: 20px; }}
 <h2>Executive summary</h2>
 <p>{html.escape(result.executive_summary)}</p>
 <p><small>{result.months_reviewed} month(s) reviewed; {result.profile_records_matched} linked profile record(s) available.</small></p>
+<h2>Mandatory review coverage</h2>
+{review_checks}
 <h2>Material findings</h2>
 {findings}
+<h2>Reviewer focus</h2>
+<ul class="plain">{reviewer_questions}</ul>
 <h2>Limitations</h2>
 <ul class="plain">{''.join(f'<li>{html.escape(item)}</li>' for item in result.limitations) or '<li class="muted">None recorded.</li>'}</ul>
 </body>

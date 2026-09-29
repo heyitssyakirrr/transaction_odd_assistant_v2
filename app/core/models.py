@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 RiskLevel = Literal["low", "medium", "high"]
+FindingSeverity = Literal["medium", "high"]
 FindingCategory = Literal[
     "dormancy_reactivation",
     "activity_spike",
@@ -15,6 +16,15 @@ FindingCategory = Literal[
     "burst_activity",
     "unusual_variability",
 ]
+ReviewCheckName = Literal[
+    "dormancy_reactivation",
+    "activity_value_change",
+    "debit_credit_flow",
+    "burst_and_gaps",
+    "profile_consistency",
+]
+ReviewOutcome = Literal["observed", "not_observed", "insufficient_data"]
+ProfileEvidenceSource = Literal["monthly_summary", "customer_profile"]
 
 
 class MonthlySummaryRow(BaseModel):
@@ -62,21 +72,30 @@ class AccountAnalysisRequest(BaseModel):
     customer_profile: list[CustomerProfileRecord] = Field(default_factory=list)
 
 
-class MonthlyEvidenceItem(BaseModel):
-    """An exact source value, hydrated by the application rather than the model."""
+class EvidenceItem(BaseModel):
+    """An exact source value hydrated by the application, never invented by the model."""
 
     evidence_id: str
-    year_month: str
-    feature: str
+    source: ProfileEvidenceSource
+    label: str
     value: str
 
 
 class AccountFinding(BaseModel):
     finding_id: str
     category: FindingCategory
-    severity: RiskLevel
+    severity: FindingSeverity
     rationale: str = Field(min_length=1, max_length=360)
-    evidence: list[MonthlyEvidenceItem] = Field(min_length=1, max_length=4)
+    evidence: list[EvidenceItem] = Field(min_length=1, max_length=4)
+
+
+class ReviewCheck(BaseModel):
+    """One mandatory AML review dimension, including a negative result."""
+
+    check: ReviewCheckName
+    outcome: ReviewOutcome
+    rationale: str = Field(min_length=1, max_length=360)
+    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=4)
 
 
 class AccountAssessment(BaseModel):
@@ -86,7 +105,9 @@ class AccountAssessment(BaseModel):
     decision: Literal["close_case", "continue_due_diligence"]
     risk_level: RiskLevel
     executive_summary: str
+    review_checks: list[ReviewCheck] = Field(min_length=5, max_length=5)
     findings: list[AccountFinding] = Field(default_factory=list)
+    reviewer_questions: list[str] = Field(default_factory=list, max_length=3)
     limitations: list[str] = Field(default_factory=list)
     months_reviewed: int
     profile_records_matched: int

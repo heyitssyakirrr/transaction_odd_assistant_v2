@@ -14,8 +14,10 @@ const els = {
   profileRecordsMatched: document.querySelector("#profile-records-matched"),
   riskLevel: document.querySelector("#risk-level"),
   summary: document.querySelector("#summary"),
+  reviewChecks: document.querySelector("#review-checks"),
   findings: document.querySelector("#findings"),
   findingsCount: document.querySelector("#findings-count"),
+  reviewerQuestions: document.querySelector("#reviewer-questions"),
   limitations: document.querySelector("#limitations"),
   reportHtmlLink: document.querySelector("#report-html-link"),
   reportJsonLink: document.querySelector("#report-json-link"),
@@ -65,7 +67,12 @@ function renderResult(data) {
 
   els.summary.textContent = data.executive_summary;
 
+  renderReviewChecks(data.review_checks || []);
   renderFindings(data.findings || []);
+
+  els.reviewerQuestions.innerHTML = (data.reviewer_questions || [])
+    .map((question) => `<li>${escapeHtml(question)}</li>`)
+    .join("") || "<li class='muted'>No additional reviewer question was returned.</li>";
 
   els.limitations.innerHTML = (data.limitations || [])
     .map((item) => `<li>${escapeHtml(item)}</li>`)
@@ -73,6 +80,27 @@ function renderResult(data) {
 
   els.reportHtmlLink.href = data.report_html;
   els.reportJsonLink.href = data.report_json;
+}
+
+function renderReviewChecks(checks) {
+  if (!checks.length) {
+    els.reviewChecks.innerHTML = "<p class='muted'>Review coverage was not returned.</p>";
+    return;
+  }
+
+  els.reviewChecks.innerHTML = checks.map((check) => {
+    const outcomeClass = check.outcome === "observed" ? "medium" : "low";
+    const evidenceItems = renderEvidenceItems(check.evidence || []);
+    return `
+      <article class="finding severity-${outcomeClass}">
+        <div class="finding-header">
+          <h4>${escapeHtml(formatEnum(check.check))}</h4>
+          <span class="severity ${outcomeClass}">${escapeHtml(formatEnum(check.outcome))}</span>
+        </div>
+        <p>${escapeHtml(check.rationale)}</p>
+        ${evidenceItems ? `<h5>Evidence reviewed</h5><ul>${evidenceItems}</ul>` : ""}
+      </article>`;
+  }).join("");
 }
 
 function renderFindings(findings) {
@@ -92,9 +120,7 @@ function renderFindings(findings) {
 
   els.findings.innerHTML = sorted
     .map((finding) => {
-      const evidenceItems = (finding.evidence || []).map((item) =>
-        `<li><span class="transaction-ids">${escapeHtml(item.year_month)} &middot; ${escapeHtml(item.feature)}=${escapeHtml(item.value)}</span></li>`
-      ).join("");
+      const evidenceItems = renderEvidenceItems(finding.evidence || []);
 
       return `
         <article class="finding severity-${escapeHtml(finding.severity)}">
@@ -108,6 +134,12 @@ function renderFindings(findings) {
         </article>`;
     })
     .join("");
+}
+
+function renderEvidenceItems(evidence) {
+  return evidence.map((item) =>
+    `<li><span class="transaction-ids">${escapeHtml(item.label)}=${escapeHtml(item.value)}</span></li>`
+  ).join("");
 }
 
 function formatEnum(value) {
