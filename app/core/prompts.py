@@ -44,7 +44,7 @@ examples, placeholders, arrays, nested objects, task keys, or extra keys. The ob
 
 Each outcome is exactly observed or not_observed. Each *_months value contains exactly two different supplied months
 as YYYYMM,YYYYMM with no spaces when its outcome is observed; it is a comparison pair, not an evidence identifier.
-When its outcome is not_observed, set its *_months value to exactly none. Never output N/A, M, field names, or an
+When its outcome is not_observed, set its *_months value to the JSON string "none". Never output N/A, M, field names, or an
 underscore in a *_months value. Each context must mention only what the selected months and their rows show. The
 executive summary must not say reactivation or dormancy unless dormancy_outcome is observed. After the final } output
 no other character.
