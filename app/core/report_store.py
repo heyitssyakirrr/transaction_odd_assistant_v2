@@ -116,7 +116,9 @@ class ReportStore:
             for check in result.review_checks
         )
         reviewer_questions = "".join(
-            f"<li>{html.escape(question)}</li>" for question in result.reviewer_questions
+            f"<li>{html.escape(question.question)}"
+            f"<br><span class='txn-ids'>{html.escape('; '.join(f'{item.label}={item.value}' for item in question.evidence))}</span>"
+            f"</li>" for question in result.reviewer_questions
         ) or "<li class='muted'>No additional reviewer question was returned.</li>"
 
         risk_border = self._RISK_BORDER_COLORS.get(result.risk_level, "#d3d6db")
@@ -205,6 +207,6 @@ ul.plain {{ padding-left: 20px; }}
 <h2>Reviewer focus</h2>
 <ul class="plain">{reviewer_questions}</ul>
 <h2>Limitations</h2>
-<ul class="plain">{''.join(f'<li>{html.escape(item)}</li>' for item in result.limitations) or '<li class="muted">None recorded.</li>'}</ul>
+<ul class="plain">{''.join(f'<li>{html.escape(item.limitation)}</li>' for item in result.limitations) or '<li class="muted">None recorded.</li>'}</ul>
 </body>
 </html>"""

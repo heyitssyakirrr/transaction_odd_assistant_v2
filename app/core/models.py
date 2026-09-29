@@ -15,6 +15,7 @@ FindingCategory = Literal[
     "flow_imbalance",
     "burst_activity",
     "unusual_variability",
+    "profile_activity_mismatch",
 ]
 ReviewCheckName = Literal[
     "dormancy_reactivation",
@@ -98,6 +99,16 @@ class ReviewCheck(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list, max_length=4)
 
 
+class ReviewerQuestion(BaseModel):
+    question: str = Field(min_length=1, max_length=300)
+    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=4)
+
+
+class AssessmentLimitation(BaseModel):
+    limitation: str = Field(min_length=1, max_length=300)
+    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=4)
+
+
 class AccountAssessment(BaseModel):
     case_id: str
     acct_num: str
@@ -107,8 +118,8 @@ class AccountAssessment(BaseModel):
     executive_summary: str
     review_checks: list[ReviewCheck] = Field(min_length=5, max_length=5)
     findings: list[AccountFinding] = Field(default_factory=list)
-    reviewer_questions: list[str] = Field(default_factory=list, max_length=3)
-    limitations: list[str] = Field(default_factory=list)
+    reviewer_questions: list[ReviewerQuestion] = Field(default_factory=list, max_length=3)
+    limitations: list[AssessmentLimitation] = Field(default_factory=list)
     months_reviewed: int
     profile_records_matched: int
     generated_at: datetime

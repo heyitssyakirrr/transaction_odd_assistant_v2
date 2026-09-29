@@ -63,10 +63,9 @@ class Settings:
     # This is a vLLM/Qwen extension rather than a portable OpenAI parameter.
     # Leave disabled unless the bank loader is confirmed to accept it.
     llm_repetition_penalty: float = float(os.getenv("LLM_REPETITION_PENALTY", "0"))
-    # "json_schema" is the current OpenAI/vLLM contract. Older vLLM loaders
-    # may require "guided_json" instead; only use it after platform confirms
-    # that request field is supported.
-    llm_structured_output_protocol: str = os.getenv("LLM_STRUCTURED_OUTPUT_PROTOCOL", "json_schema").lower()
+    # This bank's Qwen loader requires vLLM's guided_json field. json_schema
+    # remains available for loaders that enforce the newer OpenAI contract.
+    llm_structured_output_protocol: str = os.getenv("LLM_STRUCTURED_OUTPUT_PROTOCOL", "guided_json").lower()
     # Qwen's native end token and the literal role labels seen when a loader
     # has an incomplete chat template. These stop generation after a complete
     # answer; they are never accepted as part of the JSON response.

@@ -13,6 +13,7 @@ from app.core.models import (
     AccountAnalysisRequest,
     AccountAssessment,
     AccountFinding,
+    AssessmentLimitation,
     CustomerProfileRecord,
     EvidenceItem,
     FindingCategory,
@@ -21,6 +22,7 @@ from app.core.models import (
     ReviewCheck,
     ReviewCheckName,
     ReviewOutcome,
+    ReviewerQuestion,
     RiskLevel,
 )
 from app.core.prompts import ANALYST_SYSTEM_PROMPT, account_assessment_payload
@@ -42,6 +44,7 @@ _FINDING_CHECK: dict[FindingCategory, ReviewCheckName] = {
     "flow_imbalance": "debit_credit_flow",
     "burst_activity": "burst_and_gaps",
     "unusual_variability": "activity_value_change",
+    "profile_activity_mismatch": "profile_consistency",
 }
 
 
@@ -68,6 +71,7 @@ class AnalysisService:
         payload = account_assessment_payload(
             monthly_summary=[row.model_dump(mode="json") for row in request.monthly_summary],
             customer_profile=profile_payload,
+            available_evidence_ids=list(evidence_catalog),
         )
         raw = await self._ask(request.case_id, payload, _RawAssessment)
         assessment = self._hydrate_and_validate(raw, evidence_catalog)
@@ -81,13 +85,13 @@ class AnalysisService:
             executive_summary=raw.executive_summary,
             review_checks=assessment["review_checks"],
             findings=assessment["findings"],
-            reviewer_questions=raw.reviewer_questions,
-            limitations=list(dict.fromkeys(raw.limitations + [
-                "Assessment uses only six monthly aggregates and linked customer-profile history.",
-                "No counterparty, transaction narrative, channel, transaction sequence, expected turnover, or declared income was available.",
-                "Citizenship is not used as a transaction-risk factor without geographical transaction or sanctions data.",
-                "LLM output is decision support and requires authorised human review.",
-            ])),
+            reviewer_questions=assessment["reviewer_questions"],
+            limitations=assessment["limitations"] + [
+                AssessmentLimitation(limitation="Assessment uses only six monthly aggregates and linked customer-profile history."),
+                AssessmentLimitation(limitation="No counterparty, transaction narrative, channel, transaction sequence, expected turnover, or declared income was available."),
+                AssessmentLimitation(limitation="Citizenship is not used as a transaction-risk factor without geographical transaction or sanctions data."),
+                AssessmentLimitation(limitation="LLM output is decision support and requires authorised human review."),
+            ],
             months_reviewed=len(request.monthly_summary),
             profile_records_matched=len(request.customer_profile),
             generated_at=datetime.now(timezone.utc),
@@ -174,7 +178,7 @@ class AnalysisService:
     @staticmethod
     def _hydrate_and_validate(
         raw: "_RawAssessment", catalog: dict[str, EvidenceItem]
-    ) -> dict[str, list[ReviewCheck] | list[AccountFinding]]:
+    ) -> dict[str, list[ReviewCheck] | list[AccountFinding] | list[ReviewerQuestion] | list[AssessmentLimitation]]:
         def resolve(ids: list[str], item_label: str) -> list[EvidenceItem]:
             unknown = [evidence_id for evidence_id in ids if evidence_id not in catalog]
             if unknown:
@@ -185,12 +189,12 @@ class AnalysisService:
 
         review_checks = [
             ReviewCheck(
-                check=item.check,
+                check=check_name,
                 outcome=item.outcome,
                 rationale=item.rationale,
-                evidence=resolve(item.evidence_ids, f"review check '{item.check}'"),
+                evidence=resolve(item.evidence_ids, f"review check '{check_name}'"),
             )
-            for item in raw.review_checks
+            for check_name, item in raw.review_checks.ordered_items()
         ]
         findings = [
             AccountFinding(
@@ -202,7 +206,26 @@ class AnalysisService:
             )
             for item in raw.findings
         ]
-        return {"review_checks": review_checks, "findings": findings}
+        reviewer_questions = [
+            ReviewerQuestion(
+                question=item.question,
+                evidence=resolve(item.evidence_ids, "reviewer question"),
+            )
+            for item in raw.reviewer_questions
+        ]
+        limitations = [
+            AssessmentLimitation(
+                limitation=item.limitation,
+                evidence=resolve(item.evidence_ids, "limitation"),
+            )
+            for item in raw.limitations
+        ]
+        return {
+            "review_checks": review_checks,
+            "findings": findings,
+            "reviewer_questions": reviewer_questions,
+            "limitations": limitations,
+        }
 
     @staticmethod
     def _rollup_risk_level(findings: list[Any]) -> RiskLevel:
@@ -218,9 +241,27 @@ class _EvidenceReferences(BaseModel):
 
 
 class _RawReviewCheck(_EvidenceReferences):
-    check: ReviewCheckName
     outcome: ReviewOutcome
     rationale: str = Field(min_length=1, max_length=360)
+
+
+class _RawReviewChecks(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dormancy_reactivation: _RawReviewCheck
+    activity_value_change: _RawReviewCheck
+    debit_credit_flow: _RawReviewCheck
+    burst_and_gaps: _RawReviewCheck
+    profile_consistency: _RawReviewCheck
+
+    def ordered_items(self) -> list[tuple[ReviewCheckName, _RawReviewCheck]]:
+        return [
+            ("dormancy_reactivation", self.dormancy_reactivation),
+            ("activity_value_change", self.activity_value_change),
+            ("debit_credit_flow", self.debit_credit_flow),
+            ("burst_and_gaps", self.burst_and_gaps),
+            ("profile_consistency", self.profile_consistency),
+        ]
 
 
 class _RawFinding(_EvidenceReferences):
@@ -229,27 +270,34 @@ class _RawFinding(_EvidenceReferences):
     rationale: str = Field(min_length=1, max_length=360)
 
 
+class _RawReviewerQuestion(_EvidenceReferences):
+    question: str = Field(min_length=1, max_length=300)
+
+
+class _RawLimitation(_EvidenceReferences):
+    limitation: str = Field(min_length=1, max_length=300)
+
+
 class _RawAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     risk_level: RiskLevel
     executive_summary: str = Field(min_length=1, max_length=600)
-    review_checks: list[_RawReviewCheck] = Field(min_length=5, max_length=5)
+    review_checks: _RawReviewChecks
     findings: list[_RawFinding] = Field(default_factory=list, max_length=3)
-    reviewer_questions: list[str] = Field(default_factory=list, max_length=3)
-    limitations: list[str] = Field(default_factory=list, max_length=3)
+    reviewer_questions: list[_RawReviewerQuestion] = Field(default_factory=list, max_length=3)
+    limitations: list[_RawLimitation] = Field(default_factory=list, max_length=3)
 
     @model_validator(mode="after")
     def validate_decision_contract(self) -> "_RawAssessment":
-        check_names = [item.check for item in self.review_checks]
-        if set(check_names) != _REQUIRED_REVIEW_CHECKS or len(set(check_names)) != len(check_names):
-            raise ValueError("review_checks must contain each required check exactly once")
+        for check_name, item in self.review_checks.ordered_items():
+            if check_name != "profile_consistency" and not item.evidence_ids:
+                raise ValueError(f"review check '{check_name}' requires at least one evidence ID")
 
-        for item in self.review_checks:
-            if item.check != "profile_consistency" and not item.evidence_ids:
-                raise ValueError(f"review check '{item.check}' requires at least one evidence ID")
-
-        observed = {item.check for item in self.review_checks if item.outcome == "observed"}
+        observed = {
+            check_name for check_name, item in self.review_checks.ordered_items()
+            if item.outcome == "observed"
+        }
         for finding in self.findings:
             if _FINDING_CHECK[finding.category] not in observed:
                 raise ValueError(

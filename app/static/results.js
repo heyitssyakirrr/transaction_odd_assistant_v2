@@ -71,11 +71,11 @@ function renderResult(data) {
   renderFindings(data.findings || []);
 
   els.reviewerQuestions.innerHTML = (data.reviewer_questions || [])
-    .map((question) => `<li>${escapeHtml(question)}</li>`)
+    .map((item) => `<li>${escapeHtml(item.question)}${renderInlineEvidence(item.evidence || [])}</li>`)
     .join("") || "<li class='muted'>No additional reviewer question was returned.</li>";
 
   els.limitations.innerHTML = (data.limitations || [])
-    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .map((item) => `<li>${escapeHtml(item.limitation)}${renderInlineEvidence(item.evidence || [])}</li>`)
     .join("") || "<li class='muted'>None recorded.</li>";
 
   els.reportHtmlLink.href = data.report_html;
@@ -140,6 +140,13 @@ function renderEvidenceItems(evidence) {
   return evidence.map((item) =>
     `<li><span class="transaction-ids">${escapeHtml(item.label)}=${escapeHtml(item.value)}</span></li>`
   ).join("");
+}
+
+function renderInlineEvidence(evidence) {
+  if (!evidence.length) return "";
+  return `<br><span class="transaction-ids">${evidence.map((item) =>
+    `${escapeHtml(item.label)}=${escapeHtml(item.value)}`
+  ).join("; ")}</span>`;
 }
 
 function formatEnum(value) {

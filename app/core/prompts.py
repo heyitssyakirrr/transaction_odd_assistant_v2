@@ -34,9 +34,10 @@ Risk policy:
 - high: at least two corroborating material findings are present. Amount alone never makes an account high risk.
 - risk_level must equal the highest finding severity. Findings may be medium or high only.
 
-Use evidence IDs exactly as supplied: MYYYYMM.feature for monthly facts and P<number>.field for profile facts.
-Never invent an ID or numeric value. Each review-check rationale and finding rationale must be understandable without
-unstated assumptions; cited values are rendered by the application.
+Use evidence IDs only from available_evidence_ids. Copy the complete ID exactly; never use a placeholder such as
+MYYYYMM.feature. Never invent an ID or numeric value. Each review-check rationale and finding rationale must be
+understandable without unstated assumptions; cited values are rendered by the application. The first review month is
+the supplied baseline, not evidence of an increase from an earlier, unknown month.
 
 Return exactly one JSON object, without markdown or text outside the object. Its keys, in this order, are:
 1. risk_level
@@ -46,22 +47,24 @@ Return exactly one JSON object, without markdown or text outside the object. Its
 5. reviewer_questions
 6. limitations
 
-review_checks must contain exactly these five objects once each, in this order:
-1. dormancy_reactivation
-2. activity_value_change
-3. debit_credit_flow
-4. burst_and_gaps
-5. profile_consistency
+review_checks is one object with exactly these five named fields:
+dormancy_reactivation, activity_value_change, debit_credit_flow, burst_and_gaps, profile_consistency.
 
-Every review-check object has check, outcome, rationale, and evidence_ids. Outcome is observed, not_observed, or
+Each named review check contains outcome, rationale, and evidence_ids. Outcome is observed, not_observed, or
 insufficient_data. All non-profile checks require at least one evidence ID. A profile check may use no evidence IDs
-only when no profile record was supplied. Each finding has category, severity, rationale, and evidence_ids. Include
-at most three findings, three reviewer_questions, and three limitations. Do not add, rename, or omit fields."""
+only when no profile record was supplied. Each finding contains category, severity, rationale, and evidence_ids. Use
+only these finding categories: dormancy_reactivation, activity_spike, flow_imbalance, burst_activity,
+unusual_variability, profile_activity_mismatch. A profile_activity_mismatch requires observed profile_consistency
+plus monthly and profile evidence. Insufficient profile data belongs in profile_consistency or limitations, never in
+findings. Each reviewer_questions item contains question and evidence_ids. Each limitations item contains limitation
+and evidence_ids. Include at most three findings, three reviewer_questions, and three limitations. Do not add,
+rename, or omit fields."""
 
 
 def account_assessment_payload(
     monthly_summary: list[dict[str, Any]],
     customer_profile: list[dict[str, Any]],
+    available_evidence_ids: list[str],
 ) -> dict[str, Any]:
     """Facts and stable citation syntax for the one-call assessment."""
 
@@ -69,6 +72,7 @@ def account_assessment_payload(
         "task": "Classify the account and return the mandatory AML review coverage for authorised staff.",
         "monthly_evidence_id_format": "MYYYYMM.feature from monthly_summary",
         "profile_evidence_id_format": "P<number>.field from customer_profile_history.profile_record_id",
+        "available_evidence_ids": available_evidence_ids,
         "monthly_summary": monthly_summary,
         "customer_profile_history": customer_profile,
     }
