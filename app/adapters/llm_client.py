@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from typing import Any
 
 import httpx
@@ -40,13 +41,15 @@ class LlmContextWindowError(LlmServiceError):
     """The request cannot fit within the configured or reported model context."""
 
 
-class OpenAICompatibleClient:
-    """Strict JSON-schema client for the bank's OpenAI-compatible loader.
+class LlmOutputFormatError(LlmServiceError):
+    """The model answer cannot be safely normalised into one JSON object."""
 
-    A malformed or truncated result is a failed assessment.  The client never
-    repairs brackets, extracts a convenient fragment, or accepts surrounding
-    commentary, because those behaviours can turn an incomplete assessment
-    into a superficially valid record.
+
+class OpenAICompatibleClient:
+    """Compatibility client for a loader that does not enforce JSON schemas.
+
+    It permits only mechanical punctuation recovery. The downstream Pydantic
+    schema and source-citation checks remain the authority for acceptance.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -64,7 +67,7 @@ class OpenAICompatibleClient:
         self,
         *,
         system_prompt: str,
-        user_payload: dict[str, Any],
+        user_payload: dict[str, Any] | str,
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
         max_response_tokens: int | None = None,
@@ -96,12 +99,12 @@ class OpenAICompatibleClient:
         content = _extract_content(payload)
         self._log_raw_response(content)
         if choice.get("finish_reason") == "length":
-            raise LlmServiceError(
+            raise LlmOutputFormatError(
                 "LLM output reached MAX_RESPONSE_TOKENS and was rejected; it was not used as an assessment."
             )
         try:
-            return _parse_json_content(content)
-        except LlmServiceError:
+            return _parse_json_content(content, repair=self._settings.llm_json_repair_enabled)
+        except LlmOutputFormatError:
             logger.warning(
                 "LLM returned invalid JSON: response_chars=%d", len(content) if isinstance(content, str) else 0
             )
@@ -122,7 +125,7 @@ class OpenAICompatibleClient:
     def _build_body(
         self,
         system_prompt: str,
-        user_payload: dict[str, Any],
+        user_payload: dict[str, Any] | str,
         *,
         use_response_format: bool,
         response_schema: dict[str, Any] | None = None,
@@ -133,7 +136,7 @@ class OpenAICompatibleClient:
             "model": self._settings.llm_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, default=str)},
+                {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, ensure_ascii=False, default=str)},
             ],
             "temperature": self._settings.llm_temperature,
             "top_p": self._settings.llm_top_p,
@@ -297,20 +300,146 @@ def _extract_content(payload: dict[str, Any]) -> str | dict[str, Any]:
     raise LlmServiceError("Unrecognised LLM response: expected choices[0].message.content or text")
 
 
-def _parse_json_content(content: str | dict[str, Any]) -> dict[str, Any]:
-    """Accept exactly one complete JSON object and nothing else."""
+def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) -> dict[str, Any]:
+    """Parse one model object, with optional bounded punctuation recovery.
+
+    Recovery removes only an outer code fence/trailing comma and appends closing
+    quote/brackets for one unfinished object. It never supplies a missing key,
+    evidence ID, value, or finding. Pydantic validation still rejects incomplete
+    business content immediately afterwards.
+    """
     if isinstance(content, dict):
         return content
     if not isinstance(content, str) or not content.strip():
-        raise LlmServiceError("LLM response content was empty.")
+        raise LlmOutputFormatError("LLM response content was empty.")
 
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise LlmServiceError("LLM response was not a complete JSON object.") from exc
-    if not isinstance(parsed, dict):
-        raise LlmServiceError("LLM response JSON must be an object.")
-    return parsed
+    candidates = [content.strip()]
+    fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", content, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        candidates.append(fenced.group(1).strip())
+    if repair:
+        candidates.extend(_top_level_json_objects(content))
+        recovered = _recover_json_object(content)
+        if recovered:
+            candidates.append(recovered)
+
+    for candidate in reversed(_unique(candidates)):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise LlmOutputFormatError("LLM response was not a recoverable JSON object.")
+
+
+def _top_level_json_objects(text: str) -> list[str]:
+    """Return complete top-level JSON object candidates without parsing prose."""
+    candidates: list[str] = []
+    depth = 0
+    start: int | None = None
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start:index + 1])
+                start = None
+    return candidates
+
+
+def _recover_json_object(text: str) -> str | None:
+    """Make syntactic complements only; never invent semantic JSON content."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    fragment = text[start:].strip()
+    fragment = re.sub(r"\s*```\s*$", "", fragment)
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    result: list[str] = []
+    for char in fragment:
+        if escaped:
+            result.append(char)
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            result.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            result.append(char)
+            in_string = not in_string
+            continue
+        if not in_string and char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif not in_string and char in "}]":
+            if not stack:
+                return None
+            # Example: `{"items":[1,2,}` is missing only `]`. Close that
+            # open array before accepting the model's following object close.
+            while stack and char != stack[-1]:
+                result.append(stack.pop())
+            if not stack:
+                return None
+            stack.pop()
+        result.append(char)
+    if in_string:
+        result.append('"')
+    recovered = "".join(result).rstrip() + "".join(reversed(stack))
+    return _remove_trailing_commas(recovered)
+
+
+def _remove_trailing_commas(text: str) -> str:
+    """Remove a comma only when it immediately precedes a structural close."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            result.append(char)
+            escaped = False
+        elif char == "\\" and in_string:
+            result.append(char)
+            escaped = True
+        elif char == '"':
+            result.append(char)
+            in_string = not in_string
+        elif char == "," and not in_string:
+            next_index = index + 1
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            if next_index < len(text) and text[next_index] in "}]":
+                index += 1
+                continue
+            result.append(char)
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def _unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def _estimate_tokens(text: str) -> int:

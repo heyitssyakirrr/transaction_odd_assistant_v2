@@ -196,6 +196,7 @@ ul.plain {{ padding-left: 20px; }}
 </header>
 <section class="decision">
   <h2>Recommendation: {html.escape(result.decision.replace("_", " ").title())} ({html.escape(result.risk_level.title())} risk)</h2>
+  {"<p><strong>Manual review required:</strong> model output could not be verified; do not close this case from this result.</p>" if result.status == "needs_review" else "<p>LLM decision support only; an authorised reviewer remains responsible for the case decision.</p>"}
 </section>
 <h2>Executive summary</h2>
 <p>{html.escape(result.executive_summary)}</p>

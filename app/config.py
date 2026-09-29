@@ -53,11 +53,11 @@ class Settings:
         "OCCUPATION_CODE_CSV_PATH",
         str(BASE_DIR / "data" / "occupation_codes.csv"),
     )
-    # The compact single-account decision has a deliberately small completion
-    # budget. A larger limit lets a misconfigured chat template run away.
-    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "1200"))
-    # Four small calls are safer than one large response for Qwen 2.5 VL 7B.
-    # They cap independent specialist output and the final synthesis separately.
+    # One concise account assessment. A bounded response reduces transcript
+    # repetition without starving the five required review dimensions.
+    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "850"))
+    # Retained for backwards-compatible .env files; the one-call design does
+    # not use these stage budgets.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
     llm_flow_max_response_tokens: int = int(os.getenv("LLM_FLOW_MAX_RESPONSE_TOKENS", "260"))
     llm_profile_max_response_tokens: int = int(os.getenv("LLM_PROFILE_MAX_RESPONSE_TOKENS", "220"))
@@ -69,9 +69,11 @@ class Settings:
     # This is a vLLM/Qwen extension rather than a portable OpenAI parameter.
     # Leave disabled unless the bank loader is confirmed to accept it.
     llm_repetition_penalty: float = float(os.getenv("LLM_REPETITION_PENALTY", "0"))
-    # This bank's Qwen loader requires vLLM's guided_json field. json_schema
-    # remains available for loaders that enforce the newer OpenAI contract.
-    llm_structured_output_protocol: str = os.getenv("LLM_STRUCTURED_OUTPUT_PROTOCOL", "guided_json").lower()
+    # The bank loader currently ignores both guided_json and response_format.
+    # Keep this off until platform support is confirmed; prompt/template plus
+    # bounded mechanical recovery provides the compatibility path.
+    llm_structured_output_protocol: str = os.getenv("LLM_STRUCTURED_OUTPUT_PROTOCOL", "off").lower()
+    llm_json_repair_enabled: bool = os.getenv("LLM_JSON_REPAIR_ENABLED", "true").lower() == "true"
     # Qwen's native end token and the literal role labels seen when a loader
     # has an incomplete chat template. These stop generation after a complete
     # answer; they are never accepted as part of the JSON response.
@@ -113,15 +115,9 @@ class Settings:
             raise ValueError(
                 "LLM_STRUCTURED_OUTPUT_PROTOCOL must be json_schema, guided_json, json_object, or off"
             )
-        largest_stage = max(
-            self.llm_timeline_max_response_tokens,
-            self.llm_flow_max_response_tokens,
-            self.llm_profile_max_response_tokens,
-            self.llm_synthesis_max_response_tokens,
-        )
-        if self.llm_context_window_tokens and self.llm_context_window_tokens <= largest_stage + self.llm_context_safety_margin_tokens:
+        if self.llm_context_window_tokens and self.llm_context_window_tokens <= self.max_response_tokens + self.llm_context_safety_margin_tokens:
             raise ValueError(
-                "LLM_CONTEXT_WINDOW_TOKENS must exceed the largest stage response budget plus "
+                "LLM_CONTEXT_WINDOW_TOKENS must exceed MAX_RESPONSE_TOKENS plus "
                 "LLM_CONTEXT_SAFETY_MARGIN_TOKENS"
             )
 

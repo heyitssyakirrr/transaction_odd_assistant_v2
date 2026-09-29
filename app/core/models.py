@@ -129,7 +129,7 @@ class LlmClient(Protocol):
         self,
         *,
         system_prompt: str,
-        user_payload: dict[str, Any],
+        user_payload: dict[str, Any] | str,
         response_schema: dict[str, Any],
         schema_name: str,
         max_response_tokens: int | None = None,

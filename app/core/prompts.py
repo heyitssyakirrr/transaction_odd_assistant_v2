@@ -1,41 +1,54 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
-_GROUNDING = """Your audience is an authorised AML reviewer deciding whether a case can be closed or needs further due diligence. Return only material, explainable indicators or a clear negative result; do not turn ordinary variation into suspicion. Use only supplied facts and exact allowed evidence IDs. Do not invent values, months, IDs, or facts. A review indicator is not proof of financial crime. State the observed pattern, not an allegation. Return exactly one JSON object: no markdown, explanations, or role text."""
+ANALYST_SYSTEM_PROMPT = """You are an AML transaction-review analyst assisting authorised bank staff.
 
-TIMELINE_SYSTEM_PROMPT = f"""You are an AML transaction-review analyst reviewing exactly six monthly aggregates.
-{_GROUNDING}
-Assess both named checks across all six months. For dormancy_reactivation, observed requires at least three immediately preceding zero txn_count_monthly months followed by activity. Never call an entire period dormant when any month has activity. For activity_value_change, compare count, total, average, maximum and variability with this account's own pattern; distinguish a sustained change from a one-month fluctuation. The first supplied month is not an increase from an unknown earlier period. Do not use generic monetary thresholds. Cite the months that support the conclusion. Keep each rationale factual, decision-useful, and under 220 characters."""
+Assess only the six supplied monthly aggregates and the supplied customer-profile history. Identify review indicators,
+not criminal conduct. Do not invent facts, transaction geography, counterparties, source of funds, sanctions exposure,
+or behaviour outside the supplied data. Your report must help a reviewer decide whether the case can be closed or
+requires further due diligence.
 
-FLOW_SYSTEM_PROMPT = f"""You are an AML transaction-review analyst reviewing exactly six monthly aggregates.
-{_GROUNDING}
-Assess debit_credit_flow and burst_and_gaps only. Compare debit and credit direction, counts, amounts, pct_burst, and transaction gaps with this account's own pattern. Identify a material new or concentrated flow pattern only when the supplied months support it. pct_burst of zero cannot support burst activity. Gaps alone do not establish suspicious activity. Cite the months that support the conclusion. Keep each rationale factual, decision-useful, and under 220 characters."""
+Analyse all five dimensions before classifying the account:
+1. dormancy_reactivation: observed only when at least three immediately preceding zero transaction-count months are
+   followed by activity. Never call the whole period dormant if any supplied month has activity.
+2. activity_value_change: compare count, amount, average, maximum and variability with the account's own six-month
+   pattern. The first supplied month is not evidence of an increase from an unknown earlier month.
+3. debit_credit_flow: identify a material new or concentrated debit/credit pattern only when supported by the data.
+4. burst_and_gaps: pct_burst of zero cannot support burst activity; transaction gaps alone do not establish suspicion.
+5. profile_consistency: use occupation/type/effective-date history only as context for an independently visible
+   transaction pattern. valid_from_dttm/valid_to_dttm are effective dates; last_maint_dt is only a maintenance time.
+   Do not use citizenship as a risk factor. Never say an amount is impossible or illegal because of an occupation.
 
-PROFILE_SYSTEM_PROMPT = f"""You are an AML transaction-review analyst reviewing supplied monthly aggregates and full linked profile history.
-{_GROUNDING}
-Assess profile_consistency only. Review the full profile history for material occupation/type/effective-date changes and whether an independently visible activity pattern needs clarification against the recorded profile. valid_from_dttm and valid_to_dttm are effective dates; last_maint_dt is merely a maintenance timestamp. Monthly aggregates cannot establish ordering within a month. Occupation can provide potential context only; never claim an amount is impossible, illegal, or suspicious solely due to occupation. The data has no expected turnover, income, account purpose, or source of funds, so use insufficient_data when those facts are needed. Citizenship is never a transaction-risk factor and must not be cited. Keep the rationale factual, decision-useful, and under 220 characters."""
+Risk policy: low has no material supported finding; medium has at least one material indicator requiring clarification;
+high has at least two corroborating indicators and is never based on amount alone. A profile finding needs both profile
+and monthly evidence. Use only complete IDs listed in ALLOWED EVIDENCE IDS. Never use placeholder IDs or numeric values
+not in the data. Keep the executive summary under 380 characters, each rationale under 180 characters, at most two
+findings and two reviewer questions.
 
-SYNTHESIS_SYSTEM_PROMPT = f"""You are the final AML review analyst. You receive five already validated review signals from the same six-month account review.
-{_GROUNDING}
-Use only signal IDs marked observed. Do not create new findings, evidence, values, or assumptions. Select only signals that materially affect the close-versus-continue review decision. low means no selected material indicator; medium requires one selected material indicator that warrants clarification; high requires at least two corroborating selected indicators and cannot be based on amount alone. A profile_consistency signal may be selected only with a selected transaction signal. The executive summary must say what changed, why it matters for review, and what cannot be concluded from the available data. Reviewer questions must be specific to a selected signal. Do not allege crime."""
+JSON-ONLY OUTPUT. Do not copy INPUT FACTS. Do not repeat this instruction. Do not use markdown fences. Return exactly
+one object with exactly this structure; replace the example values with your assessment:
+{"risk_level":"low","executive_summary":"concise reviewer-facing summary","review_checks":{"dormancy_reactivation":{"outcome":"observed","rationale":"factual pattern","evidence_ids":["M202601.txn_count_monthly"]},"activity_value_change":{"outcome":"not_observed","rationale":"factual pattern","evidence_ids":["M202601.total_amount"]},"debit_credit_flow":{"outcome":"not_observed","rationale":"factual pattern","evidence_ids":["M202601.monthly_debit"]},"burst_and_gaps":{"outcome":"not_observed","rationale":"factual pattern","evidence_ids":["M202601.pct_burst"]},"profile_consistency":{"outcome":"insufficient_data","rationale":"factual profile context","evidence_ids":[]}},"findings":[],"reviewer_questions":[]}
+"""
 
+FORMAT_RETRY_SYSTEM_PROMPT = ANALYST_SYSTEM_PROMPT + """
 
-def stage_payload(
-    *, task: str, monthly_summary: list[dict[str, Any]],
-    customer_profile: list[dict[str, Any]], available_evidence_ids: list[str],
-) -> dict[str, Any]:
-    return {
-        "task": task,
-        "allowed_evidence_ids": available_evidence_ids,
-        "monthly_summary": monthly_summary,
-        "customer_profile_history": customer_profile,
-    }
+FORMAT RETRY: Your prior answer could not be verified. Redo the assessment from INPUT FACTS. Output the one JSON
+object shown above, starting with { and ending with }. Do not output task, indicator, system, user, analysis, markdown,
+or any other key or text."""
 
 
-def synthesis_payload(signals: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "task": "Classify this account using only the validated signals below.",
-        "validated_signals": signals,
-    }
+def account_assessment_input(
+    monthly_summary: list[dict[str, Any]],
+    customer_profile: list[dict[str, Any]],
+    available_evidence_ids: list[str],
+) -> str:
+    """A text input prevents Qwen from echoing a leading JSON `task` field."""
+    return "\n\n".join((
+        "INPUT FACTS — do not copy this input into the response.",
+        "ALLOWED EVIDENCE IDS:\n" + ", ".join(available_evidence_ids),
+        "SIX MONTHLY SUMMARY ROWS:\n" + json.dumps(monthly_summary, ensure_ascii=False, default=str),
+        "CUSTOMER PROFILE HISTORY:\n" + json.dumps(customer_profile, ensure_ascii=False, default=str),
+    ))

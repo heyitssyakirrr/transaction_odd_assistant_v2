@@ -56,6 +56,12 @@ function renderResult(data) {
 
   els.decisionCard.className = `decision-card risk-${data.risk_level}`;
   els.decision.textContent = formatEnum(data.decision);
+  const decisionRationale = document.querySelector("#decision-rationale");
+  if (decisionRationale) {
+    decisionRationale.textContent = data.status === "needs_review"
+      ? "Model output could not be verified. Manual review is required; this result must not be used to close the case."
+      : "LLM decision support only. An authorised reviewer remains responsible for the case decision.";
+  }
 
   els.riskBadge.textContent = `${data.risk_level.toUpperCase()} RISK`;
   els.riskBadge.className = `risk-badge risk-${data.risk_level}`;
