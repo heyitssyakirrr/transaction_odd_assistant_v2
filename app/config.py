@@ -56,6 +56,12 @@ class Settings:
     # The compact single-account decision has a deliberately small completion
     # budget. A larger limit lets a misconfigured chat template run away.
     max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "1200"))
+    # Four small calls are safer than one large response for Qwen 2.5 VL 7B.
+    # They cap independent specialist output and the final synthesis separately.
+    llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
+    llm_flow_max_response_tokens: int = int(os.getenv("LLM_FLOW_MAX_RESPONSE_TOKENS", "260"))
+    llm_profile_max_response_tokens: int = int(os.getenv("LLM_PROFILE_MAX_RESPONSE_TOKENS", "220"))
+    llm_synthesis_max_response_tokens: int = int(os.getenv("LLM_SYNTHESIS_MAX_RESPONSE_TOKENS", "260"))
     # Qwen's low-variance sampling defaults. Set only parameters accepted by
     # the bank's OpenAI-compatible loader.
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0"))
@@ -84,6 +90,10 @@ class Settings:
             "LLM_QUEUE_MAXSIZE": self.llm_queue_maxsize,
             "LLM_QUEUE_ENQUEUE_TIMEOUT_SECONDS": self.llm_queue_enqueue_timeout_seconds,
             "MAX_RESPONSE_TOKENS": self.max_response_tokens,
+            "LLM_TIMELINE_MAX_RESPONSE_TOKENS": self.llm_timeline_max_response_tokens,
+            "LLM_FLOW_MAX_RESPONSE_TOKENS": self.llm_flow_max_response_tokens,
+            "LLM_PROFILE_MAX_RESPONSE_TOKENS": self.llm_profile_max_response_tokens,
+            "LLM_SYNTHESIS_MAX_RESPONSE_TOKENS": self.llm_synthesis_max_response_tokens,
             "LLM_LOG_RAW_RESPONSE_MAX_CHARS": self.llm_log_raw_response_max_chars,
         }
         invalid = [name for name, value in positive_values.items() if value <= 0]
@@ -103,9 +113,15 @@ class Settings:
             raise ValueError(
                 "LLM_STRUCTURED_OUTPUT_PROTOCOL must be json_schema, guided_json, json_object, or off"
             )
-        if self.llm_context_window_tokens and self.llm_prompt_token_budget <= 0:
+        largest_stage = max(
+            self.llm_timeline_max_response_tokens,
+            self.llm_flow_max_response_tokens,
+            self.llm_profile_max_response_tokens,
+            self.llm_synthesis_max_response_tokens,
+        )
+        if self.llm_context_window_tokens and self.llm_context_window_tokens <= largest_stage + self.llm_context_safety_margin_tokens:
             raise ValueError(
-                "LLM_CONTEXT_WINDOW_TOKENS must exceed MAX_RESPONSE_TOKENS plus "
+                "LLM_CONTEXT_WINDOW_TOKENS must exceed the largest stage response budget plus "
                 "LLM_CONTEXT_SAFETY_MARGIN_TOKENS"
             )
 

@@ -67,6 +67,7 @@ class OpenAICompatibleClient:
         user_payload: dict[str, Any],
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
+        max_response_tokens: int | None = None,
     ) -> dict[str, Any]:
         if not self._settings.llm_base_url:
             raise LlmServiceError(
@@ -81,6 +82,7 @@ class OpenAICompatibleClient:
             use_response_format=True,
             response_schema=response_schema,
             schema_name=schema_name,
+            max_response_tokens=max_response_tokens,
         )
         self._validate_context_budget(body)
         payload = await self._post_with_retries(body, headers)
@@ -125,6 +127,7 @@ class OpenAICompatibleClient:
         use_response_format: bool,
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
+        max_response_tokens: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self._settings.llm_model,
@@ -134,7 +137,7 @@ class OpenAICompatibleClient:
             ],
             "temperature": self._settings.llm_temperature,
             "top_p": self._settings.llm_top_p,
-            "max_tokens": self._settings.max_response_tokens,
+            "max_tokens": max_response_tokens or self._settings.max_response_tokens,
             "stream": False,
         }
         if self._settings.llm_repetition_penalty:
@@ -238,13 +241,20 @@ class OpenAICompatibleClient:
         serialized = json.dumps(body["messages"], ensure_ascii=False, separators=(",", ":"))
         request_bytes = len(serialized.encode("utf-8"))
         estimated_tokens = _estimate_tokens(serialized)
-        budget = self._settings.llm_prompt_token_budget
+        budget = None
+        if self._settings.llm_context_window_tokens:
+            budget = (
+                self._settings.llm_context_window_tokens
+                - body["max_tokens"]
+                - self._settings.llm_context_safety_margin_tokens
+            )
         logger.info(
-            "LLM request prepared: request_bytes=%d estimated_prompt_tokens=%d prompt_budget_tokens=%s max_response_tokens=%d",
+            "LLM request prepared: request_bytes=%d estimated_prompt_tokens=%d structured_protocol=%s prompt_budget_tokens=%s max_response_tokens=%d",
             request_bytes,
             estimated_tokens,
+            self._settings.llm_structured_output_protocol,
             budget if budget is not None else "unconfigured",
-            self._settings.max_response_tokens,
+            body["max_tokens"],
         )
         if budget is not None and estimated_tokens > budget:
             logger.error(

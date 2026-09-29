@@ -11,11 +11,10 @@ RiskLevel = Literal["low", "medium", "high"]
 FindingSeverity = Literal["medium", "high"]
 FindingCategory = Literal[
     "dormancy_reactivation",
-    "activity_spike",
-    "flow_imbalance",
-    "burst_activity",
-    "unusual_variability",
-    "profile_activity_mismatch",
+    "activity_value_change",
+    "debit_credit_flow",
+    "burst_and_gaps",
+    "profile_consistency",
 ]
 ReviewCheckName = Literal[
     "dormancy_reactivation",
@@ -133,4 +132,5 @@ class LlmClient(Protocol):
         user_payload: dict[str, Any],
         response_schema: dict[str, Any],
         schema_name: str,
+        max_response_tokens: int | None = None,
     ) -> dict[str, Any]: ...
