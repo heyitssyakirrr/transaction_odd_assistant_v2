@@ -14,7 +14,6 @@ FindingCategory = Literal[
     "flow_imbalance",
     "burst_activity",
     "unusual_variability",
-    "profile_timing",
 ]
 
 
@@ -80,21 +79,6 @@ class AccountFinding(BaseModel):
     evidence: list[MonthlyEvidenceItem] = Field(min_length=1, max_length=4)
 
 
-class MonthlyComparisonNote(BaseModel):
-    title: str = Field(min_length=1, max_length=80)
-    pattern_summary: str = Field(min_length=1, max_length=300)
-    evidence: list[MonthlyEvidenceItem] = Field(min_length=1, max_length=4)
-
-
-class ProfileTimelineNote(BaseModel):
-    field: Literal["occupation", "citizenship", "indv_org_type"]
-    change_summary: str = Field(min_length=1, max_length=220)
-    # Keep this as text in the wire contract. Some grammar backends reject
-    # JSON Schema's date-time format even though they support normal strings.
-    change_dttm: str | None = Field(default=None, max_length=40)
-    coincides_with_txn_pattern: bool = False
-
-
 class AccountAssessment(BaseModel):
     case_id: str
     acct_num: str
@@ -102,8 +86,6 @@ class AccountAssessment(BaseModel):
     decision: Literal["close_case", "continue_due_diligence"]
     risk_level: RiskLevel
     executive_summary: str
-    monthly_comparison: list[MonthlyComparisonNote] = Field(default_factory=list)
-    profile_notes: list[ProfileTimelineNote] = Field(default_factory=list)
     findings: list[AccountFinding] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     months_reviewed: int

@@ -94,8 +94,7 @@ class ReportStore:
               <ul>
                 {''.join(
                     f'<li><span class="txn-ids">{html.escape(item.year_month)} &middot; '
-                    f'{html.escape(item.feature)}={html.escape(item.value)}</span>'
-                    f'{html.escape(item.statement)}</li>'
+                    f'{html.escape(item.feature)}={html.escape(item.value)}</span></li>'
                     for item in finding.evidence
                 )}
               </ul>
@@ -182,7 +181,7 @@ ul.plain {{ padding-left: 20px; }}
 </section>
 <h2>Executive summary</h2>
 <p>{html.escape(result.executive_summary)}</p>
-<p><small>{result.months_reviewed} month(s) reviewed in this account's summary.</small></p>
+<p><small>{result.months_reviewed} month(s) reviewed; {result.profile_records_matched} linked profile record(s) available.</small></p>
 <h2>Material findings</h2>
 {findings}
 <h2>Limitations</h2>

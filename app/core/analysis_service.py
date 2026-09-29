@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
@@ -16,9 +16,7 @@ from app.core.models import (
     CustomerProfileRecord,
     FindingCategory,
     LlmClient,
-    MonthlyComparisonNote,
     MonthlyEvidenceItem,
-    ProfileTimelineNote,
     RiskLevel,
 )
 from app.core.prompts import ANALYST_SYSTEM_PROMPT, account_assessment_payload
@@ -54,7 +52,7 @@ class AnalysisService:
         )
         raw = await self._ask(request.case_id, payload, _RawAssessment)
         assessment = self._hydrate_and_validate(raw, evidence_catalog)
-        risk_level = self._rollup_risk_level(assessment["findings"])
+        risk_level = raw.risk_level
 
         return AccountAssessment(
             case_id=request.case_id,
@@ -63,8 +61,6 @@ class AnalysisService:
             decision="close_case" if risk_level == "low" else "continue_due_diligence",
             risk_level=risk_level,
             executive_summary=raw.executive_summary,
-            monthly_comparison=assessment["monthly_comparison"],
-            profile_notes=raw.profile_timeline_notes,
             findings=assessment["findings"],
             limitations=list(dict.fromkeys(raw.limitations + [
                 "Assessment uses only six monthly aggregates and linked customer-profile history.",
@@ -121,7 +117,7 @@ class AnalysisService:
     @staticmethod
     def _hydrate_and_validate(
         raw: "_RawAssessment", catalog: dict[str, MonthlyEvidenceItem]
-    ) -> dict[str, list[MonthlyComparisonNote] | list[AccountFinding]]:
+    ) -> dict[str, list[AccountFinding]]:
         def resolve(ids: list[str], item_label: str) -> list[MonthlyEvidenceItem]:
             unknown = [evidence_id for evidence_id in ids if evidence_id not in catalog]
             if unknown:
@@ -130,14 +126,6 @@ class AnalysisService:
                 )
             return [catalog[evidence_id] for evidence_id in dict.fromkeys(ids)]
 
-        comparisons = [
-            MonthlyComparisonNote(
-                title=item.title,
-                pattern_summary=item.pattern_summary,
-                evidence=resolve(item.evidence_ids, f"observation '{item.title}'"),
-            )
-            for item in raw.monthly_comparison
-        ]
         findings = [
             AccountFinding(
                 finding_id=str(uuid4()),
@@ -148,7 +136,7 @@ class AnalysisService:
             )
             for item in raw.findings
         ]
-        return {"monthly_comparison": comparisons, "findings": findings}
+        return {"findings": findings}
 
     @staticmethod
     def _rollup_risk_level(findings: list[AccountFinding]) -> RiskLevel:
@@ -158,12 +146,9 @@ class AnalysisService:
 
 
 class _EvidenceReferences(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     evidence_ids: list[str] = Field(min_length=1, max_length=4)
-
-
-class _RawComparison(_EvidenceReferences):
-    title: str = Field(min_length=1, max_length=80)
-    pattern_summary: str = Field(min_length=1, max_length=300)
 
 
 class _RawFinding(_EvidenceReferences):
@@ -173,8 +158,25 @@ class _RawFinding(_EvidenceReferences):
 
 
 class _RawAssessment(BaseModel):
-    monthly_comparison: list[_RawComparison] = Field(default_factory=list, max_length=3)
-    profile_timeline_notes: list[ProfileTimelineNote] = Field(default_factory=list, max_length=3)
-    findings: list[_RawFinding] = Field(default_factory=list, max_length=3)
+    model_config = ConfigDict(extra="forbid")
+
+    risk_level: RiskLevel
     executive_summary: str = Field(min_length=1, max_length=600)
+    findings: list[_RawFinding] = Field(default_factory=list, max_length=3)
     limitations: list[str] = Field(default_factory=list, max_length=3)
+
+    @model_validator(mode="after")
+    def risk_must_match_findings(self) -> "_RawAssessment":
+        """Reject internally inconsistent model decisions instead of guessing.
+
+        This is not a risk-scoring rule: the LLM still decides each finding's
+        severity.  It only ensures that a response cannot call the account
+        low while simultaneously returning a medium/high finding (or vice
+        versa), which would make the staff-facing result ambiguous.
+        """
+        expected = AnalysisService._rollup_risk_level(self.findings)
+        if self.risk_level != expected:
+            raise ValueError(
+                "risk_level must equal the highest severity in findings, or low when findings is empty"
+            )
+        return self

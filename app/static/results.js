@@ -14,8 +14,6 @@ const els = {
   profileRecordsMatched: document.querySelector("#profile-records-matched"),
   riskLevel: document.querySelector("#risk-level"),
   summary: document.querySelector("#summary"),
-  monthlyComparison: document.querySelector("#monthly-comparison"),
-  profileNotes: document.querySelector("#profile-notes"),
   findings: document.querySelector("#findings"),
   findingsCount: document.querySelector("#findings-count"),
   limitations: document.querySelector("#limitations"),
@@ -67,8 +65,6 @@ function renderResult(data) {
 
   els.summary.textContent = data.executive_summary;
 
-  renderMonthlyComparison(data.monthly_comparison || []);
-  renderProfileNotes(data.profile_notes || []);
   renderFindings(data.findings || []);
 
   els.limitations.innerHTML = (data.limitations || [])
@@ -77,45 +73,6 @@ function renderResult(data) {
 
   els.reportHtmlLink.href = data.report_html;
   els.reportJsonLink.href = data.report_json;
-}
-
-function renderMonthlyComparison(notes) {
-  if (!notes.length) {
-    els.monthlyComparison.innerHTML = "<li class='muted'>No feature stood out from this account's own 6-month pattern.</li>";
-    return;
-  }
-  els.monthlyComparison.innerHTML = notes
-    .map((note) => {
-      const evidence = renderEvidence(note.evidence || []);
-      return `
-        <li>
-          <span class="plain-list-label">${escapeHtml(note.title)}</span>
-          <span>${escapeHtml(note.pattern_summary)}</span>
-          ${evidence}
-        </li>`;
-    })
-    .join("");
-}
-
-function renderProfileNotes(notes) {
-  if (!notes.length) {
-    els.profileNotes.innerHTML = "<li class='muted'>No profile change recorded in the supplied history.</li>";
-    return;
-  }
-  els.profileNotes.innerHTML = notes
-    .map((note) => {
-      const when = note.change_dttm ? new Date(note.change_dttm).toLocaleDateString() : "date not recorded";
-      const flag = note.coincides_with_txn_pattern
-        ? "<span class='severity medium'>Coincides with comparison above</span>"
-        : "";
-      return `
-        <li>
-          <span class="plain-list-label">${escapeHtml(formatEnum(note.field))}</span>
-          <span>${escapeHtml(note.change_summary)} (${escapeHtml(when)})</span>
-          ${flag}
-        </li>`;
-    })
-    .join("");
 }
 
 function renderFindings(findings) {
@@ -151,13 +108,6 @@ function renderFindings(findings) {
         </article>`;
     })
     .join("");
-}
-
-function renderEvidence(evidence) {
-  if (!evidence.length) return "";
-  return `<span class="transaction-ids">${evidence.map((item) =>
-    `${escapeHtml(item.year_month)} · ${escapeHtml(item.feature)}=${escapeHtml(item.value)}`
-  ).join("; ")}</span>`;
 }
 
 function formatEnum(value) {
