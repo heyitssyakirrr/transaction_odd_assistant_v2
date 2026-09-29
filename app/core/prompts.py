@@ -15,15 +15,16 @@ Use only the six chronological monthly rows. Provide neutral, evidence-based con
 crime, or wrongdoing. Do not invent counterparties, payment narratives, geography, source of funds, income, expected
 turnover, or any data outside the rows. Do not ask the caller for information.
 
-Silently complete this lookup procedure before writing the answer:
-1. Read txn_count_monthly in all six rows for dormancy. Reactivation requires three immediately preceding zero-count
-   months followed by activity.
-2. Compare the highest and lowest supplied txn_count_monthly and total_amount months. Then check avg_amount,
-   max_amount, and std_amount before describing activity/value change. The first supplied month is not earlier history.
-3. Read debit_count_monthly, credit_count_monthly, monthly_debit, and monthly_credit by month before describing a
-   debit/credit pattern. Use debit and credit labels exactly; do not invent flow direction.
-4. Read pct_burst and pct_trx_gap by month. pct_burst of zero cannot support burst activity. Without a supplied
-   business definition, pct_trx_gap is only a pattern, not a suspicious act.
+Silently complete this review before writing the answer:
+1. Read txn_count_monthly across all six rows. Reactivation requires three immediately preceding zero-count months
+   followed by activity. Do not call a quiet, declining, or fluctuating account dormant.
+2. Compare the highest and lowest txn_count_monthly and total_amount months, then check avg_amount, max_amount and
+   std_amount. Describe a material increase, decrease, or concentration accurately; do not call the first supplied
+   month historical baseline.
+3. Compare debit_count_monthly, credit_count_monthly, monthly_debit and monthly_credit by month. State only the
+   direction actually shown. A change between debit and credit activity is context, not an allegation.
+4. Read pct_burst and pct_trx_gap. A pct_burst of zero cannot support burst activity. pct_trx_gap is a pattern only;
+   no business definition or suspicious act may be inferred from it.
 
 Each of the four checks is assessable from these rows. Use observed only for a material pattern that warrants staff
 context; otherwise use not_observed and still state the actual pattern. Do not output N/A, insufficient_data, a
@@ -36,14 +37,16 @@ under 140 characters.
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
 examples, placeholders, arrays, nested objects, task keys, or extra keys. The object must contain exactly these keys:
 "risk_level", "executive_summary",
-"dormancy_outcome", "dormancy_context", "dormancy_evidence",
-"activity_value_outcome", "activity_value_context", "activity_value_evidence",
-"debit_credit_outcome", "debit_credit_context", "debit_credit_evidence",
-"burst_gap_outcome", "burst_gap_context", "burst_gap_evidence".
+"dormancy_outcome", "dormancy_context", "dormancy_months",
+"activity_value_outcome", "activity_value_context", "activity_value_months",
+"debit_credit_outcome", "debit_credit_context", "debit_credit_months",
+"burst_gap_outcome", "burst_gap_context", "burst_gap_months".
 
-Each outcome is exactly observed or not_observed. Each evidence field contains exactly two comma-separated monthly IDs
-from different months, with no spaces. Form an ID as MYYYYMM.field_name, using only a field in the supplied rows.
-After the final } output no other character.
+Each outcome is exactly observed or not_observed. Each *_months value contains exactly two different supplied months
+as YYYYMM,YYYYMM with no spaces; it is a comparison pair, not an evidence identifier. Never output none, N/A, M,
+field names, or an underscore in a *_months value. Each context must mention only what the selected months and their
+rows show. The executive summary must not say reactivation or dormancy unless dormancy_outcome is observed. After the
+final } output no other character.
 """
 
 
@@ -58,12 +61,10 @@ Use only fields that have an explicit value. Do not output N/A, insufficient_dat
 or a statement about data that is not supplied. Where present, occupation_name is the resolved occupation label and
 must be preferred over occupation_code. Dates are factual profile timeline dates only.
 
-STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
-examples, placeholders, arrays, nested objects, task keys, or extra keys. The object must contain exactly these keys:
-"profile_summary", "profile_evidence". profile_summary is one factual sentence under 220 characters.
-profile_evidence contains exactly two comma-separated P profile IDs with no spaces, selected only from fields present
-in INPUT FACTS. Each supplied field shows its P evidence ID in square brackets; cite that exact ID. After the final }
-output no other character.
+STRICT JSON ONLY. Return one RFC 8259 JSON object with exactly one key: "profile_summary". The value is one factual
+sentence under 220 characters. Do not refer to P1, P2, record IDs, labels, brackets, or a customer name. Include the
+resolved occupation name when present; state citizenship only as a factual attribute. After the final } output no other
+character.
 """
 
 
@@ -96,10 +97,10 @@ def profile_context_input(customer_profile: list[dict[str, str | None]]) -> str:
         ("valid_from_dttm", "effective_from"),
         ("valid_to_dttm", "effective_to"),
     )
-    for record in customer_profile:
-        values = [f"record_id={record['profile_record_id']}"]
+    for index, record in enumerate(customer_profile, start=1):
+        values = [f"profile_version={index}"]
         values.extend(
-            f"{label}[{record['profile_record_id']}.{field}]={record[field]}"
+            f"{label}={record[field]}"
             for field, label in field_labels
             if record.get(field) is not None
         )

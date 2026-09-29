@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal, TypeVar
@@ -29,18 +30,20 @@ TransactionOutcome = Literal["observed", "not_observed"]
 _CHECK_ORDER: tuple[ReviewCheckName, ...] = (
     "dormancy_reactivation", "activity_value_change", "debit_credit_flow", "burst_and_gaps",
 )
-_TRANSACTION_FIELDS: dict[ReviewCheckName, frozenset[str]] = {
-    "dormancy_reactivation": frozenset({"txn_count_monthly"}),
-    "activity_value_change": frozenset({"txn_count_monthly", "total_amount", "avg_amount", "std_amount", "max_amount"}),
-    "debit_credit_flow": frozenset({"debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit", "monthly_avg_debit", "monthly_avg_credit"}),
-    "burst_and_gaps": frozenset({"pct_burst", "pct_trx_gap", "txn_count_monthly"}),
-}
-_PROFILE_CONTEXT_FIELDS = frozenset({
-    "occupation_cd", "occupation", "citizen_cd", "citizenship", "indv_org_type",
-    "last_maint_dt", "valid_from_dttm", "valid_to_dttm",
-})
 _FORBIDDEN_TRANSACTION_TEXT = ("n/a", "insufficient", "nothing happened", "please provide")
-_FORBIDDEN_PROFILE_TEXT = ("n/a", "insufficient", "missing", "unavailable", "not provided", "please provide")
+_FORBIDDEN_PROFILE_TEXT = (
+    "n/a", "insufficient", "missing", "unavailable", "not provided", "please provide", "named p",
+)
+_MONTH_PAIR = re.compile(r"^M?(\d{6})[,_]M?(\d{6})$")
+
+# The model selects the relevant months. The application then attaches exact
+# CSV values, so no model-generated field ID or value reaches bank staff.
+_EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
+    "dormancy_reactivation": ("txn_count_monthly",),
+    "activity_value_change": ("txn_count_monthly", "total_amount"),
+    "debit_credit_flow": ("monthly_debit", "monthly_credit"),
+    "burst_and_gaps": ("pct_burst", "pct_trx_gap"),
+}
 
 
 class ModelOutputError(ValueError):
@@ -51,7 +54,7 @@ class ModelOutputError(ValueError):
 class _FlatCheck:
     outcome: TransactionOutcome
     context: str
-    evidence_text: str
+    months_text: str
 
 
 class AnalysisService:
@@ -105,7 +108,7 @@ class AnalysisService:
             case_id, "profile-context", PROFILE_CONTEXT_SYSTEM_PROMPT,
             profile_context_input(profile), _RawProfileContext,
             self._settings.llm_profile_context_max_response_tokens,
-            lambda value: self._validate_profile_context(value, catalog),
+            self._validate_profile_context,
         )
 
     async def _complete_with_retry(
@@ -153,10 +156,15 @@ class AnalysisService:
 
     def _validate_transaction_context(self, raw: "_RawTransactionContext", catalog: dict[str, EvidenceItem]) -> None:
         checks = raw.checks()
+        known_months = {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
         for name, check in checks.items():
             self._reject_forbidden_text(check.context, _FORBIDDEN_TRANSACTION_TEXT, f"{name} context")
-            ids = self._split_evidence_ids(check.evidence_text, f"{name} evidence")
-            self._validate_transaction_evidence(name, ids, catalog)
+            months = self._split_month_pair(check.months_text, f"{name} months")
+            self._validate_transaction_months(months, known_months, name)
+        if raw.dormancy_outcome == "not_observed" and any(
+            phrase in raw.executive_summary.casefold() for phrase in ("reactivat", "after dormancy", "following dormancy")
+        ):
+            raise ModelOutputError("summary claims dormancy/reactivation although the dormancy check is not observed")
         observed_count = sum(check.outcome == "observed" for check in checks.values())
         if raw.risk_level == "low" and observed_count:
             raise ModelOutputError("low risk requires all transaction checks to be not_observed")
@@ -165,14 +173,8 @@ class AnalysisService:
         if raw.risk_level == "high" and observed_count < 2:
             raise ModelOutputError("high risk requires two observed transaction checks")
 
-    def _validate_profile_context(self, raw: "_RawProfileContext", catalog: dict[str, EvidenceItem]) -> None:
+    def _validate_profile_context(self, raw: "_RawProfileContext") -> None:
         self._reject_forbidden_text(raw.profile_summary, _FORBIDDEN_PROFILE_TEXT, "profile summary")
-        ids = self._split_evidence_ids(raw.profile_evidence, "profile evidence")
-        if any(not item_id.startswith("P") for item_id in ids):
-            raise ModelOutputError("profile summary must cite profile evidence only")
-        if any(item_id.rsplit(".", 1)[-1] not in _PROFILE_CONTEXT_FIELDS for item_id in ids):
-            raise ModelOutputError("profile summary cited an unsupported profile field")
-        self._resolve(ids, catalog, "profile summary")
 
     def _hydrate_assessment(
         self, request: AccountAnalysisRequest, raw: "_RawTransactionContext",
@@ -183,7 +185,8 @@ class AnalysisService:
         findings: list[AccountFinding] = []
         for name in _CHECK_ORDER:
             check = checks[name]
-            evidence = self._resolve(self._split_evidence_ids(check.evidence_text, f"{name} evidence"), catalog, name)
+            months = self._split_month_pair(check.months_text, f"{name} months")
+            evidence = self._evidence_for_months(name, months, catalog)
             review_checks.append(ReviewCheck(check=name, outcome=check.outcome, rationale=check.context, evidence=evidence))
             if check.outcome == "observed":
                 findings.append(AccountFinding(
@@ -202,8 +205,10 @@ class AnalysisService:
         )
 
     def _hydrate_profile_context(self, raw: "_RawProfileContext", catalog: dict[str, EvidenceItem]) -> CustomerProfileContext:
-        ids = self._split_evidence_ids(raw.profile_evidence, "profile evidence")
-        return CustomerProfileContext(summary=raw.profile_summary, evidence=self._resolve(ids, catalog, "profile summary"))
+        return CustomerProfileContext(
+            summary=raw.profile_summary,
+            evidence=self._canonical_profile_evidence(catalog),
+        )
 
     @staticmethod
     def _reject_forbidden_text(value: str, phrases: tuple[str, ...], label: str) -> None:
@@ -211,20 +216,47 @@ class AnalysisService:
             raise ModelOutputError(f"{label} contains a prohibited missing-data phrase")
 
     @staticmethod
-    def _split_evidence_ids(value: str, label: str) -> list[str]:
-        ids = value.split(",") if value else []
-        if len(ids) != 2 or len(ids) != len(set(ids)) or any(not item or item != item.strip() for item in ids):
-            raise ModelOutputError(f"{label} must contain exactly two distinct comma-separated IDs without spaces")
-        return ids
+    def _split_month_pair(value: str, label: str) -> list[str]:
+        """Accept two source months and safely normalise Qwen's common spelling.
 
-    def _validate_transaction_evidence(self, name: ReviewCheckName, ids: list[str], catalog: dict[str, EvidenceItem]) -> None:
-        if any(not item_id.startswith("M") or "." not in item_id for item_id in ids):
-            raise ModelOutputError(f"{name} evidence must cite monthly IDs")
-        if len({item_id.split(".", 1)[0] for item_id in ids}) != 2:
-            raise ModelOutputError(f"{name} evidence must cite two different months")
-        if any(item_id.rsplit(".", 1)[-1] not in _TRANSACTION_FIELDS[name] for item_id in ids):
-            raise ModelOutputError(f"{name} evidence cited an unrelated field")
-        self._resolve(ids, catalog, f"{name} evidence")
+        ``M202607_M202608`` and ``202607,202608`` denote the same pair. This
+        fixes punctuation only; it never derives a month or invents a value.
+        """
+        match = _MONTH_PAIR.fullmatch(value.strip().replace(" ", ""))
+        if match is None or match.group(1) == match.group(2):
+            raise ModelOutputError(f"{label} must contain two distinct YYYYMM values")
+        return [match.group(1), match.group(2)]
+
+    @staticmethod
+    def _validate_transaction_months(months: list[str], known_months: set[str], name: ReviewCheckName) -> None:
+        unknown = [month for month in months if month not in known_months]
+        if unknown:
+            raise ModelOutputError(f"{name} selected month(s) not present in supplied data: {', '.join(unknown)}")
+
+    def _evidence_for_months(
+        self, name: ReviewCheckName, months: list[str], catalog: dict[str, EvidenceItem],
+    ) -> list[EvidenceItem]:
+        ids = [f"M{month}.{field}" for month in months for field in _EVIDENCE_FIELDS[name]]
+        return self._resolve(ids, catalog, name)
+
+    @staticmethod
+    def _canonical_profile_evidence(catalog: dict[str, EvidenceItem]) -> list[EvidenceItem]:
+        """Attach supplied profile values without asking the model to cite IDs."""
+        fields = (
+            "occupation", "citizenship", "indv_org_type", "last_maint_dt",
+            "valid_from_dttm", "valid_to_dttm", "occupation_cd", "citizen_cd",
+        )
+        record_ids = sorted(
+            {item_id.split(".", 1)[0] for item_id in catalog if item_id.startswith("P")},
+            key=lambda record_id: int(record_id[1:]), reverse=True,
+        )
+        ids = [
+            f"{record_id}.{field}" for record_id in record_ids for field in fields
+            if f"{record_id}.{field}" in catalog
+        ][:4]
+        if not ids:
+            raise ModelOutputError("no factual profile evidence is available to render the profile summary")
+        return [catalog[item_id] for item_id in ids]
 
     @staticmethod
     def _resolve(ids: list[str], catalog: dict[str, EvidenceItem], label: str) -> list[EvidenceItem]:
@@ -303,27 +335,26 @@ class _RawTransactionContext(BaseModel):
     executive_summary: str = Field(min_length=1, max_length=260)
     dormancy_outcome: TransactionOutcome
     dormancy_context: str = Field(min_length=1, max_length=140)
-    dormancy_evidence: str = Field(min_length=1, max_length=160)
+    dormancy_months: str = Field(min_length=1, max_length=32)
     activity_value_outcome: TransactionOutcome
     activity_value_context: str = Field(min_length=1, max_length=140)
-    activity_value_evidence: str = Field(min_length=1, max_length=160)
+    activity_value_months: str = Field(min_length=1, max_length=32)
     debit_credit_outcome: TransactionOutcome
     debit_credit_context: str = Field(min_length=1, max_length=140)
-    debit_credit_evidence: str = Field(min_length=1, max_length=160)
+    debit_credit_months: str = Field(min_length=1, max_length=32)
     burst_gap_outcome: TransactionOutcome
     burst_gap_context: str = Field(min_length=1, max_length=140)
-    burst_gap_evidence: str = Field(min_length=1, max_length=160)
+    burst_gap_months: str = Field(min_length=1, max_length=32)
 
     def checks(self) -> dict[ReviewCheckName, _FlatCheck]:
         return {
-            "dormancy_reactivation": _FlatCheck(self.dormancy_outcome, self.dormancy_context, self.dormancy_evidence),
-            "activity_value_change": _FlatCheck(self.activity_value_outcome, self.activity_value_context, self.activity_value_evidence),
-            "debit_credit_flow": _FlatCheck(self.debit_credit_outcome, self.debit_credit_context, self.debit_credit_evidence),
-            "burst_and_gaps": _FlatCheck(self.burst_gap_outcome, self.burst_gap_context, self.burst_gap_evidence),
+            "dormancy_reactivation": _FlatCheck(self.dormancy_outcome, self.dormancy_context, self.dormancy_months),
+            "activity_value_change": _FlatCheck(self.activity_value_outcome, self.activity_value_context, self.activity_value_months),
+            "debit_credit_flow": _FlatCheck(self.debit_credit_outcome, self.debit_credit_context, self.debit_credit_months),
+            "burst_and_gaps": _FlatCheck(self.burst_gap_outcome, self.burst_gap_context, self.burst_gap_months),
         }
 
 
 class _RawProfileContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
     profile_summary: str = Field(min_length=1, max_length=220)
-    profile_evidence: str = Field(min_length=1, max_length=160)
