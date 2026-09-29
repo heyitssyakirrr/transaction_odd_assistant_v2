@@ -93,6 +93,10 @@ class OpenAICompatibleClient:
         )
         content = _extract_content(payload)
         self._log_raw_response(content)
+        if choice.get("finish_reason") == "length":
+            raise LlmServiceError(
+                "LLM output reached MAX_RESPONSE_TOKENS and was rejected; it was not used as an assessment."
+            )
         try:
             return _parse_json_content(content)
         except LlmServiceError:
@@ -135,14 +139,23 @@ class OpenAICompatibleClient:
         }
         if self._settings.llm_repetition_penalty:
             body["repetition_penalty"] = self._settings.llm_repetition_penalty
+        if self._settings.llm_stop_sequences:
+            body["stop"] = list(self._settings.llm_stop_sequences)
         if use_response_format and response_schema:
-            body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "schema": response_schema,
-                },
-            }
+            protocol = self._settings.llm_structured_output_protocol
+            if protocol == "json_schema":
+                body["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "schema": response_schema,
+                    },
+                }
+            elif protocol == "guided_json":
+                # vLLM's legacy OpenAI-compatible structured-output field.
+                body["guided_json"] = response_schema
+            elif protocol == "json_object":
+                body["response_format"] = {"type": "json_object"}
         return body
 
     async def _post_with_retries(self, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:

@@ -53,15 +53,28 @@ class Settings:
         "OCCUPATION_CODE_CSV_PATH",
         str(BASE_DIR / "data" / "occupation_codes.csv"),
     )
-    # The compact strict assessment schema fits comfortably in this budget.
-    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "1200"))
+    # The compact single-account decision has a deliberately small completion
+    # budget. A larger limit lets a misconfigured chat template run away.
+    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "700"))
     # Qwen's low-variance sampling defaults. Set only parameters accepted by
     # the bank's OpenAI-compatible loader.
-    llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+    llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0"))
     llm_top_p: float = float(os.getenv("LLM_TOP_P", "0.001"))
     # This is a vLLM/Qwen extension rather than a portable OpenAI parameter.
     # Leave disabled unless the bank loader is confirmed to accept it.
     llm_repetition_penalty: float = float(os.getenv("LLM_REPETITION_PENALTY", "0"))
+    # "json_schema" is the current OpenAI/vLLM contract. Older vLLM loaders
+    # may require "guided_json" instead; only use it after platform confirms
+    # that request field is supported.
+    llm_structured_output_protocol: str = os.getenv("LLM_STRUCTURED_OUTPUT_PROTOCOL", "json_schema").lower()
+    # Qwen's native end token and the literal role labels seen when a loader
+    # has an incomplete chat template. These stop generation after a complete
+    # answer; they are never accepted as part of the JSON response.
+    llm_stop_sequences: tuple[str, ...] = tuple(
+        value for value in os.getenv(
+            "LLM_STOP_SEQUENCES", "<|im_end|>|<|endoftext|>|system:|user:"
+        ).split("|") if value
+    )
     report_directory: str = os.getenv("REPORT_DIRECTORY", str(BASE_DIR / "data" / "reports"))
     require_human_review: bool = os.getenv("REQUIRE_HUMAN_REVIEW", "true").lower() == "true"
 
@@ -87,6 +100,10 @@ class Settings:
             raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1")
         if self.llm_repetition_penalty < 0:
             raise ValueError("LLM_REPETITION_PENALTY must not be negative")
+        if self.llm_structured_output_protocol not in {"json_schema", "guided_json", "json_object", "off"}:
+            raise ValueError(
+                "LLM_STRUCTURED_OUTPUT_PROTOCOL must be json_schema, guided_json, json_object, or off"
+            )
         if self.llm_context_window_tokens and self.llm_prompt_token_budget <= 0:
             raise ValueError(
                 "LLM_CONTEXT_WINDOW_TOKENS must exceed MAX_RESPONSE_TOKENS plus "
