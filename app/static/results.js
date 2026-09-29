@@ -17,7 +17,8 @@ const els = {
   reviewChecks: document.querySelector("#review-checks"),
   findings: document.querySelector("#findings"),
   findingsCount: document.querySelector("#findings-count"),
-  reviewerQuestions: document.querySelector("#reviewer-questions"),
+  customerProfileSection: document.querySelector("#customer-profile-section"),
+  customerProfileContext: document.querySelector("#customer-profile-context"),
   limitations: document.querySelector("#limitations"),
   reportHtmlLink: document.querySelector("#report-html-link"),
   reportJsonLink: document.querySelector("#report-json-link"),
@@ -75,10 +76,7 @@ function renderResult(data) {
 
   renderReviewChecks(data.review_checks || []);
   renderFindings(data.findings || []);
-
-  els.reviewerQuestions.innerHTML = (data.reviewer_questions || [])
-    .map((item) => `<li>${escapeHtml(item.question)}${renderInlineEvidence(item.evidence || [])}</li>`)
-    .join("") || "<li class='muted'>No additional reviewer question was returned.</li>";
+  renderCustomerProfileContext(data.customer_profile_context);
 
   els.limitations.innerHTML = (data.limitations || [])
     .map((item) => `<li>${escapeHtml(item.limitation)}${renderInlineEvidence(item.evidence || [])}</li>`)
@@ -86,6 +84,20 @@ function renderResult(data) {
 
   els.reportHtmlLink.href = data.report_html;
   els.reportJsonLink.href = data.report_json;
+}
+
+function renderCustomerProfileContext(context) {
+  if (!context) {
+    els.customerProfileSection.classList.add("hidden");
+    return;
+  }
+  els.customerProfileSection.classList.remove("hidden");
+  const evidenceItems = renderEvidenceItems(context.evidence || []);
+  els.customerProfileContext.innerHTML = `
+    <article class="finding severity-low">
+      <p>${escapeHtml(context.summary)}</p>
+      ${evidenceItems ? `<h5>Profile fields used</h5><ul>${evidenceItems}</ul>` : ""}
+    </article>`;
 }
 
 function renderReviewChecks(checks) {
@@ -116,7 +128,7 @@ function renderFindings(findings) {
 
   if (!findings.length) {
     els.findings.innerHTML =
-      "<p class='muted'>No material finding with a verified year_month citation was returned.</p>";
+      "<p class='muted'>No observed transaction context was returned.</p>";
     return;
   }
 

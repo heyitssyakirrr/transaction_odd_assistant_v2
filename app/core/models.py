@@ -14,14 +14,12 @@ FindingCategory = Literal[
     "activity_value_change",
     "debit_credit_flow",
     "burst_and_gaps",
-    "profile_consistency",
 ]
 ReviewCheckName = Literal[
     "dormancy_reactivation",
     "activity_value_change",
     "debit_credit_flow",
     "burst_and_gaps",
-    "profile_consistency",
 ]
 ReviewOutcome = Literal["observed", "not_observed", "insufficient_data"]
 ProfileEvidenceSource = Literal["monthly_summary", "customer_profile"]
@@ -108,6 +106,13 @@ class AssessmentLimitation(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list, max_length=4)
 
 
+class CustomerProfileContext(BaseModel):
+    """Factual customer-profile information, separate from transaction risk."""
+
+    summary: str = Field(min_length=1, max_length=300)
+    evidence: list[EvidenceItem] = Field(min_length=1, max_length=4)
+
+
 class AccountAssessment(BaseModel):
     case_id: str
     acct_num: str
@@ -115,9 +120,10 @@ class AccountAssessment(BaseModel):
     decision: Literal["close_case", "continue_due_diligence"]
     risk_level: RiskLevel
     executive_summary: str
-    review_checks: list[ReviewCheck] = Field(min_length=5, max_length=5)
+    review_checks: list[ReviewCheck] = Field(min_length=4, max_length=4)
     findings: list[AccountFinding] = Field(default_factory=list)
     reviewer_questions: list[ReviewerQuestion] = Field(default_factory=list, max_length=3)
+    customer_profile_context: CustomerProfileContext | None = None
     limitations: list[AssessmentLimitation] = Field(default_factory=list)
     months_reviewed: int
     profile_records_matched: int

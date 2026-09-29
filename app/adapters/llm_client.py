@@ -330,7 +330,8 @@ def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) 
     if fenced:
         candidates.append(fenced.group(1).strip())
     if repair:
-        candidates.extend(_top_level_json_objects(content))
+        if prefix := _first_complete_object_at_start(content):
+            candidates.append(prefix)
         recovered = _recover_json_object(content)
         if recovered:
             candidates.append(recovered)
@@ -349,14 +350,21 @@ def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) 
     raise LlmOutputFormatError("LLM response was not a recoverable JSON object.")
 
 
-def _top_level_json_objects(text: str) -> list[str]:
-    """Return complete top-level JSON object candidates without parsing prose."""
-    candidates: list[str] = []
+def _first_complete_object_at_start(text: str) -> str | None:
+    """Extract a complete first JSON object before a faulty chat continuation.
+
+    Qwen may continue with a natural-language question after a completed
+    object. This accepts only an object beginning at the first non-whitespace
+    character; it never searches prose for a later object or repairs meaning.
+    Duplicate keys remain rejected by the JSON parser.
+    """
+    fragment = text.lstrip()
+    if not fragment.startswith("{"):
+        return None
     depth = 0
-    start: int | None = None
     in_string = False
     escaped = False
-    for index, char in enumerate(text):
+    for index, char in enumerate(fragment):
         if escaped:
             escaped = False
             continue
@@ -369,15 +377,14 @@ def _top_level_json_objects(text: str) -> list[str]:
         if in_string:
             continue
         if char == "{":
-            if depth == 0:
-                start = index
             depth += 1
-        elif char == "}" and depth:
+        elif char == "}":
             depth -= 1
-            if depth == 0 and start is not None:
-                candidates.append(text[start:index + 1])
-                start = None
-    return candidates
+            if depth == 0:
+                return fragment[:index + 1]
+            if depth < 0:
+                return None
+    return None
 
 
 def _recover_json_object(text: str) -> str | None:

@@ -60,7 +60,7 @@ class Settings:
     # on the bank's Qwen loader. They may run concurrently through the shared
     # work queue.
     llm_transaction_max_response_tokens: int = int(os.getenv("LLM_TRANSACTION_MAX_RESPONSE_TOKENS", "500"))
-    llm_profile_context_max_response_tokens: int = int(os.getenv("LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS", "260"))
+    llm_profile_context_max_response_tokens: int = int(os.getenv("LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS", "180"))
     # Retained for backwards-compatible .env files; no longer used by the
     # account-context workflow.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))

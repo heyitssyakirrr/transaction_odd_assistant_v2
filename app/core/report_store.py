@@ -115,11 +115,14 @@ class ReportStore:
             """
             for check in result.review_checks
         )
-        reviewer_questions = "".join(
-            f"<li>{html.escape(question.question)}"
-            f"<br><span class='txn-ids'>{html.escape('; '.join(f'{item.label}={item.value}' for item in question.evidence))}</span>"
-            f"</li>" for question in result.reviewer_questions
-        ) or "<li class='muted'>No additional reviewer question was returned.</li>"
+        profile_context = ""
+        if result.customer_profile_context is not None:
+            profile_context = f"""
+<h2>Customer profile context</h2>
+<article class="finding">
+  <p>{html.escape(result.customer_profile_context.summary)}</p>
+  <ul>{''.join(f'<li><span class="txn-ids">{html.escape(item.label)}={html.escape(item.value)}</span></li>' for item in result.customer_profile_context.evidence)}</ul>
+</article>"""
 
         risk_border = self._RISK_BORDER_COLORS.get(result.risk_level, "#d3d6db")
 
@@ -203,10 +206,9 @@ ul.plain {{ padding-left: 20px; }}
 <p><small>{result.months_reviewed} month(s) reviewed; {result.profile_records_matched} linked profile record(s) available.</small></p>
 <h2>Mandatory review coverage</h2>
 {review_checks}
+{profile_context}
 <h2>Material findings</h2>
 {findings}
-<h2>Reviewer focus</h2>
-<ul class="plain">{reviewer_questions}</ul>
 <h2>Limitations</h2>
 <ul class="plain">{''.join(f'<li>{html.escape(item.limitation)}</li>' for item in result.limitations) or '<li class="muted">None recorded.</li>'}</ul>
 </body>
