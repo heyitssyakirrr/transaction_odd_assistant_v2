@@ -90,6 +90,11 @@ class Settings:
         value.strip() for value in os.getenv("LLM_STOP_SEQUENCES", "").split(",") if value.strip()
     ) or _DEFAULT_LLM_STOP_SEQUENCES
     report_directory: str = os.getenv("REPORT_DIRECTORY", str(BASE_DIR / "data" / "reports"))
+    # Application logs are persisted separately from generated staff reports.
+    # Mount this directory on persistent storage in OpenShift when logs must
+    # survive a pod replacement.
+    log_directory: str = os.getenv("LOG_DIRECTORY", str(BASE_DIR / "data" / "logs"))
+    log_retention_days: int = int(os.getenv("LOG_RETENTION_DAYS", "30"))
     require_human_review: bool = os.getenv("REQUIRE_HUMAN_REVIEW", "true").lower() == "true"
 
     def __post_init__(self) -> None:
@@ -106,6 +111,7 @@ class Settings:
             "LLM_PROFILE_MAX_RESPONSE_TOKENS": self.llm_profile_max_response_tokens,
             "LLM_SYNTHESIS_MAX_RESPONSE_TOKENS": self.llm_synthesis_max_response_tokens,
             "LLM_LOG_RAW_RESPONSE_MAX_CHARS": self.llm_log_raw_response_max_chars,
+            "LOG_RETENTION_DAYS": self.log_retention_days,
         }
         invalid = [name for name, value in positive_values.items() if value <= 0]
         if invalid:
@@ -137,6 +143,11 @@ class Settings:
     @property
     def report_directory_path(self) -> Path:
         path = Path(self.report_directory)
+        return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def log_directory_path(self) -> Path:
+        path = Path(self.log_directory)
         return path if path.is_absolute() else BASE_DIR / path
 
     @property

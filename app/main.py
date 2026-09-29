@@ -11,10 +11,11 @@ from app.config import Settings
 from app.core.analysis_service import AnalysisService
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.report_store import ReportStore
+from app.logging_config import LOG_FORMAT, configure_persistent_logging
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format=LOG_FORMAT,
 )
 logger = logging.getLogger("app.main")
 
@@ -22,6 +23,10 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 
 settings = Settings()
+log_file = configure_persistent_logging(settings.log_directory_path, settings.log_retention_days)
+
+if log_file is not None:
+    logger.info("Persistent application logging enabled: %s", log_file)
 
 if not settings.llm_base_url:
     logger.warning(
