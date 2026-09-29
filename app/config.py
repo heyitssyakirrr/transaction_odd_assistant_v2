@@ -54,11 +54,15 @@ class Settings:
         "OCCUPATION_CODE_CSV_PATH",
         str(BASE_DIR / "data" / "occupation_codes.csv"),
     )
-    # One concise account assessment. A bounded response reduces transcript
-    # repetition without starving the five required review dimensions.
+    # Compatibility default for callers outside the account-context workflow.
     max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "700"))
-    # Retained for backwards-compatible .env files; the one-call design does
-    # not use these stage budgets.
+    # Two small context calls are more reliable than one deeply nested report
+    # on the bank's Qwen loader. They may run concurrently through the shared
+    # work queue.
+    llm_transaction_max_response_tokens: int = int(os.getenv("LLM_TRANSACTION_MAX_RESPONSE_TOKENS", "500"))
+    llm_profile_context_max_response_tokens: int = int(os.getenv("LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS", "260"))
+    # Retained for backwards-compatible .env files; no longer used by the
+    # account-context workflow.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
     llm_flow_max_response_tokens: int = int(os.getenv("LLM_FLOW_MAX_RESPONSE_TOKENS", "260"))
     llm_profile_max_response_tokens: int = int(os.getenv("LLM_PROFILE_MAX_RESPONSE_TOKENS", "220"))
@@ -71,10 +75,14 @@ class Settings:
     # Leave disabled unless the bank loader is confirmed to accept it.
     llm_repetition_penalty: float = float(os.getenv("LLM_REPETITION_PENALTY", "0"))
     # The bank loader currently ignores both guided_json and response_format.
-    # Keep this off until platform support is confirmed; prompt/template plus
-    # bounded mechanical recovery provides the compatibility path.
+    # Keep this off until platform support is confirmed; flat contracts plus
+    # bounded mechanical recovery provide the compatibility path.
     llm_structured_output_protocol: str = os.getenv("LLM_STRUCTURED_OUTPUT_PROTOCOL", "off").lower()
     llm_json_repair_enabled: bool = os.getenv("LLM_JSON_REPAIR_ENABLED", "true").lower() == "true"
+    # A malformed but complete response may succeed after one clean retry.
+    # Truncated (`finish_reason=length`) responses never retry because the
+    # same prompt and output cap would be expected to fail again.
+    llm_format_retry_enabled: bool = os.getenv("LLM_FORMAT_RETRY_ENABLED", "true").lower() == "true"
     # Use commas, not pipes: Qwen's native special tokens themselves contain
     # pipes. Literal assistant: prevents the loader from starting a duplicate
     # assistant turn after a complete object.
@@ -91,6 +99,8 @@ class Settings:
             "LLM_QUEUE_MAXSIZE": self.llm_queue_maxsize,
             "LLM_QUEUE_ENQUEUE_TIMEOUT_SECONDS": self.llm_queue_enqueue_timeout_seconds,
             "MAX_RESPONSE_TOKENS": self.max_response_tokens,
+            "LLM_TRANSACTION_MAX_RESPONSE_TOKENS": self.llm_transaction_max_response_tokens,
+            "LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS": self.llm_profile_context_max_response_tokens,
             "LLM_TIMELINE_MAX_RESPONSE_TOKENS": self.llm_timeline_max_response_tokens,
             "LLM_FLOW_MAX_RESPONSE_TOKENS": self.llm_flow_max_response_tokens,
             "LLM_PROFILE_MAX_RESPONSE_TOKENS": self.llm_profile_max_response_tokens,

@@ -46,6 +46,10 @@ class LlmOutputFormatError(LlmServiceError):
     """The model answer cannot be safely normalised into one JSON object."""
 
 
+class LlmOutputTruncatedError(LlmOutputFormatError):
+    """The model hit its output cap, so a same-budget retry is not useful."""
+
+
 class OpenAICompatibleClient:
     """Compatibility client for a loader that does not enforce JSON schemas.
 
@@ -100,7 +104,7 @@ class OpenAICompatibleClient:
         content = _extract_content(payload)
         self._log_raw_response(content)
         if choice.get("finish_reason") == "length":
-            raise LlmOutputFormatError(
+            raise LlmOutputTruncatedError(
                 "LLM output reached MAX_RESPONSE_TOKENS and was rejected; it was not used as an assessment."
             )
         try:
@@ -330,11 +334,15 @@ def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) 
         recovered = _recover_json_object(content)
         if recovered:
             candidates.append(recovered)
+        # Qwen occasionally emits a JSON object with otherwise-valid values
+        # but bare identifier keys. Quoting those keys is syntactic recovery
+        # only; schema and citation validation still reject wrong content.
+        candidates.extend(_quote_bare_object_keys(candidate) for candidate in list(candidates))
 
     for candidate in reversed(_unique(candidates)):
         try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
+            parsed = json.loads(candidate, object_pairs_hook=_reject_duplicate_json_keys)
+        except (json.JSONDecodeError, ValueError):
             continue
         if isinstance(parsed, dict):
             return parsed
@@ -444,6 +452,76 @@ def _remove_trailing_commas(text: str) -> str:
             result.append(char)
         index += 1
     return "".join(result)
+
+
+def _quote_bare_object_keys(text: str) -> str:
+    """Quote simple unquoted object keys outside JSON strings.
+
+    This deliberately supports only identifiers in an object-key position,
+    such as `{ risk_level: "medium" }`. It does not repair values, duplicate
+    keys, missing business fields, or free-form prose.
+    """
+    result: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+    expects_key = False
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            result.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and in_string:
+            result.append(char)
+            escaped = True
+            index += 1
+            continue
+        if char == '"':
+            result.append(char)
+            in_string = not in_string
+            index += 1
+            continue
+        if in_string:
+            result.append(char)
+            index += 1
+            continue
+        if char in "{,":
+            expects_key = True
+            result.append(char)
+            index += 1
+            continue
+        if expects_key and char.isspace():
+            result.append(char)
+            index += 1
+            continue
+        if expects_key and (char.isalpha() or char == "_"):
+            end = index + 1
+            while end < len(text) and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            after = end
+            while after < len(text) and text[after].isspace():
+                after += 1
+            if after < len(text) and text[after] == ":":
+                result.extend(("\"", text[index:end], "\""))
+                index = end
+                expects_key = False
+                continue
+        expects_key = False
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Keep JSON duplicate-key behaviour from silently hiding model output."""
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
 
 
 def _unique(values: list[str]) -> list[str]:
