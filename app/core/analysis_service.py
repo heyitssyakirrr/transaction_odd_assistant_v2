@@ -26,6 +26,20 @@ _CHECK_ORDER: tuple[ReviewCheckName, ...] = (
 )
 _CHECK_CATEGORY: dict[ReviewCheckName, FindingCategory] = {name: name for name in _CHECK_ORDER}
 _SEVERITY_RANK: dict[RiskLevel, int] = {"low": 0, "medium": 1, "high": 2}
+_CHECK_FIELDS: dict[ReviewCheckName, frozenset[str]] = {
+    "dormancy_reactivation": frozenset({"txn_count_monthly"}),
+    "activity_value_change": frozenset({
+        "txn_count_monthly", "total_amount", "avg_amount", "std_amount", "max_amount",
+    }),
+    "debit_credit_flow": frozenset({
+        "debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit",
+        "monthly_avg_debit", "monthly_avg_credit",
+    }),
+    "burst_and_gaps": frozenset({"pct_burst", "pct_trx_gap", "txn_count_monthly"}),
+}
+_PROFILE_CONTEXT_FIELDS = frozenset({
+    "occupation_cd", "occupation", "indv_org_type", "last_maint_dt", "valid_from_dttm", "valid_to_dttm",
+})
 
 
 class ModelOutputError(ValueError):
@@ -85,6 +99,8 @@ class AnalysisService:
             raise ModelOutputError(f"LLM output did not meet the assessment schema: {exc}") from exc
 
     def _hydrate_assessment(self, request: AccountAnalysisRequest, raw: "_RawAssessment", catalog: dict[str, EvidenceItem]) -> AccountAssessment:
+        for name, item in raw.review_checks.ordered_items():
+            self._validate_review_check_evidence(name, item, catalog)
         checks = [
             ReviewCheck(check=name, outcome=item.outcome, rationale=item.rationale,
                         evidence=self._resolve(item.evidence_ids, catalog, f"review check '{name}'"))
@@ -98,6 +114,7 @@ class AnalysisService:
             ) for item in raw.findings
         ]
         for finding in findings:
+            self._validate_finding_evidence(finding.category, finding.evidence, catalog)
             if finding.category not in observed:
                 raise ModelOutputError(f"finding '{finding.category}' has no observed supporting review check")
         if "profile_consistency" in {finding.category for finding in findings}:
@@ -117,6 +134,43 @@ class AnalysisService:
             limitations=self._static_limitations(), months_reviewed=len(request.monthly_summary),
             profile_records_matched=len(request.customer_profile), generated_at=datetime.now(timezone.utc),
         )
+
+    @staticmethod
+    def _validate_review_check_evidence(
+        name: ReviewCheckName, item: "_RawReviewCheck", catalog: dict[str, EvidenceItem],
+    ) -> None:
+        """Reject citations that cannot support the named analytic check.
+
+        This is an output-integrity gate, not a transaction-risk calculation:
+        Qwen selects the interpretation; the application merely ensures the
+        cited supplied fields and months can substantiate that interpretation.
+        """
+        evidence_ids = list(dict.fromkeys(item.evidence_ids))
+        if name == "profile_consistency":
+            profile_ids = [item_id for item_id in evidence_ids if item_id.startswith("P")]
+            if any(item_id.rsplit(".", 1)[-1] not in _PROFILE_CONTEXT_FIELDS for item_id in profile_ids):
+                raise ModelOutputError("profile consistency cannot cite citizenship as risk context")
+            if item.outcome == "observed" and (not profile_ids or not any(item_id.startswith("M") for item_id in evidence_ids)):
+                raise ModelOutputError("observed profile consistency requires both profile and monthly evidence")
+            return
+
+        monthly_ids = [item_id for item_id in evidence_ids if item_id.startswith("M")]
+        months = {item_id.split(".", 1)[0] for item_id in monthly_ids}
+        if len(months) < 2:
+            raise ModelOutputError(f"review check '{name}' requires monthly comparison evidence from two different months")
+        allowed_fields = _CHECK_FIELDS[name]
+        if any(item_id.rsplit(".", 1)[-1] not in allowed_fields for item_id in monthly_ids):
+            raise ModelOutputError(f"review check '{name}' cited a field outside its evidence contract")
+        if any(item_id not in catalog for item_id in evidence_ids):
+            raise ModelOutputError(f"review check '{name}' cited unavailable evidence")
+
+    @classmethod
+    def _validate_finding_evidence(
+        cls, category: FindingCategory, evidence: list[EvidenceItem], catalog: dict[str, EvidenceItem],
+    ) -> None:
+        evidence_ids = [item.evidence_id for item in evidence]
+        raw_check = _RawReviewCheck(outcome="observed", rationale="citation check", evidence_ids=evidence_ids)
+        cls._validate_review_check_evidence(category, raw_check, catalog)
 
     def _manual_review_fallback(self, request: AccountAnalysisRequest, error: str) -> AccountAssessment:
         """Never convert an unverifiable model answer into a low-risk closure."""

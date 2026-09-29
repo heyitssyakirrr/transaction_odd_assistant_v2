@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent # change based on where u put the file
+_DEFAULT_LLM_STOP_SEQUENCES = ("<|im_end|>", "<|endoftext|>", "assistant:", "system:", "user:")
 
 
 def _load_dotenv(path: Path) -> None:
@@ -55,7 +56,7 @@ class Settings:
     )
     # One concise account assessment. A bounded response reduces transcript
     # repetition without starving the five required review dimensions.
-    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "850"))
+    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "700"))
     # Retained for backwards-compatible .env files; the one-call design does
     # not use these stage budgets.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
@@ -74,14 +75,12 @@ class Settings:
     # bounded mechanical recovery provides the compatibility path.
     llm_structured_output_protocol: str = os.getenv("LLM_STRUCTURED_OUTPUT_PROTOCOL", "off").lower()
     llm_json_repair_enabled: bool = os.getenv("LLM_JSON_REPAIR_ENABLED", "true").lower() == "true"
-    # Qwen's native end token and the literal role labels seen when a loader
-    # has an incomplete chat template. These stop generation after a complete
-    # answer; they are never accepted as part of the JSON response.
+    # Use commas, not pipes: Qwen's native special tokens themselves contain
+    # pipes. Literal assistant: prevents the loader from starting a duplicate
+    # assistant turn after a complete object.
     llm_stop_sequences: tuple[str, ...] = tuple(
-        value for value in os.getenv(
-            "LLM_STOP_SEQUENCES", "<|im_end|>|<|endoftext|>|system:|user:"
-        ).split("|") if value
-    )
+        value.strip() for value in os.getenv("LLM_STOP_SEQUENCES", "").split(",") if value.strip()
+    ) or _DEFAULT_LLM_STOP_SEQUENCES
     report_directory: str = os.getenv("REPORT_DIRECTORY", str(BASE_DIR / "data" / "reports"))
     require_human_review: bool = os.getenv("REQUIRE_HUMAN_REVIEW", "true").lower() == "true"
 

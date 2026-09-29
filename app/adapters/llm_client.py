@@ -20,6 +20,7 @@ logger = logging.getLogger("app.llm_client")
 _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 1
 _BACKOFF_BASE_SECONDS = 0.75
+_QWEN_ASSESSMENT_TOKEN_CAP = 700
 
 
 class LlmServiceError(RuntimeError):
@@ -132,6 +133,13 @@ class OpenAICompatibleClient:
         schema_name: str = "response",
         max_response_tokens: int | None = None,
     ) -> dict[str, Any]:
+        requested_tokens = max_response_tokens or self._settings.max_response_tokens
+        output_tokens = min(requested_tokens, _QWEN_ASSESSMENT_TOKEN_CAP)
+        if requested_tokens > _QWEN_ASSESSMENT_TOKEN_CAP:
+            logger.warning(
+                "LLM response-token request clamped for Qwen assessment: requested=%d cap=%d",
+                requested_tokens, _QWEN_ASSESSMENT_TOKEN_CAP,
+            )
         body: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": [
@@ -140,7 +148,7 @@ class OpenAICompatibleClient:
             ],
             "temperature": self._settings.llm_temperature,
             "top_p": self._settings.llm_top_p,
-            "max_tokens": max_response_tokens or self._settings.max_response_tokens,
+            "max_tokens": output_tokens,
             "stream": False,
         }
         if self._settings.llm_repetition_penalty:
