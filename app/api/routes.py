@@ -17,7 +17,6 @@ from app.core.summary_loader import (
     generate_case_id,
     load_customer_profile,
     parse_monthly_summary_csv,
-    review_window,
 )
 
 logger = logging.getLogger("app.api")
@@ -58,10 +57,9 @@ def build_router(
             case_id = generate_case_id(acct_num)
             logger.info("Starting analysis: case=%s acct=%s months=%s", case_id, acct_num, len(monthly_summary))
 
-            window_start, window_end = review_window(monthly_summary)
             # Parquet I/O is blocking; keep it off the event loop.
             customer_profile = await asyncio.to_thread(
-                load_customer_profile, customer_info_path, acct_num, window_start, window_end
+                load_customer_profile, customer_info_path, acct_num
             )
 
             request = AccountAnalysisRequest(

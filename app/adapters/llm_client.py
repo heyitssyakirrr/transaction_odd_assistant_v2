@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import random
-import re
 from typing import Any
 
 import httpx
@@ -20,21 +19,6 @@ logger = logging.getLogger("app.llm_client")
 _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 1
 _BACKOFF_BASE_SECONDS = 0.75
-
-# Cuts generation short if the model keeps talking after its JSON object,
-# instead of burning the rest of max_tokens on commentary. Deliberately NOT
-# copied from a flat-schema stop list like "}\n{" or "}\n " -- those match
-# an ordinary nested object's closing brace too (see the schemas in
-# prompts.py, which nest arrays of objects) and would truncate a correct,
-# in-progress response. These patterns only match a genuine blank line,
-# which the system prompt explicitly tells the model not to
-# produce inside a compact, single-line JSON object -- so seeing either one
-# is itself a sign the model has moved past the JSON and started rambling.
-# "```" is deliberately excluded: Qwen often opens with ```json, which would
-# stop generation before any JSON and return empty content.
-# This is a latency/cost optimisation, not the correctness mechanism -- see
-# _parse_json_content for the part that actually guarantees a valid result.
-_STOP_SEQUENCES = ["\n\n", "\r\n\r\n"]
 
 
 class LlmServiceError(RuntimeError):
@@ -57,15 +41,12 @@ class LlmContextWindowError(LlmServiceError):
 
 
 class OpenAICompatibleClient:
-    """Client for the team's configurable, OpenAI-compatible LLM loader.
+    """Strict JSON-schema client for the bank's OpenAI-compatible loader.
 
-    Handles the concerns a raw httpx call would otherwise leave to every
-    caller: missing configuration surfaced as a clear error (rather than an
-    obscure transport failure), and bounded retries with backoff for
-    transient loader errors. The request shape defaults to what is confirmed
-    to work against this org's loader (single `user` message, no
-    `response_format`); see `_build_body` for how to opt back into
-    `response_format` once/if the platform team confirms support for it.
+    A malformed or truncated result is a failed assessment.  The client never
+    repairs brackets, extracts a convenient fragment, or accepts surrounding
+    commentary, because those behaviours can turn an incomplete assessment
+    into a superficially valid record.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -141,34 +122,25 @@ class OpenAICompatibleClient:
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
     ) -> dict[str, Any]:
-        # use_response_format opts into schema-guided decoding. A bare
-        # {"type": "json_schema"} with no nested "json_schema" object is NOT
-        # a valid response_format and is silently ignored/no-ops on most
-        # OpenAI-compatible loaders (confirmed against this org's loader:
-        # sending it produced unconstrained, occasionally malformed JSON,
-        # identical to sending nothing at all). The real schema MUST be
-        # nested under json_schema.schema, generated from the same Pydantic
-        # model that will validate the response (see analysis_service._ask),
-        # so drift between the prompt's schema and the enforced schema is
-        # impossible by construction.
-        combined_prompt = f"{system_prompt}\n\n{json.dumps(user_payload, ensure_ascii=False, default=str)}"
         body: dict[str, Any] = {
             "model": self._settings.llm_model,
-            "messages": [{"role": "user", "content": combined_prompt}],
-            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, default=str)},
+            ],
+            "temperature": self._settings.llm_temperature,
+            "top_p": self._settings.llm_top_p,
             "max_tokens": self._settings.max_response_tokens,
             "stream": False,
-            "stop": _STOP_SEQUENCES,
         }
-        if self._settings.llm_frequency_penalty:
-            body["frequency_penalty"] = self._settings.llm_frequency_penalty
+        if self._settings.llm_repetition_penalty:
+            body["repetition_penalty"] = self._settings.llm_repetition_penalty
         if use_response_format and response_schema:
             body["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": schema_name,
                     "schema": response_schema,
-                    "strict": True,
                 },
             }
         return body
@@ -302,135 +274,20 @@ def _extract_content(payload: dict[str, Any]) -> str | dict[str, Any]:
     raise LlmServiceError("Unrecognised LLM response: expected choices[0].message.content or text")
 
 
-def _strip_code_fence(text: str) -> str:
-    """Remove a wrapping ``` or ```json fence, in case the model adds one
-    despite being told not to. A no-op if there is no fence."""
-    candidate = text.strip()
-    if not (candidate.startswith("```") and candidate.endswith("```")):
-        return candidate
-    candidate = candidate[3:]
-    if candidate.lower().startswith("json"):
-        candidate = candidate[4:]
-    return candidate.rsplit("```", 1)[0].strip()
-
-
-def _strip_trailing_commas(text: str) -> str:
-    """Remove a comma immediately before a closing ] or } -- a common,
-    otherwise-harmless slip that breaks strict JSON parsing."""
-    return re.sub(r",(\s*[\]}])", r"\1", text)
-
-
-def _extract_first_balanced_object(text: str) -> str | None:
-    """Return the first complete, depth-balanced {...} span in text, or
-    None if there isn't one.
-
-    Tracks brace depth and string/escape state character by character, so
-    it correctly finds the outermost object's true closing brace no matter
-    how deeply nested the schema is underneath it -- unlike a fixed stop
-    string, which cannot tell an inner object's closing brace from the
-    outer one. Any text before or after this span (a stray greeting, a
-    second object the model added by mistake) is discarded by construction,
-    since only the first depth-zero span is returned.
-    """
-    depth = 0
-    start: int | None = None
-    in_string = False
-    escape_next = False
-
-    for index, char in enumerate(text):
-        if escape_next:
-            escape_next = False
-            continue
-        if char == "\\" and in_string:
-            escape_next = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif char == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    return text[start : index + 1]
-    return None
-
-
-def _close_unterminated_json(text: str) -> str:
-    """Best-effort close any object/array left open by a response cut short
-    mid-generation (e.g. by hitting max_tokens), by appending the correct
-    closing characters in the correct order. A no-op if nothing is open.
-    """
-    stack: list[str] = []
-    in_string = False
-    escape_next = False
-
-    for char in text:
-        if escape_next:
-            escape_next = False
-            continue
-        if char == "\\" and in_string:
-            escape_next = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char in "{[":
-            stack.append("}" if char == "{" else "]")
-        elif char in "}]" and stack and stack[-1] == char:
-            stack.pop()
-
-    if not stack:
-        return text
-    return text.rstrip().rstrip(",") + "".join(reversed(stack))
-
-
 def _parse_json_content(content: str | dict[str, Any]) -> dict[str, Any]:
-    """Parse the model's JSON output defensively.
-
-    Well-formed output (the common case) parses on the very first attempt
-    at no extra cost. Only when that fails does this fall through
-    progressively more tolerant candidates -- stripping a markdown fence,
-    extracting the first depth-balanced {...} span (discarding any
-    commentary the model added around it), stripping a stray trailing
-    comma, and closing brackets left open by a truncated response -- so a
-    response that is imperfect but recoverable is not thrown away, while
-    one that never contained a valid JSON object still fails loudly, same
-    as before.
-    """
+    """Accept exactly one complete JSON object and nothing else."""
     if isinstance(content, dict):
         return content
     if not isinstance(content, str) or not content.strip():
         raise LlmServiceError("LLM response content was empty.")
 
-    unfenced = _strip_code_fence(content)
-    candidates = [content, unfenced]
-
-    extracted = _extract_first_balanced_object(unfenced)
-    if extracted:
-        candidates.append(extracted)
-
-    for candidate in list(candidates):
-        repaired = _strip_trailing_commas(_close_unterminated_json(candidate))
-        if repaired not in candidates:
-            candidates.append(repaired)
-
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-
-    raise LlmServiceError("LLM response content was not valid JSON.")
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise LlmServiceError("LLM response was not a complete JSON object.") from exc
+    if not isinstance(parsed, dict):
+        raise LlmServiceError("LLM response JSON must be an object.")
+    return parsed
 
 
 def _estimate_tokens(text: str) -> int:

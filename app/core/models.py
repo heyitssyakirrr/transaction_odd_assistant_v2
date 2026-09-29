@@ -2,37 +2,35 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Any, Literal, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
-
-
-def _as_list(value: Any) -> Any:
-    return [value] if isinstance(value, str) else value
+from pydantic import BaseModel, ConfigDict, Field
 
 
-# Small models sometimes return a single string where the schema asks for a list.
-StrList = Annotated[list[str], BeforeValidator(_as_list)]
+RiskLevel = Literal["low", "medium", "high"]
+FindingCategory = Literal[
+    "dormancy_reactivation",
+    "activity_spike",
+    "flow_imbalance",
+    "burst_activity",
+    "unusual_variability",
+    "profile_timing",
+]
 
 
 class MonthlySummaryRow(BaseModel):
-    """One month of pre-aggregated per-account transaction features.
+    """One upstream-provided aggregate row; this service does not score it."""
 
-    Produced upstream by the aggregation job. This service treats every
-    numeric field here as-is -- it never derives, recomputes, or scores
-    from raw transactions itself.
-    """
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     acct_num: str = Field(min_length=1, max_length=64)
-    year_month: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")  # "YYYYMM", e.g. 202604    
+    year_month: str = Field(pattern=r"^\d{6}$")
     txn_count_monthly: int = Field(ge=0)
     pct_burst: float
     total_amount: Decimal
     avg_amount: Decimal
     std_amount: Decimal
     max_amount: Decimal
-    #day_gaps: float
     pct_trx_gap: float
     monthly_debit: Decimal
     monthly_credit: Decimal
@@ -43,11 +41,8 @@ class MonthlySummaryRow(BaseModel):
 
 
 class CustomerProfileRecord(BaseModel):
-    """One SCD Type 2 version of a customer's profile from custmer_info.
+    """One SCD2 customer profile version, retained for the account's full history."""
 
-    Multiple rows per account are expected: each is the profile as it stood
-    for [valid_from_dttm, valid_to_dttm). A null valid_to_dttm means current.
-    """
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     acct_num: str
@@ -64,44 +59,39 @@ class AccountAnalysisRequest(BaseModel):
     case_id: str = Field(min_length=1, max_length=128)
     source_filename: str = Field(min_length=1, max_length=255)
     acct_num: str = Field(min_length=1, max_length=64)
-    monthly_summary: list[MonthlySummaryRow] = Field(min_length=1, max_length=6)
-    customer_profile: list[CustomerProfileRecord] = Field(default_factory=list, max_length=50)
+    monthly_summary: list[MonthlySummaryRow] = Field(min_length=6, max_length=6)
+    customer_profile: list[CustomerProfileRecord] = Field(default_factory=list)
 
 
 class MonthlyEvidenceItem(BaseModel):
+    """An exact source value, hydrated by the application rather than the model."""
+
+    evidence_id: str
     year_month: str
     feature: str
     value: str
-    statement: str
 
 
 class AccountFinding(BaseModel):
-    finding_id: str = ""
-    category: str
-    severity: Literal["low", "medium", "high", "critical"]
-    evidence: list[MonthlyEvidenceItem] = Field(default_factory=list)
-    rationale: str
+    finding_id: str
+    category: FindingCategory
+    severity: RiskLevel
+    rationale: str = Field(min_length=1, max_length=360)
+    evidence: list[MonthlyEvidenceItem] = Field(min_length=1, max_length=4)
 
 
 class MonthlyComparisonNote(BaseModel):
-    """The LLM's own plain-language comparison of one feature across the
-    account's 6 months, produced BEFORE findings so findings are visibly
-    grounded in a comparison rather than appearing from nowhere.
-    """
-    feature: str
-    pattern_summary: str = Field(max_length=200)
-    notable_months: StrList = Field(default_factory=list)
+    title: str = Field(min_length=1, max_length=80)
+    pattern_summary: str = Field(min_length=1, max_length=300)
+    evidence: list[MonthlyEvidenceItem] = Field(min_length=1, max_length=4)
 
 
 class ProfileTimelineNote(BaseModel):
-    """A customer_profile change and whether its timing overlaps a
-    transaction-pattern change noted in monthly_comparison. The changed
-    field's *value* (occupation, citizenship) is never itself a risk
-    signal -- only the timing of the change is.
-    """
-    field: str
-    change_summary: str = Field(max_length=200)
-    change_dttm: datetime | None = None
+    field: Literal["occupation", "citizenship", "indv_org_type"]
+    change_summary: str = Field(min_length=1, max_length=220)
+    # Keep this as text in the wire contract. Some grammar backends reject
+    # JSON Schema's date-time format even though they support normal strings.
+    change_dttm: str | None = Field(default=None, max_length=40)
     coincides_with_txn_pattern: bool = False
 
 
@@ -110,15 +100,23 @@ class AccountAssessment(BaseModel):
     acct_num: str
     status: Literal["completed", "needs_review"]
     decision: Literal["close_case", "continue_due_diligence"]
-    risk_level: Literal["low", "medium", "high"]
+    risk_level: RiskLevel
     executive_summary: str
     monthly_comparison: list[MonthlyComparisonNote] = Field(default_factory=list)
     profile_notes: list[ProfileTimelineNote] = Field(default_factory=list)
-    findings: list[AccountFinding]
+    findings: list[AccountFinding] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     months_reviewed: int
+    profile_records_matched: int
     generated_at: datetime
 
 
 class LlmClient(Protocol):
-    async def complete_json(self, *, system_prompt: str, user_payload: dict[str, Any]) -> dict[str, Any]: ...
+    async def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        response_schema: dict[str, Any],
+        schema_name: str,
+    ) -> dict[str, Any]: ...

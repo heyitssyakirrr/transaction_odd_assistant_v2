@@ -53,20 +53,20 @@ def parse_monthly_summary_csv(csv_content: str) -> list[MonthlySummaryRow]:
                 MonthlySummaryRow(
                     acct_num=str(row["acct_num"]).strip(),
                     year_month=str(row["year_month"]).strip(),
-                    txn_count_monthly=int(raw_row["txn_count_monthly"]),
-                    pct_burst=float(raw_row["pct_burst"]),
-                    total_amount=_decimal(raw_row["total_amount"]),
-                    avg_amount=_decimal(raw_row["avg_amount"]),
-                    std_amount=_decimal(raw_row["std_amount"]),
-                    max_amount=_decimal(raw_row["max_amount"]),
+                    txn_count_monthly=int(row["txn_count_monthly"]),
+                    pct_burst=float(row["pct_burst"]),
+                    total_amount=_decimal(row["total_amount"]),
+                    avg_amount=_decimal(row["avg_amount"]),
+                    std_amount=_decimal(row["std_amount"]),
+                    max_amount=_decimal(row["max_amount"]),
                     #day_gaps=float(raw_row["day_gaps"]),
-                    pct_trx_gap=float(raw_row["pct_trx_gap"]),
-                    monthly_debit=_decimal(raw_row["monthly_debit"]),
-                    monthly_credit=_decimal(raw_row["monthly_credit"]),
-                    debit_count_monthly=int(raw_row["debit_count_monthly"]),
-                    credit_count_monthly=int(raw_row["credit_count_monthly"]),
-                    monthly_avg_debit=_decimal(raw_row["monthly_avg_debit"]),
-                    monthly_avg_credit=_decimal(raw_row["monthly_avg_credit"]),
+                    pct_trx_gap=float(row["pct_trx_gap"]),
+                    monthly_debit=_decimal(row["monthly_debit"]),
+                    monthly_credit=_decimal(row["monthly_credit"]),
+                    debit_count_monthly=int(row["debit_count_monthly"]),
+                    credit_count_monthly=int(row["credit_count_monthly"]),
+                    monthly_avg_debit=_decimal(row["monthly_avg_debit"]),
+                    monthly_avg_credit=_decimal(row["monthly_avg_credit"]),
                 )
             )
         except (KeyError, ValueError, InvalidOperation, TypeError) as exc:
@@ -81,7 +81,19 @@ def parse_monthly_summary_csv(csv_content: str) -> list[MonthlySummaryRow]:
             f"Expected all rows to belong to one account; found {len(acct_nums)}: {sorted(acct_nums)}"
         )
 
-    return sorted(rows, key=lambda row: row.year_month)
+    rows = sorted(rows, key=lambda row: row.year_month)
+    if len(rows) != 6:
+        raise SummaryCsvError(f"Expected exactly 6 monthly rows; found {len(rows)}.")
+    expected_months = [_month_start(rows[0].year_month)]
+    for _ in range(5):
+        current = expected_months[-1]
+        expected_months.append(
+            current.replace(year=current.year + 1, month=1)
+            if current.month == 12 else current.replace(month=current.month + 1)
+        )
+    if [row.year_month for row in rows] != [month.strftime("%Y%m") for month in expected_months]:
+        raise SummaryCsvError("The 6 monthly rows must be consecutive calendar months.")
+    return rows
 
 
 def review_window(rows: list[MonthlySummaryRow]) -> tuple[datetime, datetime]:
@@ -94,22 +106,16 @@ def review_window(rows: list[MonthlySummaryRow]) -> tuple[datetime, datetime]:
     return _month_start(months[0]), _month_end(months[-1])
 
 
-def load_customer_profile(
-    parquet_path: Path, acct_num: str, window_start: datetime, window_end: datetime
-) -> list[CustomerProfileRecord]:
-    """Read the shared customer_info SCD2 table and keep every row for this
-    account whose validity period overlaps [window_start, window_end).
+def load_customer_profile(parquet_path: Path, acct_num: str) -> list[CustomerProfileRecord]:
+    """Read every available profile version for one account.
 
-    Overlap filter (membership check, not math):
-        VALID_FROM_DTTM <= window_end AND
-        (VALID_TO_DTTM IS NULL OR VALID_TO_DTTM >= window_start)
-
-    A profile change coinciding with a transaction-pattern change in the same
-    window is a signal the LLM should be able to see -- so every overlapping
-    version is kept, not just the current one.
+    The Parquet filter is pushed into the reader so concurrent reviews do not
+    materialise the entire customer table. The profile timeline is deliberately
+    not limited to the six-month transaction window: that is the agreed review
+    input contract.
     """
     try:
-        table = pd.read_parquet(parquet_path)
+        table = pd.read_parquet(parquet_path, filters=[("ACCT_NUM", "==", str(acct_num))])
     except FileNotFoundError as exc:
         raise CustomerProfileError(f"customer_info parquet not found at {parquet_path}") from exc
     except Exception as exc:  # pyarrow/fastparquet raise their own error types
@@ -125,8 +131,6 @@ def load_customer_profile(
         valid_from = _coerce_datetime(row.get("VALID_FROM_DTTM"))
         valid_to = _coerce_datetime(row.get("VALID_TO_DTTM"))
         if valid_from is None:
-            continue  # unusable row: no start of validity to anchor the overlap check
-        if not (valid_from <= window_end and (valid_to is None or valid_to >= window_start)):
             continue
         records.append(
             CustomerProfileRecord(
@@ -142,8 +146,8 @@ def load_customer_profile(
         )
 
     logger.info(
-        "customer_info: acct=%s window=%s..%s matched=%s of %s candidate rows",
-        acct_num, window_start.date(), window_end.date(), len(records), len(account_rows),
+        "customer_info: acct=%s matched_full_history=%s of %s candidate rows",
+        acct_num, len(records), len(account_rows),
     )
     return sorted(records, key=lambda item: item.valid_from_dttm)
 

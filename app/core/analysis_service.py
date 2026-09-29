@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError
@@ -14,42 +14,31 @@ from app.core.models import (
     AccountAssessment,
     AccountFinding,
     CustomerProfileRecord,
+    FindingCategory,
     LlmClient,
     MonthlyComparisonNote,
+    MonthlyEvidenceItem,
     ProfileTimelineNote,
-    StrList,
+    RiskLevel,
 )
 from app.core.prompts import ANALYST_SYSTEM_PROMPT, account_assessment_payload
 from app.core.reference_data import resolve_citizenship, resolve_occupation
 
 logger = logging.getLogger("app.analysis_service")
-
 ModelType = TypeVar("ModelType", bound=BaseModel)
-
-# Ranking used to roll findings up into an overall risk_level. "critical" is
-# a valid per-finding severity but AccountAssessment.risk_level only allows
-# low/medium/high, so it collapses into "high" at the top of the scale.
-_SEVERITY_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+_SEVERITY_RANK: dict[RiskLevel, int] = {"low": 0, "medium": 1, "high": 2}
 
 
 class ModelOutputError(ValueError):
-    """Raised when the LLM response is not valid for the required schema."""
+    """The model did not produce a complete, schema-valid, grounded assessment."""
 
 
 class AnalysisService:
-    """LLM-led AML workflow over a pre-aggregated monthly account summary.
+    """One strict, evidence-grounded LLM call for a six-month account review.
 
-    Single LLM call per account. The LLM does all of the analytical
-    reasoning -- comparing months, correlating profile changes, deciding
-    findings and their severity. This service does not compute statistics
-    or scores itself; it only:
-      - resolves customer_profile codes to labels before the call (the LLM
-        cannot reason about opaque codes), and
-      - applies fixed, auditable business rules AFTER the call: risk_level
-        is a deterministic rollup of the findings' own severities (never
-        asked of the model as an independent field, so it can't disagree
-        with the findings that are supposed to justify it), and decision
-        is a deterministic mapping from risk_level.
+    This class intentionally does not calculate risk signals. Its deterministic work is
+    limited to source-data serialization, evidence-reference verification, and deriving
+    a single account risk from the severities the model assigned to its findings.
     """
 
     def __init__(self, llm: LlmClient, settings: Settings, llm_queue: LlmWorkQueue) -> None:
@@ -58,50 +47,51 @@ class AnalysisService:
         self._llm_queue = llm_queue
 
     async def analyze_account(self, request: AccountAnalysisRequest) -> AccountAssessment:
-        valid_year_months = {row.year_month for row in request.monthly_summary}
+        evidence_catalog = self._evidence_catalog(request)
         payload = account_assessment_payload(
             monthly_summary=[row.model_dump(mode="json") for row in request.monthly_summary],
             customer_profile=[self._customer_profile_for_llm(record) for record in request.customer_profile],
         )
-
-        raw_output = await self._ask(request.case_id, "account-assessment", payload, _RawAssessment)
-
-        findings = self._validated_findings(raw_output.findings, valid_year_months)
-        monthly_comparison = self._validated_comparison(raw_output.monthly_comparison, valid_year_months)
-
-        # Business rule, not model judgment: risk_level is derived from the
-        # findings' own severities, so it can never contradict them the way
-        # an independently-asked risk_level field could.
-        risk_level = self._rollup_risk_level(findings)
-        decision = "close_case" if risk_level == "low" else "continue_due_diligence"
+        raw = await self._ask(request.case_id, payload, _RawAssessment)
+        assessment = self._hydrate_and_validate(raw, evidence_catalog)
+        risk_level = self._rollup_risk_level(assessment["findings"])
 
         return AccountAssessment(
             case_id=request.case_id,
             acct_num=request.acct_num,
             status="needs_review",
-            decision=decision,
+            decision="close_case" if risk_level == "low" else "continue_due_diligence",
             risk_level=risk_level,
-            executive_summary=raw_output.executive_summary,
-            monthly_comparison=monthly_comparison,
-            profile_notes=raw_output.profile_timeline_notes,
-            findings=findings,
-            limitations=list(dict.fromkeys(raw_output.limitations + [
-                "Assessment uses only the uploaded monthly summary and linked customer profile history.",
+            executive_summary=raw.executive_summary,
+            monthly_comparison=assessment["monthly_comparison"],
+            profile_notes=raw.profile_timeline_notes,
+            findings=assessment["findings"],
+            limitations=list(dict.fromkeys(raw.limitations + [
+                "Assessment uses only six monthly aggregates and linked customer-profile history.",
+                "No counterparty, transaction narrative, channel, or transaction-level sequence was available.",
                 "LLM output is decision support and requires authorised human review.",
             ])),
             months_reviewed=len(request.monthly_summary),
+            profile_records_matched=len(request.customer_profile),
             generated_at=datetime.now(timezone.utc),
         )
 
-    def _customer_profile_for_llm(self, record: CustomerProfileRecord) -> dict[str, Any]:
-        """Resolve coded fields to labels the LLM can reason about.
+    async def _ask(self, case_id: str, payload: dict[str, object], model: type[ModelType]) -> ModelType:
+        raw = await self._llm_queue.submit(
+            name=f"case={case_id} stage=account-assessment",
+            operation=lambda: self._llm.complete_json(
+                system_prompt=ANALYST_SYSTEM_PROMPT,
+                user_payload=payload,
+                response_schema=model.model_json_schema(),
+                schema_name=model.__name__,
+            ),
+        )
+        try:
+            return model.model_validate(raw)
+        except ValidationError as exc:
+            raise ModelOutputError(f"LLM output did not meet the required schema: {exc}") from exc
 
-        Deliberately drops acct_num/customer_num (redundant, and unneeded
-        for the analytical task) and the raw occupation_cd/citizen_cd
-        (opaque to the model). Only the lookup RESULT is sent, never the
-        lookup table itself, so payload size doesn't grow with the size of
-        the occupation CSV.
-        """
+    def _customer_profile_for_llm(self, record: CustomerProfileRecord) -> dict[str, Any]:
         return {
             "occupation": resolve_occupation(record.occupation_cd, self._settings.occupation_code_path),
             "citizenship": resolve_citizenship(record.citizen_cd),
@@ -111,72 +101,80 @@ class AnalysisService:
             "valid_to_dttm": record.valid_to_dttm.isoformat() if record.valid_to_dttm else None,
         }
 
-    async def _ask(self, case_id: str, stage: str, payload: dict[str, object], model: type[ModelType]) -> ModelType:
-        # Generate the schema from the SAME Pydantic model that will validate
-        # the response below, so the schema sent to the loader for guided
-        # decoding and the schema enforced client-side can never drift apart.
-        raw = await self._llm_queue.submit(
-            name=f"case={case_id} stage={stage}",
-            operation=lambda: self._llm.complete_json(
-                system_prompt=ANALYST_SYSTEM_PROMPT,
-                user_payload=payload,
-                response_schema=model.model_json_schema(),
-                schema_name=model.__name__,
-            ),
-        )
-        try:
-            if set(raw) == {"response_schema"} and isinstance(raw["response_schema"], dict):
-                raw = raw["response_schema"]
-            return model.model_validate(raw)
-        except ValidationError as exc:
-            raise ModelOutputError(f"LLM JSON does not match the required schema: {exc}") from exc
+    @staticmethod
+    def _evidence_catalog(request: AccountAnalysisRequest) -> dict[str, MonthlyEvidenceItem]:
+        catalog: dict[str, MonthlyEvidenceItem] = {}
+        excluded = {"acct_num", "year_month"}
+        for row in request.monthly_summary:
+            for feature in type(row).model_fields:
+                if feature in excluded:
+                    continue
+                evidence_id = f"M{row.year_month}.{feature}"
+                catalog[evidence_id] = MonthlyEvidenceItem(
+                    evidence_id=evidence_id,
+                    year_month=row.year_month,
+                    feature=feature,
+                    value=str(getattr(row, feature)),
+                )
+        return catalog
 
     @staticmethod
-    def _validated_findings(findings: list[AccountFinding], allowed_year_months: set[str]) -> list[AccountFinding]:
-        retained: list[AccountFinding] = []
-        for finding in findings:
-            evidence = [item for item in finding.evidence if item.year_month in allowed_year_months]
-            if evidence:
-                finding.finding_id = finding.finding_id or str(uuid4())
-                finding.evidence = evidence
-                retained.append(finding)
-        return retained
+    def _hydrate_and_validate(
+        raw: "_RawAssessment", catalog: dict[str, MonthlyEvidenceItem]
+    ) -> dict[str, list[MonthlyComparisonNote] | list[AccountFinding]]:
+        def resolve(ids: list[str], item_label: str) -> list[MonthlyEvidenceItem]:
+            unknown = [evidence_id for evidence_id in ids if evidence_id not in catalog]
+            if unknown:
+                raise ModelOutputError(
+                    f"LLM cited evidence not present in the uploaded summary for {item_label}: {', '.join(unknown)}"
+                )
+            return [catalog[evidence_id] for evidence_id in dict.fromkeys(ids)]
+
+        comparisons = [
+            MonthlyComparisonNote(
+                title=item.title,
+                pattern_summary=item.pattern_summary,
+                evidence=resolve(item.evidence_ids, f"observation '{item.title}'"),
+            )
+            for item in raw.monthly_comparison
+        ]
+        findings = [
+            AccountFinding(
+                finding_id=str(uuid4()),
+                category=item.category,
+                severity=item.severity,
+                rationale=item.rationale,
+                evidence=resolve(item.evidence_ids, f"finding '{item.category}'"),
+            )
+            for item in raw.findings
+        ]
+        return {"monthly_comparison": comparisons, "findings": findings}
 
     @staticmethod
-    def _validated_comparison(
-        notes: list[MonthlyComparisonNote], allowed_year_months: set[str]
-    ) -> list[MonthlyComparisonNote]:
-        """Drop any notable_months the model cited that weren't actually
-        supplied -- same grounding discipline as findings evidence."""
-        retained: list[MonthlyComparisonNote] = []
-        for note in notes:
-            note.notable_months = [ym for ym in note.notable_months if ym in allowed_year_months]
-            retained.append(note)
-        return retained
-
-    @staticmethod
-    def _rollup_risk_level(findings: list[AccountFinding]) -> Literal["low", "medium", "high"]:
+    def _rollup_risk_level(findings: list[AccountFinding]) -> RiskLevel:
         if not findings:
             return "low"
-        worst = max(_SEVERITY_RANK[finding.severity] for finding in findings)
-        if worst >= _SEVERITY_RANK["high"]:
-            return "high"
-        if worst >= _SEVERITY_RANK["medium"]:
-            return "medium"
-        return "low"
+        return max(findings, key=lambda finding: _SEVERITY_RANK[finding.severity]).severity
+
+
+class _EvidenceReferences(BaseModel):
+    evidence_ids: list[str] = Field(min_length=1, max_length=4)
+
+
+class _RawComparison(_EvidenceReferences):
+    title: str = Field(min_length=1, max_length=80)
+    pattern_summary: str = Field(min_length=1, max_length=300)
+
+
+class _RawFinding(_EvidenceReferences):
+    category: FindingCategory
+    severity: RiskLevel
+    rationale: str = Field(min_length=1, max_length=360)
 
 
 class _RawAssessment(BaseModel):
-    """Wire shape returned by the LLM, before grounding validation.
-
-    risk_level is deliberately NOT part of this shape: it's a deterministic
-    rollup of findings[].severity (see AnalysisService._rollup_risk_level),
-    computed after grounding validation runs, so it can never be asked of
-    (and disagree with) the model independently. decision is likewise never
-    asked of the model -- it's a deterministic mapping from risk_level.
-    """
-    monthly_comparison: list[MonthlyComparisonNote] = Field(default_factory=list, max_length=8)
-    profile_timeline_notes: list[ProfileTimelineNote] = Field(default_factory=list, max_length=8)
-    findings: list[AccountFinding] = Field(default_factory=list, max_length=10)
-    executive_summary: str = Field(max_length=1_200)
-    limitations: StrList = Field(default_factory=list, max_length=8)
+    monthly_comparison: list[_RawComparison] = Field(default_factory=list, max_length=3)
+    profile_timeline_notes: list[ProfileTimelineNote] = Field(default_factory=list, max_length=3)
+    findings: list[_RawFinding] = Field(default_factory=list, max_length=3)
+    executive_summary: str = Field(min_length=1, max_length=600)
+    limitations: list[str] = Field(default_factory=list, max_length=3)

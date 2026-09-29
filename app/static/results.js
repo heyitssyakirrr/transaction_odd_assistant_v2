@@ -11,6 +11,7 @@ const els = {
   riskBadge: document.querySelector("#risk-badge"),
   acctNum: document.querySelector("#acct-num"),
   monthsReviewed: document.querySelector("#months-reviewed"),
+  profileRecordsMatched: document.querySelector("#profile-records-matched"),
   riskLevel: document.querySelector("#risk-level"),
   summary: document.querySelector("#summary"),
   monthlyComparison: document.querySelector("#monthly-comparison"),
@@ -61,6 +62,7 @@ function renderResult(data) {
 
   els.acctNum.textContent = data.acct_num;
   els.monthsReviewed.textContent = data.months_reviewed;
+  els.profileRecordsMatched.textContent = data.profile_records_matched ?? 0;
   els.riskLevel.textContent = data.risk_level.toUpperCase();
 
   els.summary.textContent = data.executive_summary;
@@ -84,12 +86,12 @@ function renderMonthlyComparison(notes) {
   }
   els.monthlyComparison.innerHTML = notes
     .map((note) => {
-      const months = (note.notable_months || []).map(escapeHtml).join(", ");
+      const evidence = renderEvidence(note.evidence || []);
       return `
         <li>
-          <span class="plain-list-label">${escapeHtml(formatEnum(note.feature))}</span>
+          <span class="plain-list-label">${escapeHtml(note.title)}</span>
           <span>${escapeHtml(note.pattern_summary)}</span>
-          ${months ? `<span class="transaction-ids">${months}</span>` : ""}
+          ${evidence}
         </li>`;
     })
     .join("");
@@ -133,15 +135,9 @@ function renderFindings(findings) {
 
   els.findings.innerHTML = sorted
     .map((finding) => {
-      const evidenceItems = finding.evidence
-        .map(
-          (item) => `
-            <li>
-              <span class="transaction-ids">${escapeHtml(item.year_month)} &middot; ${escapeHtml(item.feature)}=${escapeHtml(item.value)}</span>
-              <span>${escapeHtml(item.statement)}</span>
-            </li>`
-        )
-        .join("");
+      const evidenceItems = (finding.evidence || []).map((item) =>
+        `<li><span class="transaction-ids">${escapeHtml(item.year_month)} &middot; ${escapeHtml(item.feature)}=${escapeHtml(item.value)}</span></li>`
+      ).join("");
 
       return `
         <article class="finding severity-${escapeHtml(finding.severity)}">
@@ -155,6 +151,13 @@ function renderFindings(findings) {
         </article>`;
     })
     .join("");
+}
+
+function renderEvidence(evidence) {
+  if (!evidence.length) return "";
+  return `<span class="transaction-ids">${evidence.map((item) =>
+    `${escapeHtml(item.year_month)} · ${escapeHtml(item.feature)}=${escapeHtml(item.value)}`
+  ).join("; ")}</span>`;
 }
 
 function formatEnum(value) {

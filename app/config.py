@@ -53,9 +53,15 @@ class Settings:
         "OCCUPATION_CODE_CSV_PATH",
         str(BASE_DIR / "data" / "occupation_codes.csv"),
     )
-    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "2200"))
-    # Zero omits the parameter; only enable if the loader accepts frequency_penalty.
-    llm_frequency_penalty: float = float(os.getenv("LLM_FREQUENCY_PENALTY", "0"))
+    # The compact strict assessment schema fits comfortably in this budget.
+    max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "1200"))
+    # Qwen's low-variance sampling defaults. Set only parameters accepted by
+    # the bank's OpenAI-compatible loader.
+    llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+    llm_top_p: float = float(os.getenv("LLM_TOP_P", "0.001"))
+    # This is a vLLM/Qwen extension rather than a portable OpenAI parameter.
+    # Leave disabled unless the bank loader is confirmed to accept it.
+    llm_repetition_penalty: float = float(os.getenv("LLM_REPETITION_PENALTY", "0"))
     report_directory: str = os.getenv("REPORT_DIRECTORY", str(BASE_DIR / "data" / "reports"))
     require_human_review: bool = os.getenv("REQUIRE_HUMAN_REVIEW", "true").lower() == "true"
 
@@ -75,6 +81,12 @@ class Settings:
             raise ValueError("LLM_CONTEXT_WINDOW_TOKENS must be zero or greater")
         if self.llm_context_safety_margin_tokens < 0:
             raise ValueError("LLM_CONTEXT_SAFETY_MARGIN_TOKENS must be zero or greater")
+        if not 0 <= self.llm_temperature <= 2:
+            raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
+        if not 0 < self.llm_top_p <= 1:
+            raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1")
+        if self.llm_repetition_penalty < 0:
+            raise ValueError("LLM_REPETITION_PENALTY must not be negative")
         if self.llm_context_window_tokens and self.llm_prompt_token_budget <= 0:
             raise ValueError(
                 "LLM_CONTEXT_WINDOW_TOKENS must exceed MAX_RESPONSE_TOKENS plus "
