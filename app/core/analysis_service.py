@@ -10,21 +10,21 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
-from app.config import Settings
-from app.core.llm_work_queue import LlmWorkQueue
-from app.core.models import (
+from TransactionSummary.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
+from TransactionSummary.config import Settings
+from TransactionSummary.core.llm_work_queue import LlmWorkQueue
+from TransactionSummary.core.models import (
     AccountAnalysisRequest, AccountAssessment, AccountFinding, AssessmentLimitation,
     CustomerProfileContext, CustomerProfileRecord, EvidenceItem, FindingCategory, LlmClient,
     ReviewCheck, ReviewCheckName, ReviewOutcome, RiskLevel,
 )
-from app.core.prompts import (
+from TransactionSummary.core.prompts import (
     FORMAT_RETRY_SUFFIX, PROFILE_CONTEXT_SYSTEM_PROMPT, TRANSACTION_CONTEXT_SYSTEM_PROMPT,
     profile_context_input, transaction_context_input,
 )
-from app.core.reference_data import resolve_citizenship, resolve_occupation
+from TransactionSummary.core.reference_data import resolve_citizenship, resolve_occupation
 
-logger = logging.getLogger("app.analysis_service")
+logger = logging.getLogger("TransactionSummary.analysis_service")
 ModelType = TypeVar("ModelType", bound=BaseModel)
 TransactionOutcome = Literal["observed", "not_observed"]
 _CHECK_ORDER: tuple[ReviewCheckName, ...] = (
@@ -34,8 +34,9 @@ _FORBIDDEN_TRANSACTION_TEXT = ("n/a", "insufficient", "nothing happened", "pleas
 _FORBIDDEN_PROFILE_TEXT = (
     "n/a", "insufficient", "missing", "unavailable", "not provided", "please provide", "named p",
 )
-_MONTH_PAIR = re.compile(r"^M?(\d{6})[,_]M?(\d{6})$")
+_MONTH_TOKEN = re.compile(r"^M?(\d{6})$")
 _NO_EVIDENCE_MONTHS = "none"
+_NOT_OBSERVED_DEFAULT_CONTEXT = "No material pattern identified for this check."
 
 # The model selects the relevant months. The application then attaches exact
 # CSV values, so no model-generated field ID or value reaches bank staff.
@@ -136,6 +137,7 @@ class AnalysisService:
             except LlmOutputTruncatedError as exc:
                 raise ModelOutputError(f"{stage} retry reached its output limit.") from exc
             except (LlmOutputFormatError, ModelOutputError) as second_error:
+                logger.warning("Retry output rejected: case=%s stage=%s error=%s", case_id, stage, second_error)
                 raise ModelOutputError(f"{stage} did not produce a verifiable result after one format retry.") from second_error
 
     async def _ask(
@@ -159,6 +161,8 @@ class AnalysisService:
         checks = raw.checks()
         known_months = {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
         for name, check in checks.items():
+            if check.outcome == "observed" and not check.context.strip():
+                raise ModelOutputError(f"{name} is observed but has no context")
             self._reject_forbidden_text(check.context, _FORBIDDEN_TRANSACTION_TEXT, f"{name} context")
             months = self._months_for_check(check, f"{name} months")
             self._validate_transaction_months(months, known_months, name)
@@ -188,7 +192,8 @@ class AnalysisService:
             check = checks[name]
             months = self._months_for_check(check, f"{name} months")
             evidence = self._evidence_for_months(name, months, catalog)
-            review_checks.append(ReviewCheck(check=name, outcome=check.outcome, rationale=check.context, evidence=evidence))
+            rationale = check.context.strip() or _NOT_OBSERVED_DEFAULT_CONTEXT
+            review_checks.append(ReviewCheck(check=name, outcome=check.outcome, rationale=rationale, evidence=evidence))
             if check.outcome == "observed":
                 findings.append(AccountFinding(
                     finding_id=str(uuid4()), category=name,
@@ -217,23 +222,30 @@ class AnalysisService:
             raise ModelOutputError(f"{label} contains a prohibited missing-data phrase")
 
     @staticmethod
-    def _split_month_pair(value: str, label: str) -> list[str]:
-        """Accept two source months and safely normalise Qwen's common spelling.
+    def _split_months(value: str, label: str) -> list[str]:
+        """Accept two or more source months, e.g. ``202607,202608`` or ``M202607_M202608``.
 
-        ``M202607_M202608`` and ``202607,202608`` denote the same pair. This
-        fixes punctuation only; it never derives a month or invents a value.
+        This fixes punctuation only; it never derives a month or invents a value.
         """
-        match = _MONTH_PAIR.fullmatch(value.strip().replace(" ", ""))
-        if match is None or match.group(1) == match.group(2):
-            raise ModelOutputError(f"{label} must contain two distinct YYYYMM values")
-        return [match.group(1), match.group(2)]
+        months: list[str] = []
+        for token in re.split(r"[,_;\s]+", value.strip()):
+            if not token:
+                continue
+            match = _MONTH_TOKEN.fullmatch(token)
+            if match is None:
+                raise ModelOutputError(f"{label} contains an invalid month: {token}")
+            if match.group(1) not in months:
+                months.append(match.group(1))
+        if len(months) < 2:
+            raise ModelOutputError(f"{label} must contain at least two distinct YYYYMM values")
+        return months
 
     @classmethod
     def _months_for_check(cls, check: _FlatCheck, label: str) -> list[str]:
         """Permit no focused evidence only for a negative model conclusion."""
         if check.outcome == "not_observed" and check.months_text.strip().casefold() == _NO_EVIDENCE_MONTHS:
             return []
-        return cls._split_month_pair(check.months_text, label)
+        return cls._split_months(check.months_text, label)
 
     @staticmethod
     def _validate_transaction_months(months: list[str], known_months: set[str], name: ReviewCheckName) -> None:
@@ -342,16 +354,16 @@ class _RawTransactionContext(BaseModel):
     risk_level: RiskLevel
     executive_summary: str = Field(min_length=1, max_length=260)
     dormancy_outcome: TransactionOutcome
-    dormancy_context: str = Field(min_length=1, max_length=140)
+    dormancy_context: str = Field(max_length=140)
     dormancy_months: str = Field(min_length=1, max_length=32)
     activity_value_outcome: TransactionOutcome
-    activity_value_context: str = Field(min_length=1, max_length=140)
+    activity_value_context: str = Field(max_length=140)
     activity_value_months: str = Field(min_length=1, max_length=32)
     debit_credit_outcome: TransactionOutcome
-    debit_credit_context: str = Field(min_length=1, max_length=140)
+    debit_credit_context: str = Field(max_length=140)
     debit_credit_months: str = Field(min_length=1, max_length=32)
     burst_gap_outcome: TransactionOutcome
-    burst_gap_context: str = Field(min_length=1, max_length=140)
+    burst_gap_context: str = Field(max_length=140)
     burst_gap_months: str = Field(min_length=1, max_length=32)
 
     def checks(self) -> dict[ReviewCheckName, _FlatCheck]:
