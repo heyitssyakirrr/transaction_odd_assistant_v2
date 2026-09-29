@@ -35,6 +35,7 @@ _FORBIDDEN_PROFILE_TEXT = (
     "n/a", "insufficient", "missing", "unavailable", "not provided", "please provide", "named p",
 )
 _MONTH_PAIR = re.compile(r"^M?(\d{6})[,_]M?(\d{6})$")
+_NO_EVIDENCE_MONTHS = "none"
 
 # The model selects the relevant months. The application then attaches exact
 # CSV values, so no model-generated field ID or value reaches bank staff.
@@ -159,7 +160,7 @@ class AnalysisService:
         known_months = {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
         for name, check in checks.items():
             self._reject_forbidden_text(check.context, _FORBIDDEN_TRANSACTION_TEXT, f"{name} context")
-            months = self._split_month_pair(check.months_text, f"{name} months")
+            months = self._months_for_check(check, f"{name} months")
             self._validate_transaction_months(months, known_months, name)
         if raw.dormancy_outcome == "not_observed" and any(
             phrase in raw.executive_summary.casefold() for phrase in ("reactivat", "after dormancy", "following dormancy")
@@ -185,7 +186,7 @@ class AnalysisService:
         findings: list[AccountFinding] = []
         for name in _CHECK_ORDER:
             check = checks[name]
-            months = self._split_month_pair(check.months_text, f"{name} months")
+            months = self._months_for_check(check, f"{name} months")
             evidence = self._evidence_for_months(name, months, catalog)
             review_checks.append(ReviewCheck(check=name, outcome=check.outcome, rationale=check.context, evidence=evidence))
             if check.outcome == "observed":
@@ -226,6 +227,13 @@ class AnalysisService:
         if match is None or match.group(1) == match.group(2):
             raise ModelOutputError(f"{label} must contain two distinct YYYYMM values")
         return [match.group(1), match.group(2)]
+
+    @classmethod
+    def _months_for_check(cls, check: _FlatCheck, label: str) -> list[str]:
+        """Permit no focused evidence only for a negative model conclusion."""
+        if check.outcome == "not_observed" and check.months_text.strip().casefold() == _NO_EVIDENCE_MONTHS:
+            return []
+        return cls._split_month_pair(check.months_text, label)
 
     @staticmethod
     def _validate_transaction_months(months: list[str], known_months: set[str], name: ReviewCheckName) -> None:
