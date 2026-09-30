@@ -84,7 +84,7 @@ class AccountFinding(BaseModel):
     category: FindingCategory
     severity: FindingSeverity
     rationale: str = Field(min_length=1, max_length=360)
-    evidence: list[EvidenceItem] = Field(min_length=1, max_length=4)
+    evidence: list[EvidenceItem] = Field(min_length=1, max_length=8)
 
 
 class ReviewCheck(BaseModel):
@@ -93,7 +93,7 @@ class ReviewCheck(BaseModel):
     check: ReviewCheckName
     outcome: ReviewOutcome
     rationale: str = Field(min_length=1, max_length=360)
-    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=4)
+    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=8)
 
 
 class ReviewerQuestion(BaseModel):

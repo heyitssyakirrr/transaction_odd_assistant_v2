@@ -3,6 +3,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from app.core.monthly_facts import transaction_comparison_facts
+
 
 _TRANSACTION_FIELDS = (
     "year_month", "txn_count_monthly", "debit_count_monthly", "credit_count_monthly",
@@ -19,11 +21,18 @@ turnover, or any data outside the rows. Do not ask the caller for information.
 Silently complete this review before writing the answer:
 1. Read txn_count_monthly across all six rows. Reactivation requires three immediately preceding zero-count months
    followed by activity. Do not call a quiet, declining, or fluctuating account dormant.
-2. Compare the highest and lowest txn_count_monthly and total_amount months, then check avg_amount, max_amount and
-   std_amount. Describe a material increase, decrease, or concentration accurately; do not call the first supplied
-   month historical baseline.
-3. Compare debit_count_monthly, credit_count_monthly, monthly_debit and monthly_credit by month. State only the
-   direction actually shown. A change between debit and credit activity is context, not an allegation.
+2. ACTIVITY/VALUE: Read the six labelled MONTH facts and the two ACTIVITY_CANDIDATES. Compare counts with counts and
+   monthly totals with monthly totals. A count change and a value change can occur in different month pairs. Select
+   the two months that best show a meaningful increase, decrease, zero-to-active change, or concentration. State the
+   exact values for those two months only; never interpolate an intermediate month or call the first month a baseline.
+   If no meaningful pattern is selected, say what the six-month counts and totals actually show.
+3. DEBIT/CREDIT FLOW: Read debit_count and credit_count separately from debits and credits. The former are numbers of
+   transactions; the latter are amounts. Look for a shift in direction, one-sided activity, or a material change in
+   debit or credit amounts. A month with zero credits has no credit inflow in these aggregates. Select two real months
+   that demonstrate the pattern. Do not say one month has a higher debit or credit count/amount unless that column's
+   value is actually higher. The MONTH_STRUCTURE line lists zero, debit-only, credit-only, and mixed months; repeated
+   one-sided flow or a switch between these states is useful context even if amounts are modest. If no meaningful
+   flow pattern is selected, state the observed six-month debit/credit mix.
 4. Read pct_burst and pct_trx_gap. A pct_burst of zero cannot support burst activity. pct_trx_gap is a pattern only;
    no business definition or suspicious act may be inferred from it.
 
@@ -43,11 +52,16 @@ examples, placeholders, arrays, nested objects, task keys, or extra keys. The ob
 "debit_credit_outcome", "debit_credit_context", "debit_credit_months",
 "burst_gap_outcome", "burst_gap_context", "burst_gap_months".
 
-Each outcome is exactly observed or not_observed. Each *_months value contains exactly two different supplied months
+Each outcome is exactly observed or not_observed. For activity_value and debit_credit, use observed when the selected
+pattern gives staff meaningful factual context; observed is not an allegation. Do not default these checks to
+not_observed just because no external income, counterparty, or account-purpose data is supplied. Each *_months value
+contains exactly two different supplied months
 as YYYYMM,YYYYMM with no spaces when its outcome is observed; it is a comparison pair, not an evidence identifier.
 When its outcome is not_observed, set its *_months value to the JSON string "none". Never output N/A, M, field names, or an
-underscore in a *_months value. Each context must mention only what the selected months and their rows show. The
-executive summary must not say reactivation or dormancy unless dormancy_outcome is observed. After the final } output
+underscore in a *_months value. Put earlier month first. Use YYYYMM rather than month names in the context; when
+observed, mention only values from the selected two months. Do not write a numerical claim in the executive summary
+unless it matches a selected pair. The executive summary must not say reactivation or dormancy unless
+dormancy_outcome is observed. After the final } output
 no other character.
 """
 
@@ -89,13 +103,17 @@ questions, assistant, system, user, analysis, markdown, or text before or after 
 """
 
 
-def transaction_context_input(monthly_summary: list[dict[str, Any]]) -> str:
+def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
     rows = ["|".join(_TRANSACTION_FIELDS)]
     rows.extend(
         "|".join(str(row.get(field, "")) for field in _TRANSACTION_FIELDS)
         for row in monthly_summary
     )
     return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
+
+
+def transaction_context_input(monthly_summary: list[dict[str, Any]]) -> str:
+    return _monthly_rows_input(monthly_summary) + "\n" + transaction_comparison_facts(monthly_summary)
 
 
 def profile_context_input(customer_profile: list[dict[str, str | None]], monthly_summary: list[dict[str, Any]]) -> str:
@@ -128,4 +146,4 @@ def profile_context_input(customer_profile: list[dict[str, str | None]], monthly
         f"same_month_credit={Decimal(str(peak_total['monthly_credit'])):.2f}|"
         f"largest_reported_single_amount={peak_single['year_month']}:{Decimal(str(peak_single['max_amount'])):.2f}"
     )
-    return "\n".join(lines) + "\n" + focus + "\n" + transaction_context_input(monthly_summary)
+    return "\n".join(lines) + "\n" + focus + "\n" + _monthly_rows_input(monthly_summary)

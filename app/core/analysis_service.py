@@ -11,19 +11,22 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ..adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
-from ..config import Settings
-from .llm_work_queue import LlmWorkQueue
-from .models import (
+from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
+from app.config import Settings
+from app.core.llm_work_queue import LlmWorkQueue
+from app.core.monthly_facts import (
+    activity_pair_context, activity_six_month_context, flow_pair_context, flow_six_month_context,
+)
+from app.core.models import (
     AccountAnalysisRequest, AccountAssessment, AccountFinding, AssessmentLimitation,
     CustomerProfileContext, CustomerProfileRecord, EvidenceItem, FindingCategory, LlmClient,
     ReviewCheck, ReviewCheckName, ReviewOutcome, RiskLevel,
 )
-from .prompts import (
+from app.core.prompts import (
     FORMAT_RETRY_SUFFIX, PROFILE_CONTEXT_SYSTEM_PROMPT, TRANSACTION_CONTEXT_SYSTEM_PROMPT,
     profile_context_input, transaction_context_input,
 )
-from .reference_data import resolve_citizenship, resolve_occupation
+from app.core.reference_data import resolve_citizenship, resolve_occupation
 
 logger = logging.getLogger("TransactionSummary.analysis_service")
 ModelType = TypeVar("ModelType", bound=BaseModel)
@@ -44,7 +47,7 @@ _NOT_OBSERVED_DEFAULT_CONTEXT = "No material pattern identified for this check."
 _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "dormancy_reactivation": ("txn_count_monthly",),
     "activity_value_change": ("txn_count_monthly", "total_amount"),
-    "debit_credit_flow": ("monthly_debit", "monthly_credit"),
+    "debit_credit_flow": ("debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit"),
     "burst_and_gaps": ("pct_burst", "pct_trx_gap"),
 }
 
@@ -81,7 +84,7 @@ class AnalysisService:
             request.case_id, "transaction-context", TRANSACTION_CONTEXT_SYSTEM_PROMPT,
             transaction_context_input(monthly), _RawTransactionContext,
             self._settings.llm_transaction_max_response_tokens,
-            lambda value: self._validate_transaction_context(value, catalog),
+            lambda value: self._validate_transaction_context(value, catalog, monthly),
         ))
         profile_task = asyncio.create_task(self._profile_context_or_none(request.case_id, profile, monthly))
         transaction_result, profile_result = await asyncio.gather(transaction_task, profile_task, return_exceptions=True)
@@ -158,15 +161,32 @@ class AnalysisService:
         except ValidationError as exc:
             raise ModelOutputError(f"{stage} output did not meet the required schema: {exc}") from exc
 
-    def _validate_transaction_context(self, raw: "_RawTransactionContext", catalog: dict[str, EvidenceItem]) -> None:
+    def _validate_transaction_context(
+        self, raw: "_RawTransactionContext", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
+    ) -> None:
         checks = raw.checks()
         known_months = {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
+        by_month = {row["year_month"]: row for row in monthly}
         for name, check in checks.items():
             if check.outcome == "observed" and not check.context.strip():
                 raise ModelOutputError(f"{name} is observed but has no context")
             self._reject_forbidden_text(check.context, _FORBIDDEN_TRANSACTION_TEXT, f"{name} context")
             months = self._months_for_check(check, f"{name} months")
             self._validate_transaction_months(months, known_months, name)
+            if name in {"activity_value_change", "debit_credit_flow"} and months:
+                if months != sorted(months):
+                    raise ModelOutputError(f"{name} months must be chronological")
+                first, second = (by_month[month] for month in months)
+                fields = _EVIDENCE_FIELDS[name]
+                unchanged = all(Decimal(str(first[field])) == Decimal(str(second[field])) for field in fields)
+                persistent_one_sided = name == "debit_credit_flow" and (
+                    (first["debit_count_monthly"] > 0 and second["debit_count_monthly"] > 0
+                     and first["credit_count_monthly"] == second["credit_count_monthly"] == 0)
+                    or (first["credit_count_monthly"] > 0 and second["credit_count_monthly"] > 0
+                        and first["debit_count_monthly"] == second["debit_count_monthly"] == 0)
+                )
+                if unchanged and not persistent_one_sided:
+                    raise ModelOutputError(f"{name} selected months show no change in the cited fields")
         if raw.dormancy_outcome == "not_observed" and any(
             phrase in raw.executive_summary.casefold() for phrase in ("reactivat", "after dormancy", "following dormancy")
         ):
@@ -187,24 +207,30 @@ class AnalysisService:
         profile_context: CustomerProfileContext | None, catalog: dict[str, EvidenceItem],
     ) -> AccountAssessment:
         checks = raw.checks()
+        monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
         review_checks: list[ReviewCheck] = []
         findings: list[AccountFinding] = []
         for name in _CHECK_ORDER:
             check = checks[name]
             months = self._months_for_check(check, f"{name} months")
             evidence = self._evidence_for_months(name, months, catalog)
-            rationale = check.context.strip() or _NOT_OBSERVED_DEFAULT_CONTEXT
+            if name == "activity_value_change":
+                rationale = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
+            elif name == "debit_credit_flow":
+                rationale = flow_pair_context(monthly, months) if months else flow_six_month_context(monthly)
+            else:
+                rationale = check.context.strip() or _NOT_OBSERVED_DEFAULT_CONTEXT
             review_checks.append(ReviewCheck(check=name, outcome=check.outcome, rationale=rationale, evidence=evidence))
             if check.outcome == "observed":
                 findings.append(AccountFinding(
                     finding_id=str(uuid4()), category=name,
                     severity="high" if raw.risk_level == "high" else "medium",
-                    rationale=check.context, evidence=evidence,
+                    rationale=rationale, evidence=evidence,
                 ))
         return AccountAssessment(
             case_id=request.case_id, acct_num=request.acct_num, status="completed",
             decision="close_case" if raw.risk_level == "low" else "continue_due_diligence",
-            risk_level=raw.risk_level, executive_summary=raw.executive_summary,
+            risk_level=raw.risk_level, executive_summary=self._checked_executive_summary(checks),
             review_checks=review_checks, findings=findings, reviewer_questions=[],
             customer_profile_context=profile_context, limitations=self._static_limitations(),
             months_reviewed=len(request.monthly_summary), profile_records_matched=len(request.customer_profile),
@@ -218,6 +244,20 @@ class AnalysisService:
         return CustomerProfileContext(
             summary=raw.profile_summary,
             evidence=self._canonical_profile_evidence(catalog, profile, monthly),
+        )
+
+    @staticmethod
+    def _checked_executive_summary(checks: dict[ReviewCheckName, _FlatCheck]) -> str:
+        labels = {
+            "dormancy_reactivation": "dormancy/reactivation",
+            "activity_value_change": "activity/value change",
+            "debit_credit_flow": "debit/credit flow",
+            "burst_and_gaps": "burst/gap pattern",
+        }
+        observed = [labels[name] for name in _CHECK_ORDER if checks[name].outcome == "observed"]
+        return (
+            "Six-month review identified " + ", ".join(observed) + " for staff review."
+            if observed else "No material transaction pattern was selected from the six monthly rows."
         )
 
     @staticmethod
