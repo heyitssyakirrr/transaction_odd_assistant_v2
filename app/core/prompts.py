@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 
@@ -51,21 +52,33 @@ no other character.
 """
 
 
-PROFILE_CONTEXT_SYSTEM_PROMPT = """You are a customer-profile summarisation assistant for authorised bank staff.
+PROFILE_CONTEXT_SYSTEM_PROMPT = """You assist authorised bank staff with customer-profile context.
 
-Summarise only factual customer-profile fields supplied in INPUT FACTS. Do not assess transaction risk, profile
-consistency, customer suitability, AML, or wrongdoing. Do not infer occupation duties, income, account purpose, source
-of funds, geography, or any missing field. Do not ask the caller for more information. Citizenship may be stated only
-as a factual profile attribute and must never be connected to risk.
+Use only INPUT FACTS: the customer's dated profile versions and six monthly transaction aggregates. Write a concise
+profile-to-activity comparison, not a transaction risk score or an allegation. Identify the declared occupation and
+individual/organisation type when supplied. For material amounts, cite a real month and its total_amount or max_amount
+and recommend verifying the source of funds and whether the activity fits the customer's stated occupation and account
+purpose. A monthly total is transaction volume, not income or net funds received; use monthly_credit and monthly_debit
+to explain its direction when relevant. Occupation does not prove income, wealth, or that a transaction is unsuitable;
+do not label a job low-income.
+An individual may legitimately transact large amounts, and an organisation may transact small amounts.
 
-Use only fields that have an explicit value. Do not output N/A, insufficient_data, missing, unavailable, not provided,
-or a statement about data that is not supplied. Where present, occupation_name is the resolved occupation label and
-must be preferred over occupation_code. Dates are factual profile timeline dates only.
+State the supplied citizenship as a profile fact. The six monthly rows contain no transaction-country, residency,
+counterparty-location, or source-of-funds field. Therefore citizenship cannot establish where the money originated,
+whether any transaction was cross-border, or a country-risk rating. For material amounts, ask staff to verify the
+funds' origin and purpose based on the amounts and declared profile, not because of the person's citizenship.
+Do not describe a country or customer as high-risk or low-risk, and do not invent income, counterparties, account
+purpose, or source of funds.
 
-STRICT JSON ONLY. Return one RFC 8259 JSON object with exactly one key: "profile_summary". The value is one factual
-sentence under 220 characters. Do not refer to P1, P2, record IDs, labels, brackets, or a customer name. Include the
-resolved occupation name when present; state citizenship only as a factual attribute. After the final } output no other
-character.
+Compare ALL supplied profile versions in effective-date order. Mention an occupation, citizenship, or individual/type
+change only when two records actually differ; give the relevant dates. LAST_MAINT_DT is a maintenance timestamp, not
+proof of which field changed. VALID_FROM_DTTM and VALID_TO_DTTM define the recorded interval; a far-future end date is
+an open-ended record, not a future event. With one version, say that historical changes cannot be checked from it.
+Never claim there were no changes outside the supplied records. Prefer the resolved occupation_name to occupation_code.
+
+STRICT JSON ONLY. Return one RFC 8259 JSON object with exactly one key: "profile_summary". The value is 2-4 clear
+sentences, at most 650 characters. Use exact months and amounts from INPUT FACTS; do not calculate income or percentages.
+No markdown, arrays, extra keys, record IDs, or text after the final }.
 """
 
 
@@ -85,8 +98,8 @@ def transaction_context_input(monthly_summary: list[dict[str, Any]]) -> str:
     return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
 
 
-def profile_context_input(customer_profile: list[dict[str, str | None]]) -> str:
-    """Render only supplied profile facts in a compact, model-readable form."""
+def profile_context_input(customer_profile: list[dict[str, str | None]], monthly_summary: list[dict[str, Any]]) -> str:
+    """Give the profile stage the same six source rows used by transaction review."""
     lines = ["INPUT FACTS — supplied customer-profile records. Do not copy labels or invent values."]
     field_labels = (
         ("occupation", "occupation_name"),
@@ -106,4 +119,13 @@ def profile_context_input(customer_profile: list[dict[str, str | None]]) -> str:
             if record.get(field) is not None
         )
         lines.append("PROFILE_RECORD|" + "|".join(values))
-    return "\n".join(lines)
+    peak_total = max(monthly_summary, key=lambda row: Decimal(str(row["total_amount"])))
+    peak_single = max(monthly_summary, key=lambda row: Decimal(str(row["max_amount"])))
+    focus = (
+        "PROFILE_ACTIVITY_FOCUS|"
+        f"highest_monthly_total={peak_total['year_month']}:{Decimal(str(peak_total['total_amount'])):.2f}|"
+        f"same_month_debit={Decimal(str(peak_total['monthly_debit'])):.2f}|"
+        f"same_month_credit={Decimal(str(peak_total['monthly_credit'])):.2f}|"
+        f"largest_reported_single_amount={peak_single['year_month']}:{Decimal(str(peak_single['max_amount'])):.2f}"
+    )
+    return "\n".join(lines) + "\n" + focus + "\n" + transaction_context_input(monthly_summary)

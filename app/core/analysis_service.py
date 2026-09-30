@@ -5,24 +5,25 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Callable, Literal, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from TransactionSummary.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
-from TransactionSummary.config import Settings
-from TransactionSummary.core.llm_work_queue import LlmWorkQueue
-from TransactionSummary.core.models import (
+from ..adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
+from ..config import Settings
+from .llm_work_queue import LlmWorkQueue
+from .models import (
     AccountAnalysisRequest, AccountAssessment, AccountFinding, AssessmentLimitation,
     CustomerProfileContext, CustomerProfileRecord, EvidenceItem, FindingCategory, LlmClient,
     ReviewCheck, ReviewCheckName, ReviewOutcome, RiskLevel,
 )
-from TransactionSummary.core.prompts import (
+from .prompts import (
     FORMAT_RETRY_SUFFIX, PROFILE_CONTEXT_SYSTEM_PROMPT, TRANSACTION_CONTEXT_SYSTEM_PROMPT,
     profile_context_input, transaction_context_input,
 )
-from TransactionSummary.core.reference_data import resolve_citizenship, resolve_occupation
+from .reference_data import resolve_citizenship, resolve_occupation
 
 logger = logging.getLogger("TransactionSummary.analysis_service")
 ModelType = TypeVar("ModelType", bound=BaseModel)
@@ -32,7 +33,7 @@ _CHECK_ORDER: tuple[ReviewCheckName, ...] = (
 )
 _FORBIDDEN_TRANSACTION_TEXT = ("n/a", "insufficient", "nothing happened", "please provide")
 _FORBIDDEN_PROFILE_TEXT = (
-    "n/a", "insufficient", "missing", "unavailable", "not provided", "please provide", "named p",
+    "n/a", "please provide", "named p",
 )
 _MONTH_TOKEN = re.compile(r"^M?(\d{6})$")
 _NO_EVIDENCE_MONTHS = "none"
@@ -82,33 +83,33 @@ class AnalysisService:
             self._settings.llm_transaction_max_response_tokens,
             lambda value: self._validate_transaction_context(value, catalog),
         ))
-        profile_task = asyncio.create_task(self._profile_context_or_none(request.case_id, profile, catalog))
+        profile_task = asyncio.create_task(self._profile_context_or_none(request.case_id, profile, monthly))
         transaction_result, profile_result = await asyncio.gather(transaction_task, profile_task, return_exceptions=True)
-
-        if isinstance(transaction_result, Exception):
-            logger.error("Transaction context failed: case=%s error=%s", request.case_id, transaction_result)
-            return self._manual_review_fallback(request)
 
         profile_context: CustomerProfileContext | None = None
         if isinstance(profile_result, Exception):
             logger.warning("Profile summary omitted: case=%s error=%s", request.case_id, profile_result)
         elif profile_result is not None:
-            profile_context = self._hydrate_profile_context(profile_result, catalog)
+            profile_context = self._hydrate_profile_context(profile_result, catalog, profile, monthly)
+
+        if isinstance(transaction_result, Exception):
+            logger.error("Transaction context failed: case=%s error=%s", request.case_id, transaction_result)
+            return self._manual_review_fallback(request, profile_context)
 
         try:
             return self._hydrate_assessment(request, transaction_result, profile_context, catalog)
         except ModelOutputError as exc:
             logger.error("Transaction context could not be rendered: case=%s error=%s", request.case_id, exc)
-            return self._manual_review_fallback(request)
+            return self._manual_review_fallback(request, profile_context)
 
     async def _profile_context_or_none(
-        self, case_id: str, profile: list[dict[str, str | None]], catalog: dict[str, EvidenceItem],
+        self, case_id: str, profile: list[dict[str, str | None]], monthly: list[dict[str, Any]],
     ) -> "_RawProfileContext | None":
         if not profile:
             return None
         return await self._complete_with_retry(
             case_id, "profile-context", PROFILE_CONTEXT_SYSTEM_PROMPT,
-            profile_context_input(profile), _RawProfileContext,
+            profile_context_input(profile, monthly), _RawProfileContext,
             self._settings.llm_profile_context_max_response_tokens,
             self._validate_profile_context,
         )
@@ -210,10 +211,13 @@ class AnalysisService:
             generated_at=datetime.now(timezone.utc),
         )
 
-    def _hydrate_profile_context(self, raw: "_RawProfileContext", catalog: dict[str, EvidenceItem]) -> CustomerProfileContext:
+    def _hydrate_profile_context(
+        self, raw: "_RawProfileContext", catalog: dict[str, EvidenceItem],
+        profile: list[dict[str, str | None]], monthly: list[dict[str, Any]],
+    ) -> CustomerProfileContext:
         return CustomerProfileContext(
             summary=raw.profile_summary,
-            evidence=self._canonical_profile_evidence(catalog),
+            evidence=self._canonical_profile_evidence(catalog, profile, monthly),
         )
 
     @staticmethod
@@ -260,20 +264,38 @@ class AnalysisService:
         return self._resolve(ids, catalog, name)
 
     @staticmethod
-    def _canonical_profile_evidence(catalog: dict[str, EvidenceItem]) -> list[EvidenceItem]:
-        """Attach supplied profile values without asking the model to cite IDs."""
-        fields = (
-            "occupation", "citizenship", "indv_org_type", "last_maint_dt",
-            "valid_from_dttm", "valid_to_dttm", "occupation_cd", "citizen_cd",
-        )
-        record_ids = sorted(
-            {item_id.split(".", 1)[0] for item_id in catalog if item_id.startswith("P")},
-            key=lambda record_id: int(record_id[1:]), reverse=True,
-        )
-        ids = [
-            f"{record_id}.{field}" for record_id in record_ids for field in fields
-            if f"{record_id}.{field}" in catalog
-        ][:4]
+    def _canonical_profile_evidence(
+        catalog: dict[str, EvidenceItem], profile: list[dict[str, str | None]],
+        monthly: list[dict[str, Any]],
+    ) -> list[EvidenceItem]:
+        """Attach exact profile and amount facts without model-generated citations."""
+        ids: list[str] = []
+        latest = profile[-1]
+        latest_id = latest["profile_record_id"]
+        for field in (
+            "occupation", "citizenship", "indv_org_type",
+            "last_maint_dt", "valid_from_dttm", "valid_to_dttm",
+        ):
+            ids.append(f"{latest_id}.{field}")
+        peak = max(monthly, key=lambda row: Decimal(str(row["total_amount"])))
+        peak_single = max(monthly, key=lambda row: Decimal(str(row["max_amount"])))
+        ids.extend((
+            f"M{peak['year_month']}.total_amount",
+            f"M{peak['year_month']}.monthly_debit",
+            f"M{peak['year_month']}.monthly_credit",
+            f"M{peak_single['year_month']}.max_amount",
+        ))
+        transitions = list(zip(profile, profile[1:]))
+        for field in ("occupation", "citizenship", "indv_org_type"):
+            for previous, current in reversed(transitions):
+                if previous.get(field) != current.get(field):
+                    ids.extend((
+                        f"{previous['profile_record_id']}.{field}",
+                        f"{current['profile_record_id']}.{field}",
+                        f"{current['profile_record_id']}.valid_from_dttm",
+                    ))
+                    break
+        ids = list(dict.fromkeys(item_id for item_id in ids if item_id in catalog))[:16]
         if not ids:
             raise ModelOutputError("no factual profile evidence is available to render the profile summary")
         return [catalog[item_id] for item_id in ids]
@@ -292,13 +314,15 @@ class AnalysisService:
             AssessmentLimitation(limitation="LLM output is decision support and requires authorised human review."),
         ]
 
-    def _manual_review_fallback(self, request: AccountAnalysisRequest) -> AccountAssessment:
+    def _manual_review_fallback(
+        self, request: AccountAnalysisRequest, profile_context: CustomerProfileContext | None = None,
+    ) -> AccountAssessment:
         checks = [ReviewCheck(check=name, outcome="insufficient_data", rationale="Transaction context could not be verified; no conclusion is shown.") for name in _CHECK_ORDER]
         return AccountAssessment(
             case_id=request.case_id, acct_num=request.acct_num, status="needs_review",
             decision="continue_due_diligence", risk_level="medium",
             executive_summary="The LLM did not produce a verifiable transaction summary. Do not close this case on the basis of this result.",
-            review_checks=checks, findings=[], reviewer_questions=[], customer_profile_context=None,
+            review_checks=checks, findings=[], reviewer_questions=[], customer_profile_context=profile_context,
             limitations=self._static_limitations() + [AssessmentLimitation(limitation="Transaction-context LLM output verification failed; an authorised reviewer must assess the supplied data directly.")],
             months_reviewed=len(request.monthly_summary), profile_records_matched=len(request.customer_profile),
             generated_at=datetime.now(timezone.utc),
@@ -377,4 +401,4 @@ class _RawTransactionContext(BaseModel):
 
 class _RawProfileContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    profile_summary: str = Field(min_length=1, max_length=220)
+    profile_summary: str = Field(min_length=1, max_length=650)

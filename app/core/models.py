@@ -107,10 +107,10 @@ class AssessmentLimitation(BaseModel):
 
 
 class CustomerProfileContext(BaseModel):
-    """Factual customer-profile information, separate from transaction risk."""
+    """Profile-to-activity context and exact supporting source fields."""
 
-    summary: str = Field(min_length=1, max_length=300)
-    evidence: list[EvidenceItem] = Field(min_length=1, max_length=4)
+    summary: str = Field(min_length=1, max_length=650)
+    evidence: list[EvidenceItem] = Field(min_length=1, max_length=16)
 
 
 class AccountAssessment(BaseModel):

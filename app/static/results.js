@@ -96,7 +96,7 @@ function renderCustomerProfileContext(context) {
   els.customerProfileContext.innerHTML = `
     <article class="finding severity-low">
       <p>${escapeHtml(context.summary)}</p>
-      ${evidenceItems ? `<h5>Profile fields used</h5><ul>${evidenceItems}</ul>` : ""}
+        ${evidenceItems ? `<h5>Profile and transaction fields used</h5><ul>${evidenceItems}</ul>` : ""}
     </article>`;
 }
 
