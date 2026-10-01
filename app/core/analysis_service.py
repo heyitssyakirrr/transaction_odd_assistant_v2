@@ -15,7 +15,8 @@ from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedErro
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
-    activity_pair_context, activity_six_month_context, flow_pair_context, flow_six_month_context,
+    InactivityRun, activity_pair_context, activity_six_month_context, dormancy_rationale, find_inactivity_run,
+    flow_pair_context, flow_six_month_context, no_inactivity_rationale,
 )
 from app.core.models import (
     AccountAnalysisRequest, AccountAssessment, AccountFinding, AssessmentLimitation,
@@ -79,12 +80,13 @@ class AnalysisService:
         profile = self._profile_records_for_llm(request.customer_profile)
         catalog = self._evidence_catalog(request, profile)
         monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
+        run = self._inactivity_run(monthly)
 
         transaction_task = asyncio.create_task(self._complete_with_retry(
             request.case_id, "transaction-context", TRANSACTION_CONTEXT_SYSTEM_PROMPT,
-            transaction_context_input(monthly), _RawTransactionContext,
-            self._settings.llm_transaction_max_response_tokens,
-            lambda value: self._validate_transaction_context(value, catalog, monthly),
+            transaction_context_input(monthly, run, self._settings.dormancy_min_zero_months),
+            _RawTransactionContext, self._settings.llm_transaction_max_response_tokens,
+            lambda value: self._validate_transaction_context(value, catalog, monthly, run, request.case_id),
         ))
         profile_task = asyncio.create_task(self._profile_context_or_none(request.case_id, profile, monthly))
         transaction_result, profile_result = await asyncio.gather(transaction_task, profile_task, return_exceptions=True)
@@ -100,7 +102,7 @@ class AnalysisService:
             return self._manual_review_fallback(request, profile_context)
 
         try:
-            return self._hydrate_assessment(request, transaction_result, profile_context, catalog)
+            return self._hydrate_assessment(request, transaction_result, profile_context, catalog, run)
         except ModelOutputError as exc:
             logger.error("Transaction context could not be rendered: case=%s error=%s", request.case_id, exc)
             return self._manual_review_fallback(request, profile_context)
@@ -119,12 +121,18 @@ class AnalysisService:
 
     async def _complete_with_retry(
         self, case_id: str, stage: str, system_prompt: str, prompt_input: str,
-        model_type: type[ModelType], max_response_tokens: int, validator: Callable[[ModelType], None],
+        model_type: type[ModelType], max_response_tokens: int,
+        validator: Callable[[ModelType], ModelType | None],
     ) -> ModelType:
+        """Ask, validate, retry once on a format problem.
+
+        A validator may return a corrected copy of the result (for example after
+        reconciling a field with source facts); returning None keeps the original.
+        """
         try:
             result = await self._ask(case_id, stage, system_prompt, prompt_input, model_type, max_response_tokens)
-            validator(result)
-            return result
+            corrected = validator(result)
+            return result if corrected is None else corrected
         except LlmOutputTruncatedError as exc:
             raise ModelOutputError(f"{stage} reached its output limit; no same-budget retry was attempted.") from exc
         except (LlmOutputFormatError, ModelOutputError) as first_error:
@@ -136,8 +144,8 @@ class AnalysisService:
                     case_id, f"{stage}-format-retry", system_prompt + FORMAT_RETRY_SUFFIX,
                     prompt_input, model_type, max_response_tokens,
                 )
-                validator(result)
-                return result
+                corrected = validator(result)
+                return result if corrected is None else corrected
             except LlmOutputTruncatedError as exc:
                 raise ModelOutputError(f"{stage} retry reached its output limit.") from exc
             except (LlmOutputFormatError, ModelOutputError) as second_error:
@@ -157,13 +165,82 @@ class AnalysisService:
             ),
         )
         try:
-            return model_type.model_validate(result)
+            normalise = getattr(model_type, "normalise_payload", None)
+            return model_type.model_validate(normalise(result) if normalise else result)
         except ValidationError as exc:
             raise ModelOutputError(f"{stage} output did not meet the required schema: {exc}") from exc
 
+    def _inactivity_run(self, monthly: list[dict[str, Any]]) -> InactivityRun | None:
+        settings = self._settings
+        return find_inactivity_run(
+            monthly, min_zero_months=settings.dormancy_min_zero_months,
+            single_reference=Decimal(str(settings.dormancy_review_single_amount)),
+            month_total_reference=Decimal(str(settings.dormancy_review_month_total)),
+        )
+
+    def _reconcile_dormancy(
+        self, raw: "_RawTransactionContext", run: InactivityRun | None, case_id: str,
+    ) -> "_RawTransactionContext":
+        """Make the dormancy check agree with the source rows.
+
+        Whether the pattern exists is arithmetic (``find_inactivity_run``), so the
+        model cannot miss or invent it. The model keeps the risk judgement; the only
+        override of it is the floor below. Every change is logged for monitoring.
+        """
+        if not self._settings.dormancy_enforce_facts:
+            return raw
+        if run is None:
+            if raw.dormancy_outcome != "observed":
+                return raw
+            logger.warning("Dormancy reconciled: case=%s model reported a pattern but none exists in the rows", case_id)
+            return raw.model_copy(update={
+                "dormancy_outcome": "not_observed", "dormancy_months": _NO_EVIDENCE_MONTHS, "dormancy_context": "",
+            })
+        if raw.dormancy_outcome != "observed":
+            logger.warning(
+                "Dormancy reconciled: case=%s model missed %d zero months before %s", case_id, run.zero_months, run.active_month,
+            )
+        reconciled = raw.model_copy(update={
+            "dormancy_outcome": "observed", "dormancy_months": f"{run.zero_end},{run.active_month}",
+            "dormancy_context": f"Inactive {run.zero_months} months before {run.active_month}.",
+        })
+        if reconciled.risk_level == "low" and not self._reactivation_only(reconciled.checks(), run):
+            logger.warning(
+                "Risk raised to medium: case=%s amount_vs_reference=%s with other observed checks", case_id, run.amount_band,
+            )
+            reconciled = reconciled.model_copy(update={"risk_level": "medium"})
+        return reconciled
+
+    @classmethod
+    def _reactivation_only(cls, checks: dict[ReviewCheckName, _FlatCheck], run: InactivityRun | None) -> bool:
+        """True when the only observed patterns are one small first month after inactivity.
+
+        That is the dormancy check below the reference amount, plus any
+        activity/flow check that merely compares the last inactive month with that
+        same first active month. Such an account may be low risk while the pattern
+        is still shown to staff.
+        """
+        if run is None or run.amount_band != "below" or checks["dormancy_reactivation"].outcome != "observed":
+            return False
+        same_event = {run.zero_end, run.active_month}
+        for name, check in checks.items():
+            if name == "dormancy_reactivation" or check.outcome != "observed":
+                continue
+            if name == "burst_and_gaps":
+                return False
+            try:
+                months = cls._months_for_check(check, f"{name} months")
+            except ModelOutputError:
+                return False
+            if not set(months) <= same_event:
+                return False
+        return True
+
     def _validate_transaction_context(
         self, raw: "_RawTransactionContext", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
-    ) -> None:
+        run: InactivityRun | None = None, case_id: str = "",
+    ) -> "_RawTransactionContext":
+        raw = self._reconcile_dormancy(raw, run, case_id)
         checks = raw.checks()
         known_months = {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
         by_month = {row["year_month"]: row for row in monthly}
@@ -187,24 +264,44 @@ class AnalysisService:
                 )
                 if unchanged and not persistent_one_sided:
                     raise ModelOutputError(f"{name} selected months show no change in the cited fields")
-        if raw.dormancy_outcome == "not_observed" and any(
-            phrase in raw.executive_summary.casefold() for phrase in ("reactivat", "after dormancy", "following dormancy")
-        ):
-            raise ModelOutputError("summary claims dormancy/reactivation although the dormancy check is not observed")
+        # The model's executive_summary is never displayed (the summary is built from the
+        # checks), so its wording is not validated; a negated phrase such as "No
+        # observed reactivation" must not discard an otherwise valid response.
         observed_count = sum(check.outcome == "observed" for check in checks.values())
-        if raw.risk_level == "low" and observed_count:
+        if raw.risk_level == "low" and observed_count and not self._reactivation_only(checks, run):
             raise ModelOutputError("low risk requires all transaction checks to be not_observed")
         if raw.risk_level == "medium" and not observed_count:
             raise ModelOutputError("medium risk requires an observed transaction check")
         if raw.risk_level == "high" and observed_count < 2:
             raise ModelOutputError("high risk requires two observed transaction checks")
+        return raw
 
     def _validate_profile_context(self, raw: "_RawProfileContext") -> None:
         self._reject_forbidden_text(raw.profile_summary, _FORBIDDEN_PROFILE_TEXT, "profile summary")
 
+    def _dormancy_view(
+        self, check: _FlatCheck, months: list[str], run: InactivityRun | None, catalog: dict[str, EvidenceItem],
+    ) -> tuple[str, list[EvidenceItem]]:
+        """Staff text and evidence for the dormancy check, from source facts when enforced."""
+        if self._settings.dormancy_enforce_facts:
+            if run is not None and check.outcome == "observed":
+                ids = [
+                    f"M{run.zero_start}.txn_count_monthly", f"M{run.zero_end}.txn_count_monthly",
+                    f"M{run.active_month}.txn_count_monthly", f"M{run.active_month}.total_amount",
+                    f"M{run.active_month}.max_amount", f"M{run.active_month}.monthly_debit",
+                    f"M{run.active_month}.monthly_credit",
+                ]
+                return dormancy_rationale(run), self._resolve(list(dict.fromkeys(ids)), catalog, "dormancy_reactivation")
+            return no_inactivity_rationale(self._settings.dormancy_min_zero_months), []
+        return (
+            check.context.strip() or _NOT_OBSERVED_DEFAULT_CONTEXT,
+            self._evidence_for_months("dormancy_reactivation", months, catalog),
+        )
+
     def _hydrate_assessment(
         self, request: AccountAnalysisRequest, raw: "_RawTransactionContext",
         profile_context: CustomerProfileContext | None, catalog: dict[str, EvidenceItem],
+        run: InactivityRun | None = None,
     ) -> AccountAssessment:
         checks = raw.checks()
         monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
@@ -218,10 +315,15 @@ class AnalysisService:
                 rationale = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
             elif name == "debit_credit_flow":
                 rationale = flow_pair_context(monthly, months) if months else flow_six_month_context(monthly)
+            elif name == "dormancy_reactivation":
+                rationale, evidence = self._dormancy_view(check, months, run, catalog)
             else:
                 rationale = check.context.strip() or _NOT_OBSERVED_DEFAULT_CONTEXT
             review_checks.append(ReviewCheck(check=name, outcome=check.outcome, rationale=rationale, evidence=evidence))
-            if check.outcome == "observed":
+            # A low-risk observed pattern (a small first month after inactivity) is shown as
+            # a review check only, so it is not presented to staff as a medium finding.
+            small_reactivation = name == "dormancy_reactivation" and run is not None and run.amount_band == "below"
+            if check.outcome == "observed" and raw.risk_level != "low" and not small_reactivation:
                 findings.append(AccountFinding(
                     finding_id=str(uuid4()), category=name,
                     severity="high" if raw.risk_level == "high" else "medium",
@@ -249,7 +351,7 @@ class AnalysisService:
     @staticmethod
     def _checked_executive_summary(checks: dict[ReviewCheckName, _FlatCheck]) -> str:
         labels = {
-            "dormancy_reactivation": "dormancy/reactivation",
+            "dormancy_reactivation": "activity after an inactive period",
             "activity_value_change": "activity/value change",
             "debit_credit_flow": "debit/credit flow",
             "burst_and_gaps": "burst/gap pattern",
@@ -429,6 +531,27 @@ class _RawTransactionContext(BaseModel):
     burst_gap_outcome: TransactionOutcome
     burst_gap_context: str = Field(max_length=140)
     burst_gap_months: str = Field(min_length=1, max_length=32)
+
+    @classmethod
+    def normalise_payload(cls, payload: Any) -> Any:
+        """Replace a missing or unrecognised risk_level with the one the policy implies.
+
+        Under the stated policy the risk level follows from the observed checks, so a
+        stray value such as ``not_observed`` is recoverable and must not discard a
+        response. The derived level is conservative (never high); the validator
+        applies every other risk rule afterwards.
+        """
+        if not isinstance(payload, dict):
+            return payload
+        risk = str(payload.get("risk_level", "")).strip().lower()
+        if risk in {"low", "medium", "high"}:
+            return {**payload, "risk_level": risk}
+        observed = sum(payload.get(key) == "observed" for key in (
+            "dormancy_outcome", "activity_value_outcome", "debit_credit_outcome", "burst_gap_outcome",
+        ))
+        derived = "medium" if observed else "low"
+        logger.warning("risk_level %r is not low/medium/high; using %s from %d observed check(s)", risk, derived, observed)
+        return {**payload, "risk_level": derived}
 
     def checks(self) -> dict[ReviewCheckName, _FlatCheck]:
         return {

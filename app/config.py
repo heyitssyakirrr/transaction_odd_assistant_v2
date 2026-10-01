@@ -61,6 +61,21 @@ class Settings:
     # work queue.
     llm_transaction_max_response_tokens: int = int(os.getenv("LLM_TRANSACTION_MAX_RESPONSE_TOKENS", "500"))
     llm_profile_context_max_response_tokens: int = int(os.getenv("LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS", "320"))
+    # Activity after an inactive period. The pattern is found by arithmetic on the
+    # six rows (see app/core/monthly_facts.py), not by the model. A run needs at
+    # least this many consecutive zero-transaction months before a month with
+    # transactions. This is an internal review rule, not a bank policy.
+    dormancy_min_zero_months: int = int(os.getenv("DORMANCY_MIN_ZERO_MONTHS", "3"))
+    # The first active month is "above reference" when its largest single
+    # transaction, or its monthly total, reaches these amounts. Using both keeps
+    # the signal count-aware: one 10,000 payment and twelve 1,000 payments are
+    # both flagged. PLACEHOLDER DEFAULTS: set the compliance-approved values.
+    dormancy_review_single_amount: float = float(os.getenv("DORMANCY_REVIEW_SINGLE_AMOUNT", "5000"))
+    dormancy_review_month_total: float = float(os.getenv("DORMANCY_REVIEW_MONTH_TOTAL", "10000"))
+    # Rollback switch. true: the code decides whether the inactivity pattern is
+    # present and an above-reference amount lifts risk to at least medium.
+    # false: the model's own dormancy answer is kept, as before this feature.
+    dormancy_enforce_facts: bool = os.getenv("DORMANCY_ENFORCE_FACTS", "true").lower() == "true"
     # Retained for backwards-compatible .env files; no longer used by the
     # account-context workflow.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
@@ -106,6 +121,9 @@ class Settings:
             "MAX_RESPONSE_TOKENS": self.max_response_tokens,
             "LLM_TRANSACTION_MAX_RESPONSE_TOKENS": self.llm_transaction_max_response_tokens,
             "LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS": self.llm_profile_context_max_response_tokens,
+            "DORMANCY_MIN_ZERO_MONTHS": self.dormancy_min_zero_months,
+            "DORMANCY_REVIEW_SINGLE_AMOUNT": self.dormancy_review_single_amount,
+            "DORMANCY_REVIEW_MONTH_TOTAL": self.dormancy_review_month_total,
             "LLM_TIMELINE_MAX_RESPONSE_TOKENS": self.llm_timeline_max_response_tokens,
             "LLM_FLOW_MAX_RESPONSE_TOKENS": self.llm_flow_max_response_tokens,
             "LLM_PROFILE_MAX_RESPONSE_TOKENS": self.llm_profile_max_response_tokens,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from app.core.monthly_facts import transaction_comparison_facts
+from app.core.monthly_facts import InactivityRun, inactivity_run_fact, transaction_comparison_facts
 
 
 _TRANSACTION_FIELDS = (
@@ -19,8 +19,10 @@ crime, or wrongdoing. Do not invent counterparties, payment narratives, geograph
 turnover, or any data outside the rows. Do not ask the caller for information.
 
 Silently complete this review before writing the answer:
-1. Read txn_count_monthly across all six rows. Reactivation requires three immediately preceding zero-count months
-   followed by activity. Do not call a quiet, declining, or fluctuating account dormant.
+1. DORMANCY/REACTIVATION: The INACTIVITY_RUN line was computed from the rows; trust it. If status=present, set
+   dormancy_outcome to observed and dormancy_months to zero_end,active_month. If status=none, set dormancy_outcome to
+   not_observed and dormancy_months to "none". Do not call a quiet, declining, or fluctuating account dormant. Observed
+   here describes the pattern only; the amount is judged through amount_vs_reference, not through this check.
 2. ACTIVITY/VALUE: Read the six labelled MONTH facts and the two ACTIVITY_CANDIDATES. Compare counts with counts and
    monthly totals with monthly totals. A count change and a value change can occur in different month pairs. Select
    the two months that best show a meaningful increase, decrease, zero-to-active change, or concentration. State the
@@ -37,12 +39,15 @@ Silently complete this review before writing the answer:
    no business definition or suspicious act may be inferred from it.
 
 Each of the four checks is assessable from these rows. Use observed only for a material pattern that warrants staff
-context; otherwise use not_observed and still state the actual pattern. Do not output N/A, insufficient_data, a
-generic "nothing happened" statement, or a request for more information.
+context (dormancy follows INACTIVITY_RUN as above); otherwise use not_observed and still state the actual pattern.
+Do not output N/A, insufficient_data, a generic "nothing happened" statement, or a request for more information.
 
 Risk policy: low requires no observed transaction check; medium requires at least one observed check; high requires at
-least two observed checks. High is never based on amount alone. Keep the summary under 260 characters and each context
-under 140 characters.
+least two observed checks. High is never based on amount alone. Two exceptions follow INACTIVITY_RUN. If status=present
+and amount_vs_reference=above, risk_level is at least medium. If status=present and amount_vs_reference=below, risk_level
+is low when every other observed check only compares zero_end with active_month (the same move from inactivity to
+activity), and burst_gap is not_observed. risk_level is exactly low, medium or high, never not_observed. Keep the summary
+under 260 characters and each context under 140 characters.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
 examples, placeholders, arrays, nested objects, task keys, or extra keys. The object must contain exactly these keys:
@@ -112,8 +117,13 @@ def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
     return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
 
 
-def transaction_context_input(monthly_summary: list[dict[str, Any]]) -> str:
-    return _monthly_rows_input(monthly_summary) + "\n" + transaction_comparison_facts(monthly_summary)
+def transaction_context_input(
+    monthly_summary: list[dict[str, Any]], inactivity_run: InactivityRun | None, min_zero_months: int,
+) -> str:
+    return (
+        _monthly_rows_input(monthly_summary) + "\n" + transaction_comparison_facts(monthly_summary)
+        + "\n" + inactivity_run_fact(inactivity_run, min_zero_months)
+    )
 
 
 def profile_context_input(customer_profile: list[dict[str, str | None]], monthly_summary: list[dict[str, Any]]) -> str:
