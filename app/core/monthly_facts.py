@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-"""Mechanical monthly comparisons supplied as facts to the LLM.
+"""Mechanical monthly comparisons for the LLM and source-grounded display text.
 
-This module does not write review insights, assign risk, or decide materiality.
+These functions do not assign risk or decide whether a pattern is material.
 """
 
 from decimal import Decimal
@@ -15,6 +15,14 @@ def _amount(row: dict[str, Any], field: str) -> Decimal:
 
 def _money(value: Decimal) -> str:
     return f"{value:,.2f}"
+
+
+def _count_label(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _direction(first: Decimal, second: Decimal) -> str:
+    return "rose" if second > first else "fell" if second < first else "held steady"
 
 
 def _directional_pair(rows: list[dict[str, Any]], field: str, increase: bool) -> str:
@@ -34,8 +42,8 @@ def _directional_pair(rows: list[dict[str, Any]], field: str, increase: bool) ->
 
 
 def transaction_comparison_facts(rows: list[dict[str, Any]]) -> str:
-    """Label source values and mechanical comparisons for the transaction prompt."""
-    lines = ["CHECKED MONTH FACTS — use these values to choose activity/value or debit/credit evidence months."]
+    """Repeat the two checks as labelled facts so a small model need not do arithmetic."""
+    lines = ["CHECKED MONTH FACTS — copy values from these lines when choosing activity/value or debit/credit months."]
     for row in rows:
         lines.append(
             f"MONTH|{row['year_month']}|transactions={row['txn_count_monthly']}|"
@@ -62,3 +70,46 @@ def transaction_comparison_facts(rows: list[dict[str, Any]]) -> str:
         + "|credit_decrease=" + _directional_pair(rows, "monthly_credit", False),
     ))
     return "\n".join(lines)
+
+
+def activity_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
+    by_month = {row["year_month"]: row for row in rows}
+    first, second = (by_month[month] for month in months)
+    first_count, second_count = first["txn_count_monthly"], second["txn_count_monthly"]
+    first_total, second_total = _amount(first, "total_amount"), _amount(second, "total_amount")
+    return (
+        f"{months[0]} to {months[1]}: transactions {_direction(Decimal(first_count), Decimal(second_count))} "
+        f"{first_count} to {second_count}; monthly total {_direction(first_total, second_total)} "
+        f"{_money(first_total)} to {_money(second_total)}."
+    )
+
+
+def flow_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
+    by_month = {row["year_month"]: row for row in rows}
+    first, second = (by_month[month] for month in months)
+    return (
+        f"{months[0]}: {_count_label(first['debit_count_monthly'], 'debit')}/{_money(_amount(first, 'monthly_debit'))}, "
+        f"{_count_label(first['credit_count_monthly'], 'credit')}/{_money(_amount(first, 'monthly_credit'))}; "
+        f"{months[1]}: {_count_label(second['debit_count_monthly'], 'debit')}/{_money(_amount(second, 'monthly_debit'))}, "
+        f"{_count_label(second['credit_count_monthly'], 'credit')}/{_money(_amount(second, 'monthly_credit'))}."
+    )
+
+
+def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
+    counts = [row["txn_count_monthly"] for row in rows]
+    totals = [_amount(row, "total_amount") for row in rows]
+    return (
+        f"Six-month transaction counts range {min(counts)}-{max(counts)}; "
+        f"monthly totals range {_money(min(totals))}-{_money(max(totals))}."
+    )
+
+
+def flow_six_month_context(rows: list[dict[str, Any]]) -> str:
+    debit_count = sum(row["debit_count_monthly"] for row in rows)
+    credit_count = sum(row["credit_count_monthly"] for row in rows)
+    debits = sum((_amount(row, "monthly_debit") for row in rows), Decimal(0))
+    credits = sum((_amount(row, "monthly_credit") for row in rows), Decimal(0))
+    return (
+        f"Six-month flow: {_count_label(debit_count, 'debit')} totalling {_money(debits)}; "
+        f"{_count_label(credit_count, 'credit')} totalling {_money(credits)}."
+    )

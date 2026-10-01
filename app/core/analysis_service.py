@@ -14,6 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
+from app.core.monthly_facts import (
+    activity_pair_context, activity_six_month_context, flow_pair_context, flow_six_month_context,
+)
 from app.core.models import (
     AccountAnalysisRequest, AccountAssessment, AccountFinding, AssessmentLimitation,
     CustomerProfileContext, CustomerProfileRecord, EvidenceItem, FindingCategory, LlmClient,
@@ -39,8 +42,8 @@ _MONTH_TOKEN = re.compile(r"^M?(\d{6})$")
 _NO_EVIDENCE_MONTHS = "none"
 _NOT_OBSERVED_DEFAULT_CONTEXT = "No material pattern identified for this check."
 
-# The model selects the relevant months and writes the insight. The application
-# attaches exact CSV fields beneath it, without generating a second narrative.
+# The model selects the relevant months. The application then attaches exact
+# CSV values, so no model-generated field ID or value reaches bank staff.
 _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "dormancy_reactivation": ("txn_count_monthly",),
     "activity_value_change": ("txn_count_monthly", "total_amount"),
@@ -61,7 +64,11 @@ class _FlatCheck:
 
 
 class AnalysisService:
-    """Concurrent transaction and factual-profile summaries with source checks."""
+    """Concurrent transaction and factual-profile summaries with strict validation.
+
+    The model determines transaction interpretation. The application only
+    serialises source data, validates citations/contracts, and renders results.
+    """
 
     def __init__(self, llm: LlmClient, settings: Settings, llm_queue: LlmWorkQueue) -> None:
         self._llm = llm
@@ -124,16 +131,9 @@ class AnalysisService:
             if not self._settings.llm_format_retry_enabled:
                 raise ModelOutputError(f"{stage} output was rejected and format retry is disabled.") from first_error
             logger.warning("Context output rejected; retrying once: case=%s stage=%s error=%s", case_id, stage, first_error)
-            retry_prompt = system_prompt + FORMAT_RETRY_SUFFIX
-            if stage == "transaction-context" and isinstance(first_error, ModelOutputError):
-                retry_prompt += (
-                    "\nThe preceding transaction answer failed validation: "
-                    + str(first_error)[:180]
-                    + ". Correct that issue using INPUT FACTS; keep every required JSON key.\n"
-                )
             try:
                 result = await self._ask(
-                    case_id, f"{stage}-format-retry", retry_prompt,
+                    case_id, f"{stage}-format-retry", system_prompt + FORMAT_RETRY_SUFFIX,
                     prompt_input, model_type, max_response_tokens,
                 )
                 validator(result)
@@ -168,11 +168,9 @@ class AnalysisService:
         known_months = {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
         by_month = {row["year_month"]: row for row in monthly}
         for name, check in checks.items():
-            if (check.outcome == "observed" or name in {"activity_value_change", "debit_credit_flow"}) and not check.context.strip():
-                raise ModelOutputError(f"{name} has no explanation")
+            if check.outcome == "observed" and not check.context.strip():
+                raise ModelOutputError(f"{name} is observed but has no context")
             self._reject_forbidden_text(check.context, _FORBIDDEN_TRANSACTION_TEXT, f"{name} context")
-            if name in {"activity_value_change", "debit_credit_flow"} and re.search(r"\d", check.context):
-                raise ModelOutputError(f"{name} insight repeats numerical evidence")
             months = self._months_for_check(check, f"{name} months")
             self._validate_transaction_months(months, known_months, name)
             if name in {"activity_value_change", "debit_credit_flow"} and months:
@@ -209,13 +207,19 @@ class AnalysisService:
         profile_context: CustomerProfileContext | None, catalog: dict[str, EvidenceItem],
     ) -> AccountAssessment:
         checks = raw.checks()
+        monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
         review_checks: list[ReviewCheck] = []
         findings: list[AccountFinding] = []
         for name in _CHECK_ORDER:
             check = checks[name]
             months = self._months_for_check(check, f"{name} months")
             evidence = self._evidence_for_months(name, months, catalog)
-            rationale = check.context.strip() or _NOT_OBSERVED_DEFAULT_CONTEXT
+            if name == "activity_value_change":
+                rationale = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
+            elif name == "debit_credit_flow":
+                rationale = flow_pair_context(monthly, months) if months else flow_six_month_context(monthly)
+            else:
+                rationale = check.context.strip() or _NOT_OBSERVED_DEFAULT_CONTEXT
             review_checks.append(ReviewCheck(check=name, outcome=check.outcome, rationale=rationale, evidence=evidence))
             if check.outcome == "observed":
                 findings.append(AccountFinding(
@@ -417,10 +421,10 @@ class _RawTransactionContext(BaseModel):
     dormancy_context: str = Field(max_length=140)
     dormancy_months: str = Field(min_length=1, max_length=32)
     activity_value_outcome: TransactionOutcome
-    activity_value_context: str = Field(max_length=190)
+    activity_value_context: str = Field(max_length=140)
     activity_value_months: str = Field(min_length=1, max_length=32)
     debit_credit_outcome: TransactionOutcome
-    debit_credit_context: str = Field(max_length=190)
+    debit_credit_context: str = Field(max_length=140)
     debit_credit_months: str = Field(min_length=1, max_length=32)
     burst_gap_outcome: TransactionOutcome
     burst_gap_context: str = Field(max_length=140)

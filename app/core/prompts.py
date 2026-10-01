@@ -21,41 +21,28 @@ turnover, or any data outside the rows. Do not ask the caller for information.
 Silently complete this review before writing the answer:
 1. Read txn_count_monthly across all six rows. Reactivation requires three immediately preceding zero-count months
    followed by activity. Do not call a quiet, declining, or fluctuating account dormant.
-2. ACTIVITY/VALUE: Read all six labelled MONTH facts and the ACTIVITY_CANDIDATES. Compare counts with counts and
+2. ACTIVITY/VALUE: Read the six labelled MONTH facts and the two ACTIVITY_CANDIDATES. Compare counts with counts and
    monthly totals with monthly totals. A count change and a value change can occur in different month pairs. Select
-   the two months that best support a meaningful increase, decrease, zero-to-active change, or value concentration.
-   In activity_value_context, explain what that pattern means for review: for example, whether turnover is isolated
-   rather than sustained, or whether value changed without a matching change in frequency. State a useful question
-   staff could check, such as whether the activity fits expected account use. Do not infer the cause from aggregates.
-   If no meaningful pattern is selected, explain why the visible variation does not warrant a finding.
+   the two months that best show a meaningful increase, decrease, zero-to-active change, or concentration. State the
+   exact values for those two months only; never interpolate an intermediate month or call the first month a baseline.
+   If no meaningful pattern is selected, say what the six-month counts and totals actually show.
 3. DEBIT/CREDIT FLOW: Read debit_count and credit_count separately from debits and credits. The former are numbers of
    transactions; the latter are amounts. Look for a shift in direction, one-sided activity, or a material change in
    debit or credit amounts. A month with zero credits has no credit inflow in these aggregates. Select two real months
    that demonstrate the pattern. Do not say one month has a higher debit or credit count/amount unless that column's
    value is actually higher. The MONTH_STRUCTURE line lists zero, debit-only, credit-only, and mixed months; repeated
-   one-sided flow or a switch between these states can be useful context even if amounts are modest. In
-   debit_credit_context, explain why the flow mix matters for review and what staff might verify about the origin,
-   destination, or purpose of funds. Do not assert that funds were recycled, transferred to a specific party, or came
-   from a particular source; monthly aggregates cannot establish that. If no meaningful flow pattern is selected,
-   explain the observed mix without inventing a concern.
+   one-sided flow or a switch between these states is useful context even if amounts are modest. If no meaningful
+   flow pattern is selected, state the observed six-month debit/credit mix.
 4. Read pct_burst and pct_trx_gap. A pct_burst of zero cannot support burst activity. pct_trx_gap is a pattern only;
    no business definition or suspicious act may be inferred from it.
 
 Each of the four checks is assessable from these rows. Use observed only for a material pattern that warrants staff
-context; otherwise use not_observed and still give a useful account-specific explanation. Do not output N/A,
-insufficient_data, a generic "nothing happened" statement, or a request for more information from the caller.
-
-The activity_value_context and debit_credit_context are the insight sentences shown ABOVE an evidence table. The
-table already shows the exact CSV numbers. Do not repeat counts, amounts, dates, month labels, percentages, or raw
-column names in these two contexts. Use words only. Explain the significance of the selected comparison and a
-proportionate review question when appropriate. Do not merely paraphrase the evidence, say "a change was observed",
-or claim a pattern is sustained unless the six-month sequence supports it. If the outcome is not_observed, explain
-the lack of a material insight rather than listing a numerical range. Keep each of these two contexts under 190
-characters. The selected *_months fields provide the evidence references separately.
+context; otherwise use not_observed and still state the actual pattern. Do not output N/A, insufficient_data, a
+generic "nothing happened" statement, or a request for more information.
 
 Risk policy: low requires no observed transaction check; medium requires at least one observed check; high requires at
-least two observed checks. High is never based on amount alone. Keep the summary under 260 characters, the activity
-and flow contexts under 190 characters, and the dormancy and burst/gap contexts under 140 characters.
+least two observed checks. High is never based on amount alone. Keep the summary under 260 characters and each context
+under 140 characters.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
 examples, placeholders, arrays, nested objects, task keys, or extra keys. The object must contain exactly these keys:
@@ -71,8 +58,8 @@ not_observed just because no external income, counterparty, or account-purpose d
 contains exactly two different supplied months
 as YYYYMM,YYYYMM with no spaces when its outcome is observed; it is a comparison pair, not an evidence identifier.
 When its outcome is not_observed, set its *_months value to the JSON string "none". Never output N/A, M, field names, or an
-underscore in a *_months value. Put earlier month first. For dormancy and burst/gap, use YYYYMM rather than month names
-in the context. Do not write a numerical claim in the executive summary
+underscore in a *_months value. Put earlier month first. Use YYYYMM rather than month names in the context; when
+observed, mention only values from the selected two months. Do not write a numerical claim in the executive summary
 unless it matches a selected pair. The executive summary must not say reactivation or dormancy unless
 dormancy_outcome is observed. After the final } output
 no other character.
