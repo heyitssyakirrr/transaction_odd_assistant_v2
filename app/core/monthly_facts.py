@@ -272,14 +272,15 @@ def no_inactivity_rationale(min_zero_months: int) -> str:
 
 
 # --- Burst and transaction-gap timing ---------------------------------------
-# pct_burst and pct_trx_gap are upstream aggregates whose exact formulas are not
-# supplied. They are labelled conservatively: pct_burst is shown as a share
-# (0.0% = no burst recorded) and pct_trx_gap as the average days between
-# transactions, which is only an in-month average when the month has two or
-# more transactions. The model judges what the timing means; these helpers only
-# lay the values out and describe them.
+# Upstream definitions (confirmed by the data owner):
+# - pct_burst: share of the month's activity in which the same counterparty
+#   transacted more than 3 times that month ("burst"). Shown as a percentage.
+# - pct_trx_gap: average gap in days between transactions in the month. A gap
+#   needs two transactions, so in a one-transaction month it measures back to
+#   the previous transaction, which may fall before the six-month window.
+# The model judges what the timing means; these helpers only lay the values out.
 
-GapBasis = Literal["in_month", "single_transaction", "no_activity"]
+GapBasis = Literal["in_month", "since_previous", "no_activity"]
 
 
 def _burst_share(row: dict[str, Any]) -> Decimal:
@@ -290,14 +291,33 @@ def _gap_days(row: dict[str, Any]) -> Decimal:
     return Decimal(str(row["pct_trx_gap"])).quantize(Decimal("0.01"))
 
 
+def _days(value: Decimal) -> str:
+    """Staff-facing day count: 364 rather than 364.00, 10.67 stays 10.67."""
+    return f"{value.normalize():f}"
+
+
 def gap_basis(row: dict[str, Any]) -> GapBasis:
     count = row["txn_count_monthly"]
-    return "in_month" if count >= 2 else "single_transaction" if count == 1 else "no_activity"
+    if count >= 2:
+        return "in_month"
+    return "since_previous" if count == 1 and _gap_days(row) > 0 else "no_activity"
+
+
+def has_burst(rows: list[dict[str, Any]]) -> bool:
+    return any(_burst_share(row) > 0 for row in rows)
+
+
+def has_in_month_gap(rows: list[dict[str, Any]]) -> bool:
+    return any(gap_basis(row) == "in_month" for row in rows)
 
 
 def burst_gap_facts(rows: list[dict[str, Any]]) -> str:
     """Labelled per-month timing facts and a few candidates, for the timing prompt."""
-    lines = ["BURST_GAP_FACTS — burst_share is pct_burst as a percentage; avg_gap_days is pct_trx_gap."]
+    lines = [
+        "BURST_GAP_FACTS — burst_share = share of the month's activity where the same counterparty transacted more "
+        "than 3 times that month. avg_gap_days = average days between transactions; when gap_basis=since_previous "
+        "the month has one transaction and the gap reaches back to the previous transaction.",
+    ]
     for row in rows:
         lines.append(
             f"BURST|{row['year_month']}|transactions={row['txn_count_monthly']}|"
@@ -305,9 +325,11 @@ def burst_gap_facts(rows: list[dict[str, Any]]) -> str:
         )
     burst = [row for row in rows if _burst_share(row) > 0]
     in_month = [row for row in rows if gap_basis(row) == "in_month"]
+    since_previous = [row for row in rows if gap_basis(row) == "since_previous"]
     peak = max(burst, key=_burst_share) if burst else None
     longest = max(in_month, key=_gap_days) if in_month else None
     shortest = min(in_month, key=_gap_days) if in_month else None
+    longest_back = max(since_previous, key=_gap_days) if since_previous else None
     rises = [(a, b) for a, b in zip(rows, rows[1:]) if _burst_share(b) > _burst_share(a)]
     rise = max(rises, key=lambda pair: _burst_share(pair[1]) - _burst_share(pair[0])) if rises else None
     lines.append(
@@ -318,6 +340,8 @@ def burst_gap_facts(rows: list[dict[str, Any]]) -> str:
             if rise else "none")
         + "|longest_in_month_gap=" + (f"{longest['year_month']}:{_gap_days(longest)}" if longest else "none")
         + "|shortest_in_month_gap=" + (f"{shortest['year_month']}:{_gap_days(shortest)}" if shortest else "none")
+        + "|longest_gap_to_previous=" + (
+            f"{longest_back['year_month']}:{_gap_days(longest_back)}" if longest_back else "none")
     )
     return "\n".join(lines)
 
@@ -325,36 +349,58 @@ def burst_gap_facts(rows: list[dict[str, Any]]) -> str:
 def _burst_month_phrase(row: dict[str, Any]) -> str:
     basis = gap_basis(row)
     gap = (
-        f"avg gap {_gap_days(row)} days" if basis == "in_month"
-        else f"gap figure {_gap_days(row)} (single transaction)" if basis == "single_transaction"
-        else "no transactions"
+        f"avg gap {_days(_gap_days(row))} days" if basis == "in_month"
+        else f"{_days(_gap_days(row))} days since the previous transaction" if basis == "since_previous"
+        else "no gap figure"
     )
     return f"{row['year_month']}: {_count_label(row['txn_count_monthly'], 'transaction')}, burst {_burst_share(row)}%, {gap}"
 
 
 def burst_gap_pair_facts(rows: list[dict[str, Any]], months: list[str]) -> str:
-    """Exact values for the months the model selected, appended under its insight."""
+    """Exact values for the given months, appended under the model's insight."""
     by_month = {row["year_month"]: row for row in rows}
     return "Facts: " + "; ".join(_burst_month_phrase(by_month[month]) for month in months) + "."
+
+
+def burst_gap_evidence_months(rows: list[dict[str, Any]]) -> list[str]:
+    """Up to two months that best show the timing, for evidence when nothing is selected.
+
+    The peak burst month first, then the longest gap (in-month, else back to the
+    previous transaction). Chronological order.
+    """
+    months: list[str] = []
+    burst = [row for row in rows if _burst_share(row) > 0]
+    if burst:
+        months.append(max(burst, key=_burst_share)["year_month"])
+    in_month = [row for row in rows if gap_basis(row) == "in_month"]
+    gap_rows = in_month or [row for row in rows if gap_basis(row) == "since_previous"]
+    if gap_rows:
+        candidate = max(gap_rows, key=_gap_days)["year_month"]
+        if candidate not in months:
+            months.append(candidate)
+    return sorted(months)
 
 
 def burst_gap_six_month_context(rows: list[dict[str, Any]]) -> str:
     burst = [row for row in rows if _burst_share(row) > 0]
     in_month = [row for row in rows if gap_basis(row) == "in_month"]
+    since_previous = [row for row in rows if gap_basis(row) == "since_previous"]
     if burst:
         peak = max(burst, key=_burst_share)
         burst_text = (
-            f"Burst share above zero in {len(burst)} of {len(rows)} months "
-            f"(peak {_burst_share(peak)}% in {peak['year_month']}, "
-            f"{_count_label(peak['txn_count_monthly'], 'transaction')})"
+            f"Burst (same counterparty more than 3 times in a month) in {len(burst)} of {len(rows)} months, "
+            f"peak {_burst_share(peak)}% in {peak['year_month']} ({_count_label(peak['txn_count_monthly'], 'transaction')})"
         )
     else:
-        burst_text = "No burst share recorded in any month"
+        burst_text = "No burst (same counterparty more than 3 times in a month) in any month"
     if in_month:
         gaps = [_gap_days(row) for row in in_month]
-        gap_text = f"average gap ranged {min(gaps)}-{max(gaps)} days across months with 2+ transactions"
+        gap_text = f"average gap {_days(min(gaps))}-{_days(max(gaps))} days in months with 2+ transactions"
+    elif since_previous:
+        back = max(since_previous, key=_gap_days)
+        gap_text = f"the {back['year_month']} transaction came {_days(_gap_days(back))} days after the previous one"
     else:
-        gap_text = "no month has 2+ transactions, so no in-month gap average applies"
+        gap_text = "no gap figure is available"
     return f"{burst_text}; {gap_text}."
 
 

@@ -44,13 +44,15 @@ context; otherwise use not_observed and still state the actual pattern. Do not o
 generic "nothing happened" statement, or a request for more information.
 
 Risk policy: low requires no observed transaction check; medium requires at least one observed check; high requires
-both checks observed. High is never based on amount alone. Keep each context under 140 characters.
+both checks observed. High is never based on amount alone. risk_level is exactly "low", "medium" or "high".
+Keep each context under 140 characters.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
-examples, placeholders, arrays, nested objects, task keys, or extra keys. The object must contain exactly these keys:
-"risk_level",
-"activity_value_outcome", "activity_value_context", "activity_value_months",
-"debit_credit_outcome", "debit_credit_context", "debit_credit_months".
+examples, placeholders, arrays, nested objects, task keys, or extra keys. Write the keys in exactly this order, so each
+context describes the actual values before you decide its outcome, and risk_level is decided last:
+"activity_value_context", "activity_value_months", "activity_value_outcome",
+"debit_credit_context", "debit_credit_months", "debit_credit_outcome",
+"risk_level".
 
 Each outcome is exactly observed or not_observed. For activity_value and debit_credit, use observed when the selected
 pattern gives staff meaningful factual context; observed is not an allegation. Do not default these checks to
@@ -69,32 +71,36 @@ TIMING_SYSTEM_PROMPT = """You are an AML transaction-timing analyst assisting au
 Use only INPUT FACTS. Provide neutral, evidence-based context for staff; do not allege AML, crime, or wrongdoing, and
 do not invent counterparties, payment narratives, source of funds, or any data outside the facts.
 
-Silently complete two checks before writing the answer:
-1. DORMANCY/REACTIVATION: The INACTIVITY_RUN line was computed from the rows. If status=present, dormancy_outcome is
-   observed; if status=none, it is not_observed. Do not call a quiet, declining, or fluctuating account dormant.
-2. BURST/GAP: Read every BURST line and the BURST_CANDIDATES line. burst_share is the share of activity the upstream
-   system marked as burst; 0.0% means no burst was recorded. avg_gap_days is the average number of days between
-   transactions. When gap_basis is single_transaction or no_activity, avg_gap_days is not an in-month average: do not
-   describe it as one and do not infer dormancy length from it. Use observed when burst activity is concentrated in a
-   month with several transactions, rises clearly between months, or the in-month gap pattern changes materially
-   (transactions clustered much closer together or spread much further apart than in other months). Otherwise use
-   not_observed.
+Definitions:
+- burst_share: share of the month's activity where the same counterparty transacted more than 3 times that month.
+  0.0% means no burst that month; any value above 0.0% means burst activity was recorded that month.
+- avg_gap_days: average number of days between transactions in the month. When gap_basis=since_previous the month has
+  one transaction, and avg_gap_days is the number of days back to the previous transaction, which may be before the
+  six months shown. A large value there means a long quiet period before that transaction.
+- INACTIVITY_RUN: computed from the rows and already shown to staff. status=present means zero_months consecutive
+  months with no transactions followed by activity in active_month; amount_vs_reference says whether that activity is
+  above or below the bank's review reference amount.
 
-burst_gap_months: when observed, the one or two supplied months that show the pattern, as YYYYMM or YYYYMM,YYYYMM with
-the earlier month first; when not_observed, the JSON string "none".
+Silently read every BURST line, the BURST_CANDIDATES line and the INACTIVITY_RUN line, then write:
+
 burst_gap_insight: one or two plain sentences, at most 200 characters, telling staff what the timing shows and why it
-matters for review, for example clustered transactions in one month or a change in spacing. Quote only months and
-values that appear in the BURST lines, use YYYYMM, and write burst_share with a % sign. When not_observed, state the
-actual six-month timing pattern briefly.
-
-risk_level is your judgement of these two timing checks: low, medium or high. A large amount after inactivity (for
-example amount_vs_reference=above, or one large transaction) deserves more attention than a small one. Use high only
-when both checks are observed and material. risk_level is never not_observed.
+matters for review. Name the burst months and their burst_share when any month is above 0.0%; never write "no burst"
+when any month has burst_share above 0.0%. For a since_previous month, say how many days passed since the previous
+transaction. Do not describe transactions as evenly spaced when no month has 2 or more transactions. Quote only months
+and values from the BURST lines, use YYYYMM, and write burst_share with a % sign.
+burst_gap_months: the one or two supplied months that best show the pattern, as YYYYMM or YYYYMM,YYYYMM with the
+earlier month first; the JSON string "none" when burst_gap_outcome is not_observed.
+burst_gap_outcome: observed or not_observed. As a guide, observe burst_share of 25.0% or more in a month with 4 or more
+transactions, a clear rise in burst_share between months, an in-month gap pattern that changes sharply, or a
+since_previous gap much longer than the zero months shown. Otherwise not_observed.
+risk_level: exactly "low", "medium" or "high", your judgement of the timing for this account. Consider the
+INACTIVITY_RUN: activity after inactivity with amount_vs_reference=above usually deserves at least medium attention; a
+small amount after inactivity may be low. Use high only when inactivity and a material burst/gap pattern both apply.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
-nested objects, or extra keys. The object must contain exactly these keys:
-"risk_level", "dormancy_outcome", "burst_gap_outcome", "burst_gap_months", "burst_gap_insight".
-Each outcome is exactly observed or not_observed. After the final } output no other character.
+nested objects, or extra keys. Write the keys in exactly this order:
+"burst_gap_insight", "burst_gap_months", "burst_gap_outcome", "risk_level".
+After the final } output no other character.
 """
 
 
