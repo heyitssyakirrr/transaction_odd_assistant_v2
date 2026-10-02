@@ -269,3 +269,103 @@ def no_inactivity_rationale(min_zero_months: int) -> str:
         f"No run of {min_zero_months} or more consecutive zero-transaction months "
         "followed by activity in this six-month review."
     )
+
+
+# --- Burst and transaction-gap timing ---------------------------------------
+# pct_burst and pct_trx_gap are upstream aggregates whose exact formulas are not
+# supplied. They are labelled conservatively: pct_burst is shown as a share
+# (0.0% = no burst recorded) and pct_trx_gap as the average days between
+# transactions, which is only an in-month average when the month has two or
+# more transactions. The model judges what the timing means; these helpers only
+# lay the values out and describe them.
+
+GapBasis = Literal["in_month", "single_transaction", "no_activity"]
+
+
+def _burst_share(row: dict[str, Any]) -> Decimal:
+    return (Decimal(str(row["pct_burst"])) * 100).quantize(Decimal("0.1"))
+
+
+def _gap_days(row: dict[str, Any]) -> Decimal:
+    return Decimal(str(row["pct_trx_gap"])).quantize(Decimal("0.01"))
+
+
+def gap_basis(row: dict[str, Any]) -> GapBasis:
+    count = row["txn_count_monthly"]
+    return "in_month" if count >= 2 else "single_transaction" if count == 1 else "no_activity"
+
+
+def burst_gap_facts(rows: list[dict[str, Any]]) -> str:
+    """Labelled per-month timing facts and a few candidates, for the timing prompt."""
+    lines = ["BURST_GAP_FACTS — burst_share is pct_burst as a percentage; avg_gap_days is pct_trx_gap."]
+    for row in rows:
+        lines.append(
+            f"BURST|{row['year_month']}|transactions={row['txn_count_monthly']}|"
+            f"burst_share={_burst_share(row)}%|avg_gap_days={_gap_days(row)}|gap_basis={gap_basis(row)}"
+        )
+    burst = [row for row in rows if _burst_share(row) > 0]
+    in_month = [row for row in rows if gap_basis(row) == "in_month"]
+    peak = max(burst, key=_burst_share) if burst else None
+    longest = max(in_month, key=_gap_days) if in_month else None
+    shortest = min(in_month, key=_gap_days) if in_month else None
+    rises = [(a, b) for a, b in zip(rows, rows[1:]) if _burst_share(b) > _burst_share(a)]
+    rise = max(rises, key=lambda pair: _burst_share(pair[1]) - _burst_share(pair[0])) if rises else None
+    lines.append(
+        "BURST_CANDIDATES|burst_months=" + (",".join(row["year_month"] for row in burst) or "none")
+        + "|peak_burst=" + (f"{peak['year_month']}:{_burst_share(peak)}%" if peak else "none")
+        + "|largest_burst_rise=" + (
+            f"{rise[0]['year_month']},{rise[1]['year_month']}:{_burst_share(rise[0])}%->{_burst_share(rise[1])}%"
+            if rise else "none")
+        + "|longest_in_month_gap=" + (f"{longest['year_month']}:{_gap_days(longest)}" if longest else "none")
+        + "|shortest_in_month_gap=" + (f"{shortest['year_month']}:{_gap_days(shortest)}" if shortest else "none")
+    )
+    return "\n".join(lines)
+
+
+def _burst_month_phrase(row: dict[str, Any]) -> str:
+    basis = gap_basis(row)
+    gap = (
+        f"avg gap {_gap_days(row)} days" if basis == "in_month"
+        else f"gap figure {_gap_days(row)} (single transaction)" if basis == "single_transaction"
+        else "no transactions"
+    )
+    return f"{row['year_month']}: {_count_label(row['txn_count_monthly'], 'transaction')}, burst {_burst_share(row)}%, {gap}"
+
+
+def burst_gap_pair_facts(rows: list[dict[str, Any]], months: list[str]) -> str:
+    """Exact values for the months the model selected, appended under its insight."""
+    by_month = {row["year_month"]: row for row in rows}
+    return "Facts: " + "; ".join(_burst_month_phrase(by_month[month]) for month in months) + "."
+
+
+def burst_gap_six_month_context(rows: list[dict[str, Any]]) -> str:
+    burst = [row for row in rows if _burst_share(row) > 0]
+    in_month = [row for row in rows if gap_basis(row) == "in_month"]
+    if burst:
+        peak = max(burst, key=_burst_share)
+        burst_text = (
+            f"Burst share above zero in {len(burst)} of {len(rows)} months "
+            f"(peak {_burst_share(peak)}% in {peak['year_month']}, "
+            f"{_count_label(peak['txn_count_monthly'], 'transaction')})"
+        )
+    else:
+        burst_text = "No burst share recorded in any month"
+    if in_month:
+        gaps = [_gap_days(row) for row in in_month]
+        gap_text = f"average gap ranged {min(gaps)}-{max(gaps)} days across months with 2+ transactions"
+    else:
+        gap_text = "no month has 2+ transactions, so no in-month gap average applies"
+    return f"{burst_text}; {gap_text}."
+
+
+def allowed_burst_gap_numbers(rows: list[dict[str, Any]]) -> set[Decimal]:
+    """Every number the timing insight may quote: months, counts, shares and gaps."""
+    allowed: set[Decimal] = set(Decimal(n) for n in range(0, 13))
+    for row in rows:
+        month = row["year_month"]
+        allowed.update({Decimal(month), Decimal(month[:4]), Decimal(row["txn_count_monthly"])})
+        share, gap = Decimal(str(row["pct_burst"])) * 100, Decimal(str(row["pct_trx_gap"]))
+        for value in (share, gap, Decimal(str(row["pct_burst"]))):
+            for places in ("1", "0.1", "0.01"):
+                allowed.add(value.quantize(Decimal(places)).normalize())
+    return {value.normalize() for value in allowed}
