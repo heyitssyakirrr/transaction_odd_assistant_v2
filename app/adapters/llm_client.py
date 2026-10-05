@@ -76,15 +76,7 @@ class OpenAICompatibleClient:
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
         max_response_tokens: int | None = None,
-        single_object: bool = False,
     ) -> dict[str, Any]:
-        """Ask for one JSON object.
-
-        ``single_object`` marks answers that are always one block (summary, profile): the
-        loader then stops at the first } (when LLM_STOP_AFTER_JSON_OBJECT is on), so Qwen
-        cannot repeat the object until the token limit. Other answers are not cut there,
-        because Qwen sometimes splits them into two blocks; those blocks are merged.
-        """
         if not self._settings.llm_base_url:
             raise LlmServiceError(
                 "LLM_BASE_URL is not configured. Copy .env.example to .env in the "
@@ -99,7 +91,7 @@ class OpenAICompatibleClient:
             response_schema=response_schema,
             schema_name=schema_name,
             max_response_tokens=max_response_tokens,
-            stop_after_object=single_object and self._settings.llm_stop_after_json_object,
+            stop_after_object=self._settings.llm_stop_after_json_object,
         )
         self._validate_context_budget(body)
         payload = await self._post_with_retries(body, headers)
@@ -114,9 +106,9 @@ class OpenAICompatibleClient:
         self._log_raw_response(content)
         if body.get("stop") and _OBJECT_END in body["stop"] and choice.get("finish_reason") == "stop":
             content = _restore_object_end(content)
-        # Qwen may split the answer into two blocks, repeat it, or explain it afterwards
-        # (sometimes until the token limit). The complete blocks at the start are the
-        # answer: they are merged, and anything after them is ignored.
+        # With the stop at } the answer is one block. Without it (stop turned off, or a
+        # loader that ignores it) Qwen may repeat the object or explain it until the token
+        # limit; the complete blocks at the start are the answer and the rest is ignored.
         merged = _merged_objects_at_start(content) if isinstance(content, str) else None
         if choice.get("finish_reason") == "length":
             if merged is None:

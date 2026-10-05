@@ -137,14 +137,14 @@ def activity_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
 
 
 def flow_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
-    by_month = {row["year_month"]: row for row in rows}
-    first, second = (by_month[month] for month in months)
-    return (
-        f"{months[0]}: {_count_label(first['debit_count_monthly'], 'debit')} {_rm(_amount(first, 'monthly_debit'))}, "
-        f"{_count_label(first['credit_count_monthly'], 'credit')} {_rm(_amount(first, 'monthly_credit'))}; "
-        f"{months[1]}: {_count_label(second['debit_count_monthly'], 'debit')} {_rm(_amount(second, 'monthly_debit'))}, "
-        f"{_count_label(second['credit_count_monthly'], 'credit')} {_rm(_amount(second, 'monthly_credit'))}."
-    )
+    """Debits and credits of the selected months; one month is shown after the month before it."""
+    index = {row["year_month"]: position for position, row in enumerate(rows)}
+    shown = [rows[index[months[0]] - 1]["year_month"], *months] if len(months) == 1 and index[months[0]] > 0 else months
+    return "; ".join(
+        f"{row['year_month']}: {_count_label(row['debit_count_monthly'], 'debit')} {_rm(_amount(row, 'monthly_debit'))}, "
+        f"{_count_label(row['credit_count_monthly'], 'credit')} {_rm(_amount(row, 'monthly_credit'))}"
+        for row in (rows[index[month]] for month in shown)
+    ) + "."
 
 
 def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
@@ -362,6 +362,23 @@ def has_in_month_gap(rows: list[dict[str, Any]]) -> bool:
     return any(gap_basis(row) == "in_month" for row in rows)
 
 
+def burst_guide_months(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Months with burst share of 25% or more and 4 or more transactions (the burst guide)."""
+    return [row for row in rows
+            if _burst_share(row) >= BURST_GUIDE_SHARE and row["txn_count_monthly"] >= BURST_GUIDE_TRANSACTIONS]
+
+
+def risk_facts(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
+    """The two facts the summary's low-risk rule reads: amount size and notable bursts."""
+    largest = max(rows, key=lambda row: _amount(row, "max_amount"))
+    below = "yes" if _amount(largest, "max_amount") < single_reference else "no"
+    guide = ",".join(f"{row['year_month']}:{_burst_share(row)}%" for row in burst_guide_months(rows)) or "none"
+    return (
+        f"RISK_FACTS|largest_single=RM {_money(_amount(largest, 'max_amount'))} in {largest['year_month']}|"
+        f"review_reference=RM {_money(single_reference)}|largest_single_below_reference={below}|burst_guide_months={guide}"
+    )
+
+
 def long_gap_months(rows: list[dict[str, Any]], long_gap_days: Decimal) -> list[dict[str, Any]]:
     """One-transaction months whose gap back to the previous transaction is ``long_gap_days`` or more."""
     return [row for row in rows if gap_basis(row) == "since_previous" and _gap_days(row) >= long_gap_days]
@@ -388,7 +405,7 @@ def burst_gap_facts(rows: list[dict[str, Any]], long_gap_days: Decimal) -> str:
     longest_back = max(since_previous, key=_gap_days) if since_previous else None
     rises = [(a, b) for a, b in zip(rows, rows[1:]) if _burst_share(b) > _burst_share(a)]
     rise = max(rises, key=lambda pair: _burst_share(pair[1]) - _burst_share(pair[0])) if rises else None
-    guide = [row for row in burst if _burst_share(row) >= BURST_GUIDE_SHARE and row["txn_count_monthly"] >= BURST_GUIDE_TRANSACTIONS]
+    guide = burst_guide_months(rows)
     lines.append(
         "BURST_GUIDE|months_with_burst_share_25%_or_more_and_4_or_more_transactions="
         + (",".join(f"{row['year_month']}:{_burst_share(row)}%" for row in guide) or "no month")
@@ -567,69 +584,62 @@ def debit_credit_mix_facts(rows: list[dict[str, Any]]) -> str:
 
 
 # --- Pattern checks -----------------------------------------------------------
-# The model names the kind of change it saw. These checks confirm the name against
-# the rows for the months it selected. A mismatch is listed for staff under the
-# model's sentence; nothing the model wrote is hidden.
+# The model names the kind of change it saw, from three broad labels per check (Qwen 7B
+# invents or misuses names when given many). Whatever it writes is grouped into one of
+# these by the words it uses, then confirmed against the rows. A mismatch is listed for
+# staff under the model's sentence; nothing the model wrote is hidden.
 
-
-# Pattern names the model may give, per check, with the names Qwen has been seen to
-# use instead. Unknown names are left as they are and fail the check below.
 PATTERN_NAMES: dict[str, tuple[str, ...]] = {
+    "activity_and_amount_change": ("large_transaction", "total_increase", "total_decrease"),
+    "money_in_and_out": ("debits", "credits", "debit_credit_mix_change"),
+    "burst_and_gaps": ("burst", "long_gap", "gap_change"),
+}
+# How each pattern is shown to staff.
+PATTERN_LABELS: dict[str, str] = {
+    "large_transaction": "Large transaction",
+    "total_increase": "Monthly total increased",
+    "total_decrease": "Monthly total decreased",
+    "debits": "Debits (money out)",
+    "credits": "Credits (money in)",
+    "debit_credit_mix_change": "Debit/credit mix changed",
+    "burst": "Burst",
+    "long_gap": "Long gap",
+    "gap_change": "Gap between transactions changed",
+}
+# Words in a name the model wrote, and the pattern they mean; the first match wins.
+_PATTERN_WORDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "activity_and_amount_change": (
-        "large_single_amount", "total_rose", "total_fell", "amounts_more_varied", "started", "stopped",
+        ("large_transaction", ("large", "single", "big")),
+        ("total_increase", ("increase", "rose", "rise", "start", "grow", "higher")),
+        ("total_decrease", ("decrease", "fell", "fall", "stop", "drop", "declin", "lower")),
     ),
     "money_in_and_out": (
-        "debit_only", "credit_only", "debit_credit_mix_changed", "debit_amount_changed", "credit_amount_changed",
+        ("debit_credit_mix_change", ("mix", "shift", "switch", "direction")),
+        ("debits", ("debit", "money_out", "outflow")),
+        ("credits", ("credit", "money_in", "inflow")),
     ),
-    "burst_and_gaps": ("burst_peak", "burst_rising", "gap_changed", "long_gap_before"),
+    "burst_and_gaps": (
+        ("burst", ("burst",)),
+        ("long_gap", ("long", "before", "quiet", "inactiv", "dormant")),
+        ("gap_change", ("gap", "spacing", "interval")),
+    ),
 }
-_PATTERN_SYNONYMS: dict[str, dict[str, str]] = {
-    "activity_and_amount_change": {
-        "rose": "total_rose", "increase": "total_rose", "total_increase": "total_rose", "amount_rose": "total_rose",
-        "fell": "total_fell", "decrease": "total_fell", "total_decrease": "total_fell", "amount_fell": "total_fell",
-        "total_fall": "total_fell", "total_rise": "total_rose", "std_rise": "amounts_more_varied",
-        "large_single": "large_single_amount", "large_transaction": "large_single_amount",
-        "large_single_transaction": "large_single_amount", "std_rose": "amounts_more_varied",
-        "count_increase": "started", "count_decrease": "stopped",
-        "more_varied": "amounts_more_varied",
-    },
-    "money_in_and_out": {
-        "money_out_only": "debit_only", "debits_only": "debit_only", "one_sided_debit": "debit_only",
-        "money_in_only": "credit_only", "credits_only": "credit_only", "one_sided_credit": "credit_only",
-        "in_out_mix_changed": "debit_credit_mix_changed", "mix_changed": "debit_credit_mix_changed",
-        "direction_shift": "debit_credit_mix_changed",
-        "debit_increase": "debit_amount_changed", "debit_decrease": "debit_amount_changed",
-        "debits_changed": "debit_amount_changed", "debit_outflow": "debit_amount_changed",
-        "credit_increase": "credit_amount_changed", "credit_decrease": "credit_amount_changed",
-        "credits_changed": "credit_amount_changed", "credit_inflow": "credit_amount_changed",
-    },
-    "burst_and_gaps": {"burst": "burst_peak", "long_gap": "long_gap_before", "gap_before": "long_gap_before"},
-}
-
-
-# How each pattern name is shown to staff.
-PATTERN_LABELS: dict[str, str] = {
-    "large_single_amount": "Large single transaction", "total_rose": "Monthly total rose",
-    "total_fell": "Monthly total fell", "amounts_more_varied": "Amounts more varied",
-    "started": "Started after no activity", "stopped": "Stopped",
-    "debit_only": "Money out only (debits)", "credit_only": "Money in only (credits)",
-    "debit_credit_mix_changed": "Debit/credit mix changed", "debit_amount_changed": "Debit amount changed",
-    "credit_amount_changed": "Credit amount changed",
-    "burst_peak": "Burst peak", "burst_rising": "Burst rising",
-    "gap_changed": "Gap between transactions changed", "long_gap_before": "Long gap before transaction",
-}
-_MONTH_TYPES = {"mixed", "mixed_flow", "debit_only", "credit_only", "zero", "zero_activity"}
 
 
 def canonical_pattern(check: str, name: str) -> str:
-    """The standard pattern name for what the model wrote ("none" stays "none").
+    """One of the check's three patterns for what the model wrote; "none" stays "none".
 
-    Two month types joined by a comma ("credit_only,debit_only") mean the type changed.
+    An unrecognised name is returned as written, so staff see it and its issue.
     """
-    parts = [part.strip() for part in name.split(",")]
-    if check == "money_in_and_out" and len(parts) == 2 and all(part in _MONTH_TYPES for part in parts):
-        return "debit_credit_mix_changed"
-    return _PATTERN_SYNONYMS.get(check, {}).get(name, name)
+    words = re.sub(r"[^a-z]+", "_", name.lower()).strip("_")
+    if words in ("", "none"):
+        return "none"
+    if check == "money_in_and_out" and "debit" in words and "credit" in words:
+        return "debit_credit_mix_change"  # e.g. "debit_only -> credit_only"
+    for pattern, keys in _PATTERN_WORDS.get(check, ()):
+        if any(key in words for key in keys):
+            return pattern
+    return name
 
 
 def pattern_problem(
@@ -648,6 +658,42 @@ def pattern_problem(
     )
 
 
+def _before_after(rows: list[dict[str, Any]], selected: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The two months being compared: the first and last selected, or one month and the month before it."""
+    if len(selected) >= 2:
+        return selected[0], selected[-1]
+    index = rows.index(selected[0])
+    return (rows[index - 1], selected[0]) if index > 0 else None
+
+
+def _pattern_fits(
+    check: str, pattern: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]], long_gap_days: Decimal,
+) -> bool:
+    if pattern == "large_transaction":
+        largest = max(_amount(row, "max_amount") for row in rows)
+        return any(_amount(row, "max_amount") == largest > 0 for row in selected)
+    if pattern == "burst":
+        return any(_burst_share(row) > 0 for row in selected)
+    if pattern == "long_gap":
+        return bool(long_gap_months(selected, long_gap_days))
+    pair = _before_after(rows, selected)
+    if pair is None:
+        return False
+    before, after = pair
+    compare = {
+        "total_increase": lambda: _amount(after, "total_amount") > _amount(before, "total_amount"),
+        "total_decrease": lambda: _amount(after, "total_amount") < _amount(before, "total_amount"),
+        # Debits/credits: that side changed, or both months had only that side.
+        "debits": lambda: (_amount(after, "monthly_debit") != _amount(before, "monthly_debit")
+                           or _structure(before) == _structure(after) == "debit_only"),
+        "credits": lambda: (_amount(after, "monthly_credit") != _amount(before, "monthly_credit")
+                            or _structure(before) == _structure(after) == "credit_only"),
+        "debit_credit_mix_change": lambda: _structure(after) != _structure(before),
+        "gap_change": lambda: _gap_days(after) != _gap_days(before),
+    }
+    return compare[pattern]()
+
+
 def _selected_facts(check: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]]) -> str:
     """What the rows actually show for the selected months, for a mismatch message."""
     if check == "money_in_and_out":
@@ -661,45 +707,12 @@ def _selected_facts(check: str, rows: list[dict[str, Any]], selected: list[dict[
     ) + f" (largest single in six months: {_rm(_amount(largest, 'max_amount'))} in {largest['year_month']})"
 
 
-def _pattern_fits(
-    check: str, pattern: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]], long_gap_days: Decimal,
-) -> bool:
-    first, last = selected[0], selected[-1]
-    pair = len(selected) >= 2
-    if check == "activity_and_amount_change":
-        largest = max(_amount(row, "max_amount") for row in rows)
-        fits = {
-            "large_single_amount": any(_amount(row, "max_amount") == largest > 0 for row in selected),
-            "total_rose": pair and _amount(last, "total_amount") > _amount(first, "total_amount"),
-            "total_fell": pair and _amount(last, "total_amount") < _amount(first, "total_amount"),
-            "amounts_more_varied": pair and _amount(last, "std_amount") > _amount(first, "std_amount"),
-            "started": pair and first["txn_count_monthly"] == 0 and last["txn_count_monthly"] > 0,
-            "stopped": pair and first["txn_count_monthly"] > 0 and last["txn_count_monthly"] == 0,
-        }
-    elif check == "money_in_and_out":
-        fits = {
-            "debit_only": all(_structure(row) == "debit_only" for row in selected),
-            "credit_only": all(_structure(row) == "credit_only" for row in selected),
-            "debit_credit_mix_changed": pair and _structure(first) != _structure(last),
-            "debit_amount_changed": pair and _amount(first, "monthly_debit") != _amount(last, "monthly_debit"),
-            "credit_amount_changed": pair and _amount(first, "monthly_credit") != _amount(last, "monthly_credit"),
-        }
-    else:
-        peak = max((_burst_share(row) for row in rows), default=Decimal(0))
-        fits = {
-            "burst_peak": peak > 0 and any(_burst_share(row) == peak for row in selected),
-            "burst_rising": pair and _burst_share(last) > _burst_share(first),
-            "gap_changed": (pair and gap_basis(first) == gap_basis(last) == "in_month"
-                            and _gap_days(first) != _gap_days(last)),
-            "long_gap_before": bool(long_gap_months(selected, long_gap_days)),
-        }
-    return fits[pattern]
-
-
 # --- Numbers a model sentence may quote ------------------------------------------
 
 _SMALL_COUNTS = {Decimal(n) for n in range(0, 13)}
-_NUMBER_IN_TEXT = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# A number as written in text: 1,234,567.89 (commas only between groups of three digits) or 202605.
+# "202604,202605" is two months, not one number.
+_NUMBER_IN_TEXT = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
 
 
 def _with_roundings(values: set[Decimal]) -> set[Decimal]:

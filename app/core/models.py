@@ -99,7 +99,7 @@ class ReviewCheck(BaseModel):
     # A short factual line built from the CSV rows.
     facts: str = Field(min_length=1, max_length=400)
     table: EvidenceTable | None = None
-    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=9)
+    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=18)
 
 
 class AssessmentLimitation(BaseModel):
@@ -154,5 +154,4 @@ class LlmClient(Protocol):
         response_schema: dict[str, Any],
         schema_name: str,
         max_response_tokens: int | None = None,
-        single_object: bool = False,
     ) -> dict[str, Any]: ...
