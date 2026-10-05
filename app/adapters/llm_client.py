@@ -1,19 +1,18 @@
-
 from __future__ import annotations
- 
+
 import asyncio
 import json
 import logging
 import random
 import re
 from typing import Any
- 
+
 import httpx
- 
+
 from app.config import Settings
- 
+
 logger = logging.getLogger("app.llm_client")
- 
+
 # Transient failures worth a retry: connection issues, timeouts, and the
 # status codes an upstream loader typically returns while overloaded or
 # warming up. Anything else (4xx client errors) is not retried, since
@@ -22,11 +21,11 @@ _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 1
 _BACKOFF_BASE_SECONDS = 0.75
 _QWEN_ASSESSMENT_TOKEN_CAP = 700
- 
- 
+
+
 class LlmServiceError(RuntimeError):
     """A safe, classified failure returned by the upstream LLM service."""
- 
+
     def __init__(
         self,
         message: str,
@@ -37,27 +36,27 @@ class LlmServiceError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.upstream_request_id = upstream_request_id
- 
- 
+
+
 class LlmContextWindowError(LlmServiceError):
     """The request cannot fit within the configured or reported model context."""
- 
- 
+
+
 class LlmOutputFormatError(LlmServiceError):
     """The model answer cannot be safely normalised into one JSON object."""
- 
- 
+
+
 class LlmOutputTruncatedError(LlmOutputFormatError):
     """The model hit its output cap, so a same-budget retry is not useful."""
- 
- 
+
+
 class OpenAICompatibleClient:
     """Compatibility client for a loader that does not enforce JSON schemas.
- 
+
     It permits only mechanical punctuation recovery. The downstream Pydantic
     schema and source-citation checks remain the authority for acceptance.
     """
- 
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client = httpx.AsyncClient(
@@ -68,7 +67,7 @@ class OpenAICompatibleClient:
             ),
             verify=False
         )
- 
+
     async def complete_json(
         self,
         *,
@@ -83,7 +82,7 @@ class OpenAICompatibleClient:
                 "LLM_BASE_URL is not configured. Copy .env.example to .env in the "
                 "project root and set LLM_BASE_URL to the internal loader's address."
             )
- 
+
         headers = self._build_headers()
         body = self._build_body(
             system_prompt,
@@ -95,7 +94,7 @@ class OpenAICompatibleClient:
         )
         self._validate_context_budget(body)
         payload = await self._post_with_retries(body, headers)
- 
+
         choice = (payload.get("choices") or [{}])[0]
         logger.info(
             "LLM completion: finish_reason=%s completion_tokens=%s",
@@ -104,6 +103,8 @@ class OpenAICompatibleClient:
         )
         content = _extract_content(payload)
         self._log_raw_response(content)
+        if self._settings.llm_stop_after_json_object and choice.get("finish_reason") == "stop":
+            content = _restore_object_end(content)
         if choice.get("finish_reason") == "length":
             # Qwen sometimes writes a complete answer and then repeats it or explains
             # itself until the token limit. A complete JSON object at the start is the
@@ -122,10 +123,10 @@ class OpenAICompatibleClient:
                 "LLM returned invalid JSON: response_chars=%d", len(content) if isinstance(content, str) else 0
             )
             raise
- 
+
     async def close(self) -> None:
         await self._client.aclose()
- 
+
     def _build_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self._settings.llm_api_key:
@@ -134,7 +135,7 @@ class OpenAICompatibleClient:
                 value = f"Bearer {value}"
             headers[self._settings.llm_api_key_header] = value
         return headers
- 
+
     def _build_body(
         self,
         system_prompt: str,
@@ -165,8 +166,11 @@ class OpenAICompatibleClient:
         }
         if self._settings.llm_repetition_penalty:
             body["repetition_penalty"] = self._settings.llm_repetition_penalty
-        if self._settings.llm_stop_sequences:
-            body["stop"] = list(self._settings.llm_stop_sequences)
+        stop = list(self._settings.llm_stop_sequences)
+        if self._settings.llm_stop_after_json_object:
+            stop.append(_OBJECT_END)
+        if stop:
+            body["stop"] = stop
         if use_response_format and response_schema:
             protocol = self._settings.llm_structured_output_protocol
             if protocol == "json_schema":
@@ -183,10 +187,10 @@ class OpenAICompatibleClient:
             elif protocol == "json_object":
                 body["response_format"] = {"type": "json_object"}
         return body
- 
+
     async def _post_with_retries(self, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         last_error: Exception | None = None
- 
+
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             started_at = asyncio.get_running_loop().time()
             try:
@@ -203,7 +207,7 @@ class OpenAICompatibleClient:
                     break
                 await self._sleep_before_retry(attempt, reason=type(exc).__name__)
                 continue
- 
+
             duration_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
             request_id = _upstream_request_id(response)
             logger.info(
@@ -214,7 +218,7 @@ class OpenAICompatibleClient:
                 duration_ms,
                 request_id or "-",
             )
- 
+
             if _is_context_window_response(response):
                 diagnostic = _safe_error_message(response)
                 logger.error(
@@ -229,7 +233,7 @@ class OpenAICompatibleClient:
                     status_code=response.status_code,
                     upstream_request_id=request_id,
                 )
- 
+
             if response.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_ATTEMPTS:
                 logger.warning(
                     "LLM loader returned %s on attempt %s/%s; retrying. upstream_request_id=%s detail=%s",
@@ -241,7 +245,7 @@ class OpenAICompatibleClient:
                 )
                 await self._sleep_before_retry(attempt, reason=f"HTTP {response.status_code}")
                 continue
- 
+
             try:
                 response.raise_for_status()
                 return response.json()
@@ -254,12 +258,12 @@ class OpenAICompatibleClient:
                     _safe_error_message(response),
                 )
                 break
- 
+
         raise LlmServiceError(
             f"LLM service request failed after {_MAX_ATTEMPTS} attempts: {last_error}",
             status_code=getattr(getattr(last_error, "response", None), "status_code", None),
         )
- 
+
     def _validate_context_budget(self, body: dict[str, Any]) -> None:
         serialized = json.dumps(body["messages"], ensure_ascii=False, separators=(",", ":"))
         request_bytes = len(serialized.encode("utf-8"))
@@ -289,7 +293,7 @@ class OpenAICompatibleClient:
                 "The request is estimated to exceed the configured LLM context window. "
                 "Reduce CHUNK_SIZE or increase the confirmed model context-window setting.",
             )
- 
+
     def _log_raw_response(self, content: str | dict[str, Any]) -> None:
         """Log model content only when explicitly enabled for diagnostics."""
         if not self._settings.llm_log_raw_response:
@@ -302,14 +306,14 @@ class OpenAICompatibleClient:
             len(raw) > limit,
             raw[:limit],
         )
- 
+
     @staticmethod
     async def _sleep_before_retry(attempt: int, *, reason: str) -> None:
         delay = _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
         logger.debug("Backing off %.2fs before retry (%s).", delay, reason)
         await asyncio.sleep(delay)
- 
- 
+
+
 def _extract_content(payload: dict[str, Any]) -> str | dict[str, Any]:
     if payload.get("choices"):
         content = payload["choices"][0].get("message", {}).get("content")
@@ -318,11 +322,11 @@ def _extract_content(payload: dict[str, Any]) -> str | dict[str, Any]:
     if payload.get("text") is not None:
         return payload["text"]
     raise LlmServiceError("Unrecognised LLM response: expected choices[0].message.content or text")
- 
- 
+
+
 def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) -> dict[str, Any]:
     """Parse one model object, with optional bounded punctuation recovery.
- 
+
     Recovery removes only an outer code fence/trailing comma and appends closing
     quote/brackets for one unfinished object. It never supplies a missing key,
     evidence ID, value, or finding. Pydantic validation still rejects incomplete
@@ -332,7 +336,7 @@ def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) 
         return content
     if not isinstance(content, str) or not content.strip():
         raise LlmOutputFormatError("LLM response content was empty.")
- 
+
     candidates = [content.strip()]
     fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", content, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
@@ -347,7 +351,7 @@ def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) 
         # but bare identifier keys. Quoting those keys is syntactic recovery
         # only; schema and citation validation still reject wrong content.
         candidates.extend(_quote_bare_object_keys(candidate) for candidate in list(candidates))
- 
+
     for candidate in reversed(_unique(candidates)):
         try:
             parsed = json.loads(candidate, object_pairs_hook=_reject_duplicate_json_keys)
@@ -356,16 +360,26 @@ def _parse_json_content(content: str | dict[str, Any], *, repair: bool = False) 
         if isinstance(parsed, dict):
             return parsed
     raise LlmOutputFormatError("LLM response was not a recoverable JSON object.")
- 
- 
+
+
+_OBJECT_END = "}"
+
+
+def _restore_object_end(content: str | dict[str, Any]) -> str | dict[str, Any]:
+    """Add back the closing } that the loader removed when it stopped on it."""
+    if isinstance(content, str) and "{" in content and not content.rstrip().endswith(_OBJECT_END):
+        return content.rstrip() + _OBJECT_END
+    return content
+
+
 def _strip_code_fence_start(text: str) -> str:
     """Drop a leading ```json fence so the object that follows it can be found."""
     return re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
- 
- 
+
+
 def _first_complete_object_at_start(text: str) -> str | None:
     """Extract a complete first JSON object before a faulty chat continuation.
- 
+
     Qwen may continue with a natural-language question after a completed
     object. This accepts only an object beginning at the first non-whitespace
     character; it never searches prose for a later object or repairs meaning.
@@ -398,8 +412,8 @@ def _first_complete_object_at_start(text: str) -> str | None:
             if depth < 0:
                 return None
     return None
- 
- 
+
+
 def _recover_json_object(text: str) -> str | None:
     """Make syntactic complements only; never invent semantic JSON content."""
     start = text.find("{")
@@ -441,8 +455,8 @@ def _recover_json_object(text: str) -> str | None:
         result.append('"')
     recovered = "".join(result).rstrip() + "".join(reversed(stack))
     return _remove_trailing_commas(recovered)
- 
- 
+
+
 def _remove_trailing_commas(text: str) -> str:
     """Remove a comma only when it immediately precedes a structural close."""
     result: list[str] = []
@@ -472,11 +486,11 @@ def _remove_trailing_commas(text: str) -> str:
             result.append(char)
         index += 1
     return "".join(result)
- 
- 
+
+
 def _quote_bare_object_keys(text: str) -> str:
     """Quote simple unquoted object keys outside JSON strings.
- 
+
     This deliberately supports only identifiers in an object-key position,
     such as `{ risk_level: "medium" }`. It does not repair values, duplicate
     keys, missing business fields, or free-form prose.
@@ -532,8 +546,8 @@ def _quote_bare_object_keys(text: str) -> str:
         result.append(char)
         index += 1
     return "".join(result)
- 
- 
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Keep JSON duplicate-key behaviour from silently hiding model output."""
     value: dict[str, Any] = {}
@@ -542,32 +556,32 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate JSON key: {key}")
         value[key] = item
     return value
- 
- 
+
+
 def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
- 
- 
+
+
 def _estimate_tokens(text: str) -> int:
     """Conservative, tokenizer-agnostic estimate used only for a safety guard."""
     return (len(text) + 3) // 4
- 
- 
+
+
 def _upstream_request_id(response: httpx.Response) -> str | None:
     for header in ("x-request-id", "x-correlation-id", "traceparent"):
         if value := response.headers.get(header):
             return value[:200]
     return None
- 
- 
+
+
 def _is_context_window_response(response: httpx.Response) -> bool:
     if response.status_code not in {400, 413, 422}:
         return False
     detail = _safe_error_message(response).lower()
     indicators = ("context length", "context window", "too many tokens", "prompt too long", "maximum tokens")
     return any(indicator in detail for indicator in indicators)
- 
- 
+
+
 def _safe_error_message(response: httpx.Response) -> str:
     """Return a bounded diagnostic without logging an arbitrary upstream body."""
     try:
@@ -580,4 +594,3 @@ def _safe_error_message(response: httpx.Response) -> str:
             error = error.get("message", error.get("code", "unknown upstream error"))
         return str(error).replace("\n", " ")[:500]
     return "unstructured upstream error"
- 

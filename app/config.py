@@ -104,6 +104,10 @@ class Settings:
     llm_stop_sequences: tuple[str, ...] = tuple(
         value.strip() for value in os.getenv("LLM_STOP_SEQUENCES", "").split(",") if value.strip()
     ) or _DEFAULT_LLM_STOP_SEQUENCES
+    # Every answer is one flat JSON object, so its first } is its end. Stopping there
+    # stops Qwen from repeating the object or explaining it until the token limit, which
+    # saves time. The loader drops the stop text, so the client adds the } back.
+    llm_stop_after_json_object: bool = os.getenv("LLM_STOP_AFTER_JSON_OBJECT", "true").lower() == "true"
     report_directory: str = os.getenv("REPORT_DIRECTORY", str(BASE_DIR / "data" / "reports"))
     # Application logs are persisted separately from generated staff reports.
     # Mount this directory on persistent storage in OpenShift when logs must

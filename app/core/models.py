@@ -91,14 +91,15 @@ class ReviewCheck(BaseModel):
     # The model's plain-language label for the kind of change, e.g. "Amounts changed".
     pattern: str | None = None
     months: list[str] = Field(default_factory=list)
-    # The model's explanation for staff; None when it was not provided or did not match the figures.
+    # The model's explanation for staff, exactly as written; None when it gave none.
     insight: str | None = Field(default=None, max_length=400)
-    # shown, not_provided (the model gave no sentence) or hidden (it did not match the figures).
-    insight_status: Literal["shown", "not_provided", "hidden"] = "not_provided"
+    # Where the model's sentence or pattern label does not match the CSV, in plain words.
+    # Shown under the sentence; nothing the model wrote is hidden.
+    issues: list[str] = Field(default_factory=list)
     # A short factual line built from the CSV rows.
     facts: str = Field(min_length=1, max_length=400)
     table: EvidenceTable | None = None
-    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=8)
+    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=9)
 
 
 class AssessmentLimitation(BaseModel):
@@ -125,6 +126,8 @@ class OverallSummary(BaseModel):
     why_it_matters: str | None = None
     verify_first: list[str] = Field(default_factory=list, max_length=2)
     risk_reason: str | None = None
+    # Summary lines that quote a figure or month not in the input, e.g. "Point 2: Quotes 999.00 ...".
+    issues: list[str] = Field(default_factory=list)
 
 
 class AccountAssessment(BaseModel):

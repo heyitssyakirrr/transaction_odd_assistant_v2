@@ -108,9 +108,9 @@ function renderSummary(overall, riskLevel) {
   toggle(els.verifyBlock, verify.length > 0);
   els.verifyFirst.innerHTML = verify.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
 
-  els.riskReason.innerHTML = overall.risk_reason
+  els.riskReason.innerHTML = (overall.risk_reason
     ? `<strong>Why ${escapeHtml(riskLevel)} risk:</strong> ${escapeHtml(overall.risk_reason)}`
-    : "";
+    : "") + renderIssues(overall.issues);
 }
 
 function renderReviewChecks(checks) {
@@ -125,10 +125,11 @@ function renderCheck(check) {
     ? `<p class="check-months">Months: <strong>${check.months.map(escapeHtml).join(" &rarr; ")}</strong></p>`
     : "";
   const pattern = check.pattern ? `<span class="pattern-tag">${escapeHtml(check.pattern)}</span>` : "";
-  const note = insightNote(check);
-  const insight = check.insight
+  const insight = (check.insight
     ? `<p class="check-insight">${escapeHtml(check.insight)}</p>`
-    : note ? `<p class="check-note">${note}</p>` : "";
+    : check.outcome === "pattern_found"
+      ? "<p class='check-note'>The AI did not provide an explanation for this check. Use the table below.</p>"
+      : "") + renderIssues(check.issues);
   return `
     <article class="check-card outcome-${escapeHtml(check.outcome)}">
       <div class="check-head">
@@ -145,15 +146,11 @@ function renderCheck(check) {
     </article>`;
 }
 
-// Why a check has no AI explanation; the same wording is used in app/core/report_store.py.
-function insightNote(check) {
-  if (check.insight_status === "hidden") {
-    return "The AI's explanation was hidden because it did not fit the figures. Use the table below.";
-  }
-  if (check.outcome === "pattern_found") {
-    return "The AI did not provide an explanation for this check. Use the table below.";
-  }
-  return "";
+// Where the AI's answer does not match the CSV; the same wording is used in app/core/report_store.py.
+function renderIssues(issues) {
+  if (!issues || !issues.length) return "";
+  return `<div class="check-issues"><strong>Check this AI answer against the table:</strong>
+    <ul>${issues.map((issue) => `<li>${escapeHtml(issue)}</li>`).join("")}</ul></div>`;
 }
 
 function renderCustomerProfile(context) {

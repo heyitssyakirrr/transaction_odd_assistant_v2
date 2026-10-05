@@ -663,6 +663,18 @@ button:disabled { cursor: wait; opacity: .65; }
 
 .check-note { margin: 10px 0 0; font-size: 13px; color: var(--muted); font-style: italic; }
 
+.check-issues {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--danger);
+  background: var(--danger-tint, #fdecea);
+  font-size: 13px;
+  font-style: normal;
+  color: var(--ink);
+}
+
+.check-issues ul { margin: 4px 0 0; padding-left: 18px; }
+
 .check-facts { margin: 10px 0 0; font-size: 13px; color: var(--ink-soft); }
 
 .check-facts span {

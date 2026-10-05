@@ -643,6 +643,29 @@ def quotable_numbers(rows: list[dict[str, Any]], months: list[str], fields: tupl
     return _with_roundings(values)
 
 
+_MONTH_NUMBERS = {name: index for index, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+# Capitalised month names only; "May" counts only with a year, so "staff may ask" is never read as a month.
+_MONTH_NAME = re.compile(
+    r"\b(?:(January|February|March|April|June|July|August|September|October|November|December"
+    r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\.?(?:\s+(\d{4}))?|(May)\s+(\d{4}))\b"
+)
+
+
+def unmatched_month_name(text: str, months: list[str]) -> str | None:
+    """The first month written as a name ("June 2025") that is not one of ``months``, or None.
+
+    The number check cannot see a wrong month name next to a correct amount, e.g.
+    "RM 10,000.00 in June 2025" for a 202511 transaction.
+    """
+    for match in _MONTH_NAME.finditer(text):
+        name, year = (match.group(1), match.group(2)) if match.group(1) else (match.group(3), match.group(4))
+        number = f"{_MONTH_NUMBERS[name[:3].lower()]:02d}"
+        if not any(month[4:] == number and (year is None or month[:4] == year) for month in months):
+            return match.group(0)
+    return None
+
+
 def calendar_numbers(rows: list[dict[str, Any]]) -> set[Decimal]:
     """The months (202604) and years (2026) of the rows, so "May 2026" is never read as a figure."""
     return {Decimal(value) for row in rows for value in (row["year_month"], row["year_month"][:4])}

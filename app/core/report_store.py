@@ -99,13 +99,12 @@ class ReportStore:
         return f'<table class="{css_class}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
 
     @staticmethod
-    def _insight_note(check: ReviewCheck) -> str:
-        """Why a check has no AI explanation; the same wording is used in app/static/results.js."""
-        if check.insight_status == "hidden":
-            return "The AI's explanation was hidden because it did not fit the figures. Use the table below."
-        if check.outcome == "pattern_found":
-            return "The AI did not provide an explanation for this check. Use the table below."
-        return ""
+    def _issues(issues: list[str]) -> str:
+        """Where the AI's answer does not match the CSV; the same wording is used in app/static/results.js."""
+        if not issues:
+            return ""
+        items = "".join(f"<li>{html.escape(issue)}</li>" for issue in issues)
+        return f"<div class='issues'><b>Check this AI answer against the table:</b><ul>{items}</ul></div>"
 
     def _check(self, check: ReviewCheck) -> str:
         color, tint = self._OUTCOME_COLORS[check.outcome]
@@ -113,10 +112,11 @@ class ReportStore:
         months = f'<p class="months">Months: <strong>{" &rarr; ".join(map(html.escape, check.months))}</strong></p>' if check.months else ""
         if check.insight:
             insight = f'<p class="insight">{html.escape(check.insight)}</p>'
-        elif note := self._insight_note(check):
-            insight = f"<p class='muted'><em>{note}</em></p>"
+        elif check.outcome == "pattern_found":
+            insight = "<p class='muted'><em>The AI did not provide an explanation for this check. Use the table below.</em></p>"
         else:
             insight = ""
+        insight += self._issues(check.issues)
         return f"""
 <article class="card" style="border-left-color: {color}">
   <div class="card-head"><h3>{html.escape(check.title)}</h3>
@@ -139,7 +139,7 @@ class ReportStore:
         reason = (
             f"<p class='reason'><b>Why {html.escape(result.risk_level)} risk:</b> {html.escape(overall.risk_reason)}</p>"
             if overall.risk_reason else ""
-        )
+        ) + self._issues(overall.issues)
         note = (
             "Part of this result could not be verified. Review the checks below before deciding; do not close the case from this result alone."
             if result.status == "needs_review"
@@ -193,6 +193,8 @@ table {{ width: 100%; border-collapse: collapse; font-size: 13.5px; margin-top: 
 th {{ text-align: right; padding: 7px 10px; background: #f4f3f1; border-bottom: 2px solid #d3d6db; color: #1c1f26; vertical-align: bottom; }}
 td {{ text-align: right; padding: 6px 10px; border-bottom: 1px solid #e3e5e9; white-space: nowrap; }}
 th:first-child, td:first-child {{ text-align: left; }}
+.issues {{ margin: 10px 0; padding: 8px 12px; border-left: 3px solid #b42318; background: #fdecea; font-size: 13px; color: #1c1f26; }}
+.issues ul {{ margin: 4px 0 0; padding-left: 18px; }}
 tr.sel td {{ font-weight: 700; color: #1c1f26; background: #fbf1d6; }}
 table.kv td, table.kv th {{ text-align: left; white-space: normal; }}
 table.kv td:first-child {{ width: 38%; color: #6b7280; }}

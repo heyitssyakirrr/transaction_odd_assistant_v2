@@ -14,11 +14,11 @@ from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedErro
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
-    PATTERN_NAMES, InactivityRun, activity_pair_context, activity_six_month_context, allowed_burst_gap_numbers,
+    InactivityRun, activity_pair_context, activity_six_month_context, allowed_burst_gap_numbers,
     burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context, calendar_numbers,
     canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, flow_pair_context,
     flow_six_month_context, has_burst, has_in_month_gap, no_inactivity_rationale, numbers_in_text,
-    pattern_problem, quotable_numbers, unquotable_number,
+    pattern_problem, quotable_numbers, unmatched_month_name, unquotable_number,
 )
 from app.core.models import (
     AccountAnalysisRequest, AccountAssessment, AssessmentLimitation, CustomerProfileContext,
@@ -26,8 +26,8 @@ from app.core.models import (
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
-    ACTIVITY_MONEY_SYSTEM_PROMPT, FORMAT_RETRY_SUFFIX, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
-    OVERALL_SUMMARY_SYSTEM_PROMPT, PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input,
+    ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
+    OVERALL_SUMMARY_SYSTEM_PROMPT, PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input, format_retry_suffix,
     inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
 )
 from app.core.reference_data import resolve_citizenship, resolve_occupation
@@ -57,7 +57,7 @@ _PATTERN_LABELS: dict[str, str] = {
     "burst_peak": "Burst peak", "burst_rising": "Burst rising",
     "gap_changed": "Gap between transactions changed", "long_gap_before": "Long gap before transaction",
 }
-# CSV fields attached as evidence for the months the model selected (at most 8 items).
+# CSV fields attached as evidence for the months the model selected (at most 9 items: 3 burst months x 3 fields).
 _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "activity_and_amount_change": ("txn_count_monthly", "total_amount", "max_amount"),
     "money_in_and_out": ("debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit"),
@@ -68,12 +68,17 @@ _INSIGHT_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "activity_and_amount_change": ("txn_count_monthly", "total_amount", "avg_amount", "std_amount", "max_amount"),
     "money_in_and_out": ("debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit", "total_amount"),
 }
-InsightStatus = Literal["shown", "not_provided", "hidden"]
+_NOT_A_SENTENCE = "Not a full sentence: the AI wrote a label or a phrase without a month or figure."
+_SUMMARY_FIELD_NAMES = {
+    "headline": "Headline", "point_1": "Point 1", "point_2": "Point 2", "point_3": "Point 3",
+    "why_it_matters": "Why it matters", "verify_1": "Verify 1", "verify_2": "Verify 2", "risk_reason": "Risk reason",
+}
+# Several months can meet the burst guide, so burst and gaps may select up to three.
+_MAX_BURST_MONTHS = 3
 
-_FORBIDDEN_TEXT = (
-    "n/a", "insufficient", "nothing happened", "please provide",
-    "launder", "illicit", "illegal", "fraud", "criminal", "terroris", "smurf",
-)
+# Phrases that mean the model gave no real answer. Judgement words are allowed: the
+# output supports the reviewer, who makes the decision.
+_NON_ANSWER_TEXT = ("n/a", "insufficient", "nothing happened", "please provide")
 _FORBIDDEN_PROFILE_TEXT = (
     "n/a", "please provide", "named p",
 )
@@ -95,10 +100,23 @@ class ModelOutputError(ValueError):
     """A model response was not complete, grounded, and safe to display."""
 
 
-def _without_label_only_insights(raw: Any, keys: tuple[str, ...]) -> Any:
-    """Treat an "explanation" of fewer than three words (e.g. "money_in_only") as not provided."""
-    blank = {key: "" for key in keys if len(getattr(raw, key).split()) < 3}
-    return raw.model_copy(update=blank) if blank else raw
+def _pattern_label(name: str) -> str | None:
+    """The staff label for a pattern name; an unrecognised name is shown as the model wrote it."""
+    return None if name == "none" else _PATTERN_LABELS.get(name, name)
+
+
+def _is_sentence(text: str, needs_figure: bool) -> bool:
+    """A real explanation: three or more words and, for a found pattern, a month or figure.
+
+    "debit_only" or "monthly total rose" is a label or phrase, not an explanation.
+    """
+    return len(text.split()) >= 3 and (not needs_figure or bool(re.search(r"\d", text)))
+
+
+def _not_a_sentence_error(keys: list[str]) -> ModelOutputError:
+    return ModelOutputError(
+        f"{', '.join(keys)} must be plain sentences that name the month as YYYYMM and quote a figure from the facts; "
+        "never a pattern name such as large_single_amount, and never none")
 
 
 @dataclass(frozen=True)
@@ -198,27 +216,31 @@ class AnalysisService:
         ]
 
     # --- validation: calls 1 and 2 -------------------------------------------------
-    # Wrong months, or an answer whose explanations are all missing, cost one retry.
-    # A pattern name or sentence that does not match the CSV never costs a retry, and the
-    # outcome, months and evidence table always stay. An unrecognised pattern name is only
-    # removed; the sentence is still checked on its own. A known pattern name that the rows
-    # contradict also hides the sentence, which usually repeats the same wrong claim.
+    # Wrong months, or a found pattern without a real explanation, cost one retry.
+    # Nothing the model wrote is ever hidden or removed: a sentence or pattern name that
+    # does not match the CSV is shown as written, with the problem listed under it for
+    # staff (UAT needs to see the real issues). The months and evidence table always stay.
 
     def _validate_activity_money(
         self, raw: "_RawActivityMoney", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
         case_id: str, final_attempt: bool,
     ) -> "_RawActivityMoney":
-        raw = _without_label_only_insights(raw, ("activity_insight", "money_flow_insight"))
-        if not final_attempt and not raw.activity_insight and not raw.money_flow_insight:
-            raise ModelOutputError("activity-money answer has no explanations")
+        checks = raw.checks()
+        not_sentences = [
+            check.insight_key for check in checks.values()
+            if check.outcome == "pattern_found" and not _is_sentence(check.insight, needs_figure=True)
+        ]
+        if not final_attempt and not_sentences:
+            raise _not_a_sentence_error(not_sentences)
         known_months = self._known_months(catalog)
         by_month = {row["year_month"]: row for row in monthly}
         updates: dict[str, Any] = {}
-        hidden: set[str] = set()
+        issues: dict[str, list[str]] = {}
         for name, prefix in (("activity_and_amount_change", "activity"), ("money_in_and_out", "money_flow")):
-            check = raw.checks()[name]
+            check = checks[name]
             pattern = canonical_pattern(name, check.pattern)
             updates[f"{prefix}_pattern"] = pattern
+            found: list[str] = []
             if check.outcome == "no_pattern_found":
                 updates[f"{prefix}_months"], updates[f"{prefix}_pattern"] = _NO_MONTHS, "none"
                 months: list[str] = []
@@ -226,8 +248,6 @@ class AnalysisService:
                 min_months = 1 if name == "activity_and_amount_change" else 2
                 months = self._split_months(check.months_text, f"{name} months", min_count=min_months, max_count=2)
                 self._validate_transaction_months(months, known_months, name)
-                if months != sorted(months):
-                    raise ModelOutputError(f"{name} months must be chronological")
                 if len(months) == 2:
                     first, second = (by_month[month] for month in months)
                     fields = _EVIDENCE_FIELDS[name]
@@ -241,77 +261,69 @@ class AnalysisService:
                     if unchanged and not persistent_one_sided:
                         raise ModelOutputError(f"{name} selected months show no change in the cited fields")
                 updates[f"{prefix}_months"] = ",".join(months)
-                problem = pattern_problem(name, pattern, monthly, months)
-                if problem:
-                    self._drop_pattern(case_id, name, problem, updates, f"{prefix}_pattern")
-                    if pattern in PATTERN_NAMES[name]:
-                        self._hide(case_id, name, problem, updates, hidden, f"{prefix}_insight")
-                        continue
+                if problem := pattern_problem(name, pattern, monthly, months):
+                    found.append(f"Pattern label: {problem}.")
+            if check.insight and check.insight_key in not_sentences:  # empty means not provided
+                found.append(_NOT_A_SENTENCE)
             allowed = quotable_numbers(monthly, months, _INSIGHT_FIELDS[name]) | self._reference_numbers()
-            problem = self._text_problem(check.insight, allowed)
-            if problem:
-                self._hide(case_id, name, problem, updates, hidden, f"{prefix}_insight")
-        return self._with_hidden(raw.model_copy(update=updates), hidden)
+            found += self._text_issues(check.insight, allowed, months or list(by_month))
+            issues[name] = self._log_issues(case_id, name, found)
+        return self._with_issues(raw.model_copy(update=updates), issues)
 
     def _validate_inactivity_burst_gaps(
         self, raw: "_RawInactivityBurstGaps", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
         run: InactivityRun | None, case_id: str, final_attempt: bool,
     ) -> "_RawInactivityBurstGaps":
-        raw = _without_label_only_insights(raw, ("burst_gaps_insight", "inactivity_insight"))
-        if not final_attempt and (not raw.burst_gaps_insight or (run is not None and not raw.inactivity_insight)):
-            raise ModelOutputError("inactivity-burst-gaps answer is missing an explanation")
+        burst_found = raw.burst_gaps_outcome == "pattern_found"
+        needs_sentence = {"burst_gaps_insight": burst_found, "inactivity_insight": run is not None}
+        not_sentences = [
+            key for key, figure in needs_sentence.items()
+            if (key == "burst_gaps_insight" or run is not None) and not _is_sentence(getattr(raw, key), figure)
+        ]
+        if not final_attempt and not_sentences:
+            raise _not_a_sentence_error(not_sentences)
+        all_months = [row["year_month"] for row in monthly]
         updates: dict[str, Any] = {}
-        hidden: set[str] = set()
+        issues: dict[str, list[str]] = {}
         # Activity after inactivity is a computed fact; the model only explains it.
         if run is None:
             updates["inactivity_insight"] = ""
         else:
-            problem = self._text_problem(raw.inactivity_insight, self._inactivity_numbers(run, monthly))
-            if problem:
-                self._hide(case_id, "activity_after_inactivity", problem, updates, hidden, "inactivity_insight")
+            found = [_NOT_A_SENTENCE] if raw.inactivity_insight and "inactivity_insight" in not_sentences else []
+            found += self._text_issues(
+                raw.inactivity_insight, self._inactivity_numbers(run, monthly), self._run_months(run, monthly))
+            issues["activity_after_inactivity"] = self._log_issues(case_id, "activity_after_inactivity", found)
 
         pattern = canonical_pattern("burst_and_gaps", raw.burst_gaps_pattern)
         updates["burst_gaps_pattern"] = pattern
-        if raw.burst_gaps_outcome == "pattern_found":
-            months = self._split_months(raw.burst_gaps_months, "burst_and_gaps months", min_count=1, max_count=2)
+        found = [_NOT_A_SENTENCE] if raw.burst_gaps_insight and "burst_gaps_insight" in not_sentences else []
+        if burst_found:
+            months = self._split_months(
+                raw.burst_gaps_months, "burst_and_gaps months", min_count=1, max_count=_MAX_BURST_MONTHS)
             self._validate_transaction_months(months, self._known_months(catalog), "burst_and_gaps")
-            if months != sorted(months):
-                raise ModelOutputError("burst_and_gaps months must be chronological")
             updates["burst_gaps_months"] = ",".join(months)
-            problem = pattern_problem("burst_and_gaps", pattern, monthly, months)
-            if problem:
-                self._drop_pattern(case_id, "burst_and_gaps", problem, updates, "burst_gaps_pattern")
-                if pattern in PATTERN_NAMES["burst_and_gaps"]:
-                    self._hide(case_id, "burst_and_gaps", problem, updates, hidden, "burst_gaps_insight")
-                    return self._with_hidden(raw.model_copy(update=updates), hidden)
+            if problem := pattern_problem("burst_and_gaps", pattern, monthly, months):
+                found.append(f"Pattern label: {problem}.")
         else:
             updates["burst_gaps_months"], updates["burst_gaps_pattern"] = _NO_MONTHS, "none"
-        problem = self._text_problem(raw.burst_gaps_insight, allowed_burst_gap_numbers(monthly))
+        found += self._text_issues(raw.burst_gaps_insight, allowed_burst_gap_numbers(monthly), all_months)
         lowered = raw.burst_gaps_insight.casefold()
-        if not problem and has_burst(monthly) and _SAYS_NO_BURST.search(lowered):
-            problem = "says no burst, but a month has burst share above 0%"
-        if not problem and not has_in_month_gap(monthly) and _SAYS_EVEN_SPACING.search(lowered):
-            problem = "describes spacing, but no month has 2 or more transactions"
-        if problem:
-            self._hide(case_id, "burst_and_gaps", problem, updates, hidden, "burst_gaps_insight")
-        return self._with_hidden(raw.model_copy(update=updates), hidden)
+        if has_burst(monthly) and _SAYS_NO_BURST.search(lowered):
+            found.append("Says there was no burst, but a month has a burst share above 0%.")
+        if not has_in_month_gap(monthly) and _SAYS_EVEN_SPACING.search(lowered):
+            found.append("Describes the spacing of transactions, but no month has 2 or more transactions.")
+        issues["burst_and_gaps"] = self._log_issues(case_id, "burst_and_gaps", found)
+        return self._with_issues(raw.model_copy(update=updates), issues)
 
     @staticmethod
-    def _hide(case_id: str, check: str, reason: str, updates: dict[str, Any], hidden: set[str], insight_key: str) -> None:
-        """Hide one model sentence that does not fit the figures, and record why."""
-        logger.warning("Insight hidden: case=%s check=%s reason=%s", case_id, check, reason)
-        updates[insight_key] = ""
-        hidden.add(insight_key)
+    def _log_issues(case_id: str, check: str, issues: list[str]) -> list[str]:
+        for issue in issues:
+            logger.warning("Insight issue: case=%s check=%s issue=%s", case_id, check, issue)
+        return issues
 
     @staticmethod
-    def _drop_pattern(case_id: str, check: str, reason: str, updates: dict[str, Any], pattern_key: str) -> None:
-        """Remove a pattern name that does not fit the selected months; the sentence is still checked on its own."""
-        logger.warning("Pattern name removed: case=%s check=%s reason=%s", case_id, check, reason)
-        updates[pattern_key] = "none"
-
-    @staticmethod
-    def _with_hidden(raw: Any, hidden: set[str]) -> Any:
-        raw.hidden_insights = frozenset(hidden)
+    def _with_issues(raw: Any, issues: dict[str, list[str]]) -> Any:
+        raw.issues = issues
         return raw
 
     def _single_reference(self) -> Decimal:
@@ -319,6 +331,11 @@ class AnalysisService:
 
     def _reference_numbers(self) -> set[Decimal]:
         return numbers_in_text(f"{self._settings.dormancy_review_single_amount} {self._settings.dormancy_review_month_total}")
+
+    @staticmethod
+    def _run_months(run: InactivityRun, monthly: list[dict[str, Any]]) -> list[str]:
+        """The zero months of the inactive run and the month activity resumed."""
+        return [row["year_month"] for row in monthly if run.zero_start <= row["year_month"] <= run.active_month]
 
     def _inactivity_numbers(self, run: InactivityRun, monthly: list[dict[str, Any]]) -> set[Decimal]:
         fields = ("txn_count_monthly", "debit_count_monthly", "credit_count_monthly", "total_amount",
@@ -330,15 +347,18 @@ class AnalysisService:
         return allowed | {value.normalize() for value in extra} | numbers_in_text(" ".join(map(str, extra)))
 
     @staticmethod
-    def _text_problem(text: str, allowed: set[Decimal]) -> str | None:
-        """Why a model sentence cannot be shown, or None when it is grounded and neutral."""
+    def _text_issues(text: str, allowed: set[Decimal], months: list[str]) -> list[str]:
+        """Where a model sentence does not fit the CSV, in plain words for staff (empty when it fits)."""
         if not text.strip():
-            return None
-        lowered = text.casefold()
-        if any(phrase in lowered for phrase in _FORBIDDEN_TEXT):
-            return "prohibited wording"
-        token = unquotable_number(text, allowed)
-        return f"number not in the figures for these months: {token}" if token else None
+            return []
+        issues = []
+        if any(phrase in text.casefold() for phrase in _NON_ANSWER_TEXT):
+            issues.append("Is not a real answer (for example N/A or a request for more data).")
+        if token := unquotable_number(text, allowed):
+            issues.append(f"Quotes {token}, which is not a figure for the months this check is about.")
+        if name := unmatched_month_name(text, months):
+            issues.append(f"Mentions {name}, which is not one of the months this check is about.")
+        return issues
 
     # --- building the checks ---------------------------------------------------------
 
@@ -366,7 +386,7 @@ class AnalysisService:
                     facts=no_inactivity_rationale(self._settings.dormancy_min_zero_months),
                     table=self._table(name, monthly, []),
                 )
-            run_months = [row["year_month"] for row in monthly if run.zero_start <= row["year_month"] <= run.active_month]
+            run_months = self._run_months(run, monthly)
             ids = [
                 f"M{run.zero_start}.txn_count_monthly", f"M{run.zero_end}.txn_count_monthly",
                 f"M{run.active_month}.txn_count_monthly", f"M{run.active_month}.total_amount",
@@ -375,8 +395,7 @@ class AnalysisService:
             ]
             return ReviewCheck(
                 check=name, title=_CHECK_TITLES[name], outcome="pattern_found",
-                insight=raw.inactivity_insight.strip() or None,
-                insight_status=self._insight_status(raw, "inactivity_insight"),
+                insight=raw.inactivity_insight.strip() or None, issues=raw.issues.get(name, []),
                 months=[run.zero_start, run.active_month],
                 facts=dormancy_rationale(run), table=self._table(name, monthly, run_months),
                 evidence=self._resolve(list(dict.fromkeys(ids)), catalog, name),
@@ -387,9 +406,8 @@ class AnalysisService:
             evidence_months = months or burst_gap_evidence_months(monthly)
             return ReviewCheck(
                 check=name, title=_CHECK_TITLES[name], outcome=raw.burst_gaps_outcome,
-                pattern=_PATTERN_LABELS.get(raw.burst_gaps_pattern), months=months,
-                insight=raw.burst_gaps_insight.strip() or None,
-                insight_status=self._insight_status(raw, "burst_gaps_insight"), facts=facts,
+                pattern=_pattern_label(raw.burst_gaps_pattern), months=months,
+                insight=raw.burst_gaps_insight.strip() or None, issues=raw.issues.get(name, []), facts=facts,
                 table=self._table(name, monthly, months),
                 evidence=self._evidence_for_months(name, evidence_months, catalog),
             )
@@ -401,18 +419,11 @@ class AnalysisService:
             facts = flow_pair_context(monthly, months) if months else flow_six_month_context(monthly)
         return ReviewCheck(
             check=name, title=_CHECK_TITLES[name], outcome=check.outcome,
-            pattern=_PATTERN_LABELS.get(check.pattern), months=months,
-            insight=check.insight.strip() or None, insight_status=self._insight_status(raw, check.insight_key),
-            facts=facts,
+            pattern=_pattern_label(check.pattern), months=months,
+            insight=check.insight.strip() or None, issues=raw.issues.get(name, []), facts=facts,
             table=self._table(name, monthly, months),
             evidence=self._evidence_for_months(name, months, catalog),
         )
-
-    @staticmethod
-    def _insight_status(raw: Any, key: str) -> InsightStatus:
-        if getattr(raw, key).strip():
-            return "shown"
-        return "hidden" if key in raw.hidden_insights else "not_provided"
 
     @staticmethod
     def _table(name: ReviewCheckName, monthly: list[dict[str, Any]], highlight: list[str]) -> EvidenceTable:
@@ -442,7 +453,8 @@ class AnalysisService:
             raw = await self._complete_with_retry(
                 case_id, "overall-summary", OVERALL_SUMMARY_SYSTEM_PROMPT, prompt_input, _RawOverallSummary,
                 self._settings.llm_summary_max_response_tokens,
-                lambda value, final: self._validate_overall_summary(value, quotable, case_id, final),
+                lambda value, final: self._validate_overall_summary(
+                    value, quotable, [row["year_month"] for row in monthly], case_id, final),
             )
         except Exception as exc:  # the report must still be shown without the summary
             logger.error("Overall summary failed: case=%s error=%s", case_id, exc)
@@ -451,44 +463,38 @@ class AnalysisService:
         summary = OverallSummary(
             verified=True, headline=raw.headline, points=points, why_it_matters=raw.why_it_matters or None,
             verify_first=[item for item in (raw.verify_1, raw.verify_2) if item], risk_reason=raw.risk_reason,
+            issues=raw.issues.get("overall_summary", []),
         )
         return summary, raw.risk_level
 
     def _validate_overall_summary(
-        self, raw: "_RawOverallSummary", quotable: set[Decimal], case_id: str, final_attempt: bool,
+        self, raw: "_RawOverallSummary", quotable: set[Decimal], months: list[str], case_id: str, final_attempt: bool,
     ) -> "_RawOverallSummary":
-        """Drop any line that quotes a figure not in the input or uses alleging wording.
+        """Keep every line as written and list any that quote a figure or month not in the input.
 
-        A dropped headline is replaced by the first remaining point. A summary without a
-        headline or risk reason costs the one retry. A missing verify step costs the retry
-        only on the first attempt; on the final attempt the summary is kept without it.
+        A summary without a headline or risk reason costs the one retry. A missing verify
+        step costs the retry only on the first attempt; on the final attempt it is kept without.
         """
-        updates: dict[str, Any] = {}
-        for field in _RawOverallSummary.TEXT_FIELDS:
-            problem = self._text_problem(getattr(raw, field), quotable)
-            if problem:
-                logger.warning("Summary line dropped: case=%s field=%s reason=%s", case_id, field, problem)
-                updates[field] = ""
-        checked = raw.model_copy(update=updates)
-        points = [point for point in (checked.point_1, checked.point_2, checked.point_3) if point]
-        if not checked.headline and points:
-            checked = checked.model_copy(update={"headline": points[0]})
-            points = points[1:]
-        checked = checked.model_copy(update=dict(zip(("point_1", "point_2", "point_3"), points + ["", "", ""])))
-        if not checked.verify_1 and checked.verify_2:
-            checked = checked.model_copy(update={"verify_1": checked.verify_2, "verify_2": ""})
+        checked = raw
+        if not raw.verify_1 and raw.verify_2:
+            checked = raw.model_copy(update={"verify_1": raw.verify_2, "verify_2": ""})
         required = ("headline", "risk_reason") if final_attempt else ("headline", "verify_1", "risk_reason")
         missing = [field for field in required if not getattr(checked, field)]
         if missing:
-            raise ModelOutputError(f"overall summary has no usable {', '.join(missing)}")
-        return checked
+            raise ModelOutputError(f"overall summary has no {', '.join(missing)}")
+        issues = [
+            f"{_SUMMARY_FIELD_NAMES[field]}: {issue}"
+            for field in _RawOverallSummary.TEXT_FIELDS
+            for issue in self._text_issues(getattr(checked, field), quotable, months)
+        ]
+        return self._with_issues(checked, {"overall_summary": self._log_issues(case_id, "overall_summary", issues)})
 
     @staticmethod
     def _check_line(check: ReviewCheck) -> str:
         months = ",".join(check.months) or "none"
         return (
             f"CHECK|{check.check}|{check.outcome}|pattern={check.pattern or 'none'}|months={months}|"
-            f"insight={check.insight or 'none'}|facts={check.facts}"
+            f"insight={check.insight or 'none'}|insight_issues={' '.join(check.issues) or 'none'}|facts={check.facts}"
         )
 
     @staticmethod
@@ -625,7 +631,7 @@ class AnalysisService:
             logger.warning("Context output rejected; retrying once: case=%s stage=%s error=%s", case_id, stage, first_error)
             try:
                 result = await self._ask(
-                    case_id, f"{stage}-format-retry", system_prompt + FORMAT_RETRY_SUFFIX,
+                    case_id, f"{stage}-format-retry", system_prompt + format_retry_suffix(first_error),
                     prompt_input, model_type, max_response_tokens,
                 )
                 corrected = validator(result, True)
@@ -654,9 +660,9 @@ class AnalysisService:
 
     @staticmethod
     def _split_months(value: str, label: str, min_count: int = 2, max_count: int | None = None) -> list[str]:
-        """Accept source months such as ``202607,202608`` or ``M202607_M202608``.
+        """Accept source months such as ``202607,202608`` or ``M202607_M202608``, oldest first.
 
-        This fixes punctuation only; it never derives a month or invents a value.
+        This fixes punctuation and order only; it never derives a month or invents a value.
         """
         months: list[str] = []
         for token in re.split(r"[,_;\s]+", value.strip()):
@@ -670,7 +676,7 @@ class AnalysisService:
         if len(months) < min_count or (max_count is not None and len(months) > max_count):
             expected = f"{min_count}" if max_count == min_count else f"{min_count}-{max_count or 'n'}"
             raise ModelOutputError(f"{label} must contain {expected} distinct YYYYMM values")
-        return months
+        return sorted(months)
 
     @staticmethod
     def _known_months(catalog: dict[str, EvidenceItem]) -> set[str]:
@@ -795,16 +801,16 @@ class _RawAnswer(BaseModel):
     _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ()
     _PATTERN_KEYS: ClassVar[tuple[str, ...]] = ()
     _TEXT_LIMITS: ClassVar[dict[str, int]] = {}
-    # Insight keys whose sentence was hidden by a check (set by the validators).
-    _hidden_insights: frozenset[str] = PrivateAttr(default=frozenset())
+    # Problems the validators found, per check, for staff to see (never hidden).
+    _issues: dict[str, list[str]] = PrivateAttr(default_factory=dict)
 
     @property
-    def hidden_insights(self) -> frozenset[str]:
-        return self._hidden_insights
+    def issues(self) -> dict[str, list[str]]:
+        return self._issues
 
-    @hidden_insights.setter
-    def hidden_insights(self, value: frozenset[str]) -> None:
-        self._hidden_insights = value
+    @issues.setter
+    def issues(self, value: dict[str, list[str]]) -> None:
+        self._issues = value
 
     @classmethod
     def prepare_payload(cls, payload: Any) -> Any:

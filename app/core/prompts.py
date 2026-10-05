@@ -50,7 +50,8 @@ context; otherwise use no_pattern_found and still state the actual pattern. Do n
 generic "nothing happened" statement, or a request for more information.
 
 Insights are read by bank staff. Always write one or two plain sentences, at most 220 characters, for both checks,
-even when no pattern is found (then say what the six months show); never write "none" as an insight. Say what the
+even when no pattern is found (then say what the six months show); never write "none" as an insight. An insight is
+never a pattern name: it names the month as YYYYMM and quotes at least one RM amount from the facts. Say what the
 figures show, with exact values, and what staff should verify. Amounts are in RM: write them as RM 1,234.56 and never
 use $. Copy values exactly as they appear in the facts; do not calculate differences, ratios or percentages. A debit
 is money out and a credit is money in. Check the MONTH_STRUCTURE line before calling a month debit-only, credit-only
@@ -69,6 +70,7 @@ examples, placeholders, arrays, nested objects, task keys, or extra keys. Write 
 insight describes the actual values before you decide its pattern and outcome:
 "activity_insight", "activity_pattern", "activity_months", "activity_outcome",
 "money_flow_insight", "money_flow_pattern", "money_flow_months", "money_flow_outcome".
+The *_insight values are sentences for staff; only the *_pattern values use the pattern names listed above.
 
 Each outcome is exactly pattern_found or no_pattern_found. Use pattern_found when the selected pattern gives staff
 meaningful factual context; pattern_found is not an allegation. Do not default these checks to no_pattern_found just
@@ -110,8 +112,8 @@ burst_gaps_pattern: "burst_peak" (one month has the highest burst_share), "burst
 months), "gap_changed" (avg_gap_days changes sharply between two months with 2 or more transactions),
 "long_gap_before" (a one-transaction month came long after the previous transaction), or "none" when no pattern is
 found.
-burst_gaps_months: the one or two supplied months that best show the pattern, as YYYYMM or YYYYMM,YYYYMM with the
-earlier month first; the JSON string "none" when burst_gaps_outcome is no_pattern_found.
+burst_gaps_months: the one to three supplied months that best show the pattern, as YYYYMM, YYYYMM,YYYYMM or
+YYYYMM,YYYYMM,YYYYMM with the earliest month first; the JSON string "none" when burst_gaps_outcome is no_pattern_found.
 burst_gaps_outcome: pattern_found or no_pattern_found. Guide: a pattern is found when BURST_GUIDE lists a month
 (burst_share of 25.0% or more with 4 or more transactions), when burst_share rises clearly between months, when the
 in-month gap changes sharply, or when a since_previous gap is much longer than the zero months shown. Otherwise
@@ -133,15 +135,16 @@ OVERALL_SUMMARY_SYSTEM_PROMPT = """You are a senior AML due-diligence analyst wr
 staff read first. Staff use it to decide what to do next, so it must be specific, accurate and easy to read.
 
 Use only INPUT FACTS: the six monthly rows from the CSV, the checked result of each review check, and the customer
-profile. Do not allege AML, crime or wrongdoing, and do not use words such as suspicious, suspicion, illegitimate or
-legitimacy; describe what the data shows and what staff should verify. Do not invent counterparties, payment purposes,
-source of funds or anything outside INPUT FACTS. Amounts are in RM: write them as RM 1,234.56 and never use $. Copy
+profile. You support the reviewer, who makes the decision: you may state concerns and reasonable assumptions, for
+example whether the amounts fit the declared occupation, as long as they are framed as points for staff to verify. Do
+not invent counterparties, payment purposes, source of funds or anything outside INPUT FACTS. Amounts are in RM: write them as RM 1,234.56 and never use $. Copy
 every month and amount exactly as written in INPUT FACTS; do not calculate differences, ratios or percentages. You may
 compare the amounts with what is typical for the declared occupation, as a question for staff to verify.
 
 Silently work through these steps:
 1. Read each CHECK line. pattern_found checks are the main evidence. insight=none means no explanation is available,
-   so use that check's months in the MONTH rows instead.
+   so use that check's months in the MONTH rows instead. insight_issues lists where that insight or its pattern does
+   not match the CSV; when it is not none, trust the MONTH rows over that insight.
 2. Connect the checks rather than repeating them, for example: money in and money out of similar size in the same
    month; one large payment after a long quiet period; repeated transactions with the same counterparty in a month
    with few transactions; activity that does not fit the declared occupation or individual/organisation type.
@@ -210,6 +213,11 @@ FORMAT_RETRY_SUFFIX = """
 FORMAT RETRY: Redo the task using INPUT FACTS. Return only the required JSON object. Do not output explanation,
 questions, assistant, system, user, analysis, markdown, or text before or after the final }.
 """
+
+
+def format_retry_suffix(reason: object) -> str:
+    """The retry instruction, with the reason the first answer was rejected so the model can fix it."""
+    return FORMAT_RETRY_SUFFIX + f"Your previous answer was rejected because: {reason}. Fix this in the new answer.\n"
 
 
 def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
