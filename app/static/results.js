@@ -125,11 +125,10 @@ function renderCheck(check) {
     ? `<p class="check-months">Months: <strong>${check.months.map(escapeHtml).join(" &rarr; ")}</strong></p>`
     : "";
   const pattern = check.pattern ? `<span class="pattern-tag">${escapeHtml(check.pattern)}</span>` : "";
+  const note = insightNote(check);
   const insight = check.insight
     ? `<p class="check-insight">${escapeHtml(check.insight)}</p>`
-    : check.outcome === "pattern_found"
-      ? "<p class='check-note'>The AI's explanation is not shown because it did not match the figures. Use the table below.</p>"
-      : "";
+    : note ? `<p class="check-note">${note}</p>` : "";
   return `
     <article class="check-card outcome-${escapeHtml(check.outcome)}">
       <div class="check-head">
@@ -144,6 +143,17 @@ function renderCheck(check) {
       <p class="check-facts"><span>Key figures</span> ${escapeHtml(check.facts)}</p>
       ${renderTable(check.table)}
     </article>`;
+}
+
+// Why a check has no AI explanation; the same wording is used in app/core/report_store.py.
+function insightNote(check) {
+  if (check.insight_status === "hidden") {
+    return "The AI's explanation was hidden because it did not fit the figures. Use the table below.";
+  }
+  if (check.outcome === "pattern_found") {
+    return "The AI did not provide an explanation for this check. Use the table below.";
+  }
+  return "";
 }
 
 function renderCustomerProfile(context) {

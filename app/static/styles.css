@@ -620,6 +620,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .check-list { display: grid; gap: 14px; margin-top: 14px; }
 
 .check-card {
+  min-width: 0; /* let a wide table scroll inside the card instead of widening the page */
   padding: 18px 20px;
   border: 1px solid var(--line);
   border-left: 4px solid var(--line-strong);
@@ -689,7 +690,8 @@ button:disabled { cursor: wait; opacity: .65; }
   color: var(--ink);
   background: var(--canvas);
   border-bottom: 2px solid var(--line-strong);
-  white-space: nowrap;
+  vertical-align: bottom;
+  min-width: 7em; /* long headers wrap onto two lines; numbers below stay on one */
 }
 
 .evidence-table td {

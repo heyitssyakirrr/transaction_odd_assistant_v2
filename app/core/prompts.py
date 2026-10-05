@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.monthly_facts import (
-    InactivityRun, burst_gap_facts, inactivity_run_fact, summary_month_lines, transaction_comparison_facts,
+    InactivityRun, amount_facts, burst_gap_facts, inactivity_run_fact, summary_month_lines, transaction_comparison_facts,
 )
 
 
@@ -20,7 +20,8 @@ _TRANSACTION_FIELDS = (
 #   3. PROFILE_CONTEXT: customer profile vs activity
 #   4. OVERALL_SUMMARY: reads the checked results of 1-3 plus the CSV rows; decides risk
 # Calls 1 and 2 describe patterns only; the overall risk is decided once, in call 4.
-# The analysis steps of call 1 are the proven activity/flow instructions, unchanged.
+# In call 1, step 2 (debit/credit flow) is the proven instruction, unchanged; step 1
+# was rewritten to lead with amounts (total, average, spread, largest single).
 
 ACTIVITY_MONEY_SYSTEM_PROMPT = """You are an AML transaction-context analyst assisting authorised bank staff.
 
@@ -29,11 +30,13 @@ crime, or wrongdoing. Do not invent counterparties, payment narratives, geograph
 turnover, or any data outside the rows. Do not ask the caller for information.
 
 Silently complete this review before writing the answer:
-1. ACTIVITY/VALUE: Read the six labelled MONTH facts and the two ACTIVITY_CANDIDATES. Compare counts with counts and
-   monthly totals with monthly totals. A count change and a value change can occur in different month pairs. Select
-   the two months that best show a meaningful increase, decrease, zero-to-active change, or concentration. State the
-   exact values for those two months only; never interpolate an intermediate month or call the first month a baseline.
-   If no meaningful pattern is selected, say what the six-month counts and totals actually show.
+1. ACTIVITY AND AMOUNTS: Read the AMOUNT lines and the AMOUNT_CANDIDATES line. Focus on the amounts staff can act
+   on: the monthly total, the average, the spread (std) and above all the largest single transaction. A single
+   transaction that is the largest of the six months, or at or above the review reference, should be named so staff
+   can verify what it was for. Select one month (for a large single transaction) or two months (for a change in
+   total, average or spread). Transaction counts are context only. One small transaction after months with no
+   activity, below the review reference, is usually not a pattern. State exact values for the selected months only;
+   never interpolate an intermediate month or call the first month a baseline.
 2. DEBIT/CREDIT FLOW: Read debit_count and credit_count separately from debits and credits. The former are numbers of
    transactions; the latter are amounts. Look for a shift in direction, one-sided activity, or a material change in
    debit or credit amounts. A month with zero credits has no credit inflow in these aggregates. Select two real months
@@ -46,17 +49,20 @@ Each of the two checks is assessable from these rows. Use pattern_found only for
 context; otherwise use no_pattern_found and still state the actual pattern. Do not output N/A, insufficient_data, a
 generic "nothing happened" statement, or a request for more information.
 
-Insights are read by bank staff. Write one or two plain sentences, at most 220 characters: what changed between the
-two months, with their exact values, and why it may matter for review. Copy values exactly as they appear in the MONTH
-facts; do not calculate differences, ratios or percentages. Check the MONTH_STRUCTURE line before calling a month
-debit-only, credit-only or mixed.
+Insights are read by bank staff. Always write one or two plain sentences, at most 220 characters, for both checks,
+even when no pattern is found (then say what the six months show); never write "none" as an insight. Say what the
+figures show, with exact values, and what staff should verify. Amounts are in RM: write them as RM 1,234.56 and never
+use $. Copy values exactly as they appear in the facts; do not calculate differences, ratios or percentages. A debit
+is money out and a credit is money in. Check the MONTH_STRUCTURE line before calling a month debit-only, credit-only
+or mixed.
 
-Pattern names (use "none" when the outcome is no_pattern_found):
-- activity_pattern: "rose" (count or total went up), "fell" (count or total went down), "started" (the first month
-  has 0 transactions), "stopped" (the second month has 0 transactions).
-- money_flow_pattern: "money_in_only" (both months have credits and no debits), "money_out_only" (both months have
-  debits and no credits), "in_out_mix_changed" (the months differ in being debit-only, credit-only, mixed or zero),
-  "amounts_changed" (debit or credit amounts changed materially).
+Pattern names (use "none" only when the outcome is no_pattern_found):
+- activity_pattern: "large_single_amount" (the selected month has the largest single transaction of the six months),
+  "total_rose", "total_fell" (monthly total between two months), "amounts_more_varied" (std rose between two months),
+  "started" (the first month has 0 transactions), "stopped" (the second month has 0 transactions).
+- money_flow_pattern: "debit_only" (both months have debits and no credits), "credit_only" (both months have credits
+  and no debits), "debit_credit_mix_changed" (the months differ in being debit-only, credit-only, mixed or zero),
+  "debit_amount_changed", "credit_amount_changed" (that amount changed materially between the two months).
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
 examples, placeholders, arrays, nested objects, task keys, or extra keys. Write the keys in exactly this order, so each
@@ -66,9 +72,10 @@ insight describes the actual values before you decide its pattern and outcome:
 
 Each outcome is exactly pattern_found or no_pattern_found. Use pattern_found when the selected pattern gives staff
 meaningful factual context; pattern_found is not an allegation. Do not default these checks to no_pattern_found just
-because no external income, counterparty, or account-purpose data is supplied. Each *_months value contains exactly
-two different supplied months
-as YYYYMM,YYYYMM with no spaces when its outcome is pattern_found; it is a comparison pair, not an evidence identifier.
+because no external income, counterparty, or account-purpose data is supplied. When its outcome is pattern_found,
+activity_months contains one month (YYYYMM) or two different months (YYYYMM,YYYYMM), and money_flow_months contains
+exactly two different supplied months
+as YYYYMM,YYYYMM with no spaces; it is a comparison pair, not an evidence identifier.
 When its outcome is no_pattern_found, set its *_months value to the JSON string "none". Never output N/A, M, field names,
 or an underscore in a *_months value. Put earlier month first. Use YYYYMM rather than month names in the insight; when
 a pattern is found, mention only values from the selected two months. After the final } output
@@ -87,36 +94,38 @@ Definitions:
 - avg_gap_days: average number of days between transactions in the month. When gap_basis=since_previous the month has
   one transaction, and avg_gap_days is the number of days back to the previous transaction, which may be before the
   six months shown. A large value there means a long quiet period before that transaction.
+- BURST_GUIDE: the months that meet the guide below for a notable burst, already worked out from the BURST lines.
 - INACTIVITY_RUN: computed from the rows. status=present means zero_months consecutive months with no transactions
   followed by activity in active_month; amount_vs_reference says whether that activity is above or below the bank's
   review reference amount.
 
-Silently read the INACTIVITY_RUN line, every BURST line and the BURST_CANDIDATES line, then write:
+Silently read every BURST line, the BURST_GUIDE and BURST_CANDIDATES lines, and the INACTIVITY_RUN line, then write:
 
-inactivity_insight: when INACTIVITY_RUN status=present, one or two plain sentences, at most 220 characters, telling
-staff what the activity after inactivity means: how long the account was quiet (zero_months, and the days since the
-previous transaction from the BURST line of active_month when it is since_previous), what came next (transactions,
-debit or credit, amount, largest_single) and whether it is above or below the review reference. Copy values exactly.
-When status=none, the JSON string "none".
-burst_gaps_insight: one or two plain sentences, at most 220 characters, telling staff what the burst and gap figures
-show and why it matters for review. Name the burst months and their burst_share when any month is above 0.0%; never
-write "no burst" when any month has burst_share above 0.0%. For a since_previous month, say how many days passed since
-the previous transaction. Do not describe transactions as evenly spaced when no month has 2 or more transactions.
-Quote only months and values from the BURST lines, use YYYYMM, and write burst_share with a % sign.
+burst_gaps_insight: always one or two plain sentences, at most 220 characters; never "none". Say what the burst and gap
+figures show and why it matters for review. Name the burst months and their burst_share when any month is above 0.0%;
+never write "no burst" when any month has burst_share above 0.0%. For a since_previous month, say how many days passed
+since the previous transaction. Do not describe transactions as evenly spaced when no month has 2 or more
+transactions. Quote only months and values from the BURST lines, use YYYYMM, and write burst_share with a % sign.
 burst_gaps_pattern: "burst_peak" (one month has the highest burst_share), "burst_rising" (burst_share rises between two
 months), "gap_changed" (avg_gap_days changes sharply between two months with 2 or more transactions),
 "long_gap_before" (a one-transaction month came long after the previous transaction), or "none" when no pattern is
 found.
 burst_gaps_months: the one or two supplied months that best show the pattern, as YYYYMM or YYYYMM,YYYYMM with the
 earlier month first; the JSON string "none" when burst_gaps_outcome is no_pattern_found.
-burst_gaps_outcome: pattern_found or no_pattern_found. As a guide, find a pattern for burst_share of 25.0% or more in a
-month with 4 or more transactions, a clear rise in burst_share between months, an in-month gap pattern that changes
-sharply, or a since_previous gap much longer than the zero months shown. Otherwise no_pattern_found.
+burst_gaps_outcome: pattern_found or no_pattern_found. Guide: a pattern is found when BURST_GUIDE lists a month
+(burst_share of 25.0% or more with 4 or more transactions), when burst_share rises clearly between months, when the
+in-month gap changes sharply, or when a since_previous gap is much longer than the zero months shown. Otherwise
+no_pattern_found.
+inactivity_insight: always one or two plain sentences, at most 220 characters; never "none". When INACTIVITY_RUN
+status=present, say how long the account was quiet (zero_months, and the days since the previous transaction from the
+BURST line of active_month when it is since_previous), what came next (transactions, debit or credit, amount in RM,
+largest_single) and whether it is above or below the review reference. When status=none, write: No inactive period of
+3 or more months in these six months.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
 nested objects, or extra keys. Write the keys in exactly this order:
-"inactivity_insight", "burst_gaps_insight", "burst_gaps_pattern", "burst_gaps_months", "burst_gaps_outcome".
-After the final } output no other character.
+"burst_gaps_insight", "burst_gaps_pattern", "burst_gaps_months", "burst_gaps_outcome", "inactivity_insight".
+Write the object once. After the final } output no other character.
 """
 
 
@@ -124,9 +133,11 @@ OVERALL_SUMMARY_SYSTEM_PROMPT = """You are a senior AML due-diligence analyst wr
 staff read first. Staff use it to decide what to do next, so it must be specific, accurate and easy to read.
 
 Use only INPUT FACTS: the six monthly rows from the CSV, the checked result of each review check, and the customer
-profile. Do not allege AML, crime or wrongdoing; describe what the data shows and what to verify. Do not invent
-counterparties, payment purposes, source of funds, income or anything outside INPUT FACTS. Copy every month and amount
-exactly as written in INPUT FACTS; do not calculate differences, ratios or percentages.
+profile. Do not allege AML, crime or wrongdoing, and do not use words such as suspicious, suspicion, illegitimate or
+legitimacy; describe what the data shows and what staff should verify. Do not invent counterparties, payment purposes,
+source of funds or anything outside INPUT FACTS. Amounts are in RM: write them as RM 1,234.56 and never use $. Copy
+every month and amount exactly as written in INPUT FACTS; do not calculate differences, ratios or percentages. You may
+compare the amounts with what is typical for the declared occupation, as a question for staff to verify.
 
 Silently work through these steps:
 1. Read each CHECK line. pattern_found checks are the main evidence. insight=none means no explanation is available,
@@ -136,14 +147,16 @@ Silently work through these steps:
    with few transactions; activity that does not fit the declared occupation or individual/organisation type.
 3. Use the six months as this account's own baseline: say what is usual for it and what stands out.
 4. Decide the overall risk:
-   - low: no material pattern, or only small amounts consistent with ordinary personal use;
+   - low: no material pattern, or only small amounts consistent with ordinary personal use. Activity after an inactive
+     period with amount_vs_reference=below and no other material pattern is renewed use with a small amount: low;
    - medium: at least one material pattern that staff should verify;
    - high: several material patterns that reinforce each other, or a very large movement out of line with the other
      months and the declared profile. An amount alone is never high.
    A check listed under NOT_VERIFIED must not be treated as normal.
 
 Write:
-headline: one line, at most 120 characters, naming the most important thing about this account.
+headline: one line, at most 120 characters, naming the most important thing about this account; it must agree with
+point_1.
 point_1, point_2, point_3: each one plain sentence, at most 220 characters, stating a key fact with its month and
 amount and what it shows. Most important first. Use the JSON string "none" for point_2 or point_3 when there is
 nothing more of value; never repeat a point.
@@ -157,7 +170,7 @@ risk_level: exactly "low", "medium" or "high".
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
 nested objects, or extra keys. Write the keys in exactly this order:
 "headline", "point_1", "point_2", "point_3", "why_it_matters", "verify_1", "verify_2", "risk_reason", "risk_level".
-After the final } output no other character.
+Write the object once; do not repeat it or explain your steps. After the final } output no other character.
 """
 
 
@@ -187,6 +200,7 @@ Never claim there were no changes outside the supplied records. Prefer the resol
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object with exactly one key: "profile_summary". The value is 2-4 clear
 sentences, at most 650 characters. Use exact months and amounts from INPUT FACTS; do not calculate income or percentages.
+Amounts are in RM: write them as RM 1,234.56 and never use $.
 No markdown, arrays, extra keys, record IDs, or text after the final }.
 """
 
@@ -207,9 +221,13 @@ def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
     return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
 
 
-def activity_money_input(monthly_summary: list[dict[str, Any]]) -> str:
-    """Call 1 input, unchanged from the proven version: six rows plus labelled monthly facts."""
-    return _monthly_rows_input(monthly_summary) + "\n" + transaction_comparison_facts(monthly_summary)
+def activity_money_input(monthly_summary: list[dict[str, Any]], single_reference: Decimal) -> str:
+    """Call 1 input: six rows, the proven labelled monthly facts, then the amount facts."""
+    return "\n".join((
+        _monthly_rows_input(monthly_summary),
+        transaction_comparison_facts(monthly_summary),
+        amount_facts(monthly_summary, single_reference),
+    ))
 
 
 def inactivity_burst_gaps_input(

@@ -91,8 +91,10 @@ class ReviewCheck(BaseModel):
     # The model's plain-language label for the kind of change, e.g. "Amounts changed".
     pattern: str | None = None
     months: list[str] = Field(default_factory=list)
-    # The model's explanation for staff; None when it was not supplied or did not match the figures.
+    # The model's explanation for staff; None when it was not provided or did not match the figures.
     insight: str | None = Field(default=None, max_length=400)
+    # shown, not_provided (the model gave no sentence) or hidden (it did not match the figures).
+    insight_status: Literal["shown", "not_provided", "hidden"] = "not_provided"
     # A short factual line built from the CSV rows.
     facts: str = Field(min_length=1, max_length=400)
     table: EvidenceTable | None = None
