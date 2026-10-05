@@ -17,7 +17,7 @@ from app.core.monthly_facts import (
     PATTERN_LABELS, InactivityRun, activity_pair_context, activity_six_month_context, allowed_burst_gap_numbers,
     burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context, calendar_numbers,
     canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, flow_pair_context,
-    flow_six_month_context, has_burst, has_in_month_gap, names_a_month, no_inactivity_rationale, numbers_in_text,
+    flow_six_month_context, burst_guide_months, has_in_month_gap, no_inactivity_rationale, numbers_in_text,
     pattern_problem, quotable_numbers, unmatched_month_name, unquotable_number,
 )
 from app.core.models import (
@@ -26,7 +26,7 @@ from app.core.models import (
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
-    ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
+    ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, inactivity_note,
     OVERALL_SUMMARY_SYSTEM_PROMPT, PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input, format_retry_suffix,
     inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
 )
@@ -59,9 +59,7 @@ _INSIGHT_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
 }
 def _sentence_issue(text: str) -> str:
     """Why an explanation does not count as one, in plain words for staff."""
-    if len(text.split()) < 3:
-        return "Is a label, not a sentence: the AI wrote a pattern name or a few words instead of an explanation."
-    return "Names no month or figure: the explanation does not say which month or amount it is about."
+    return "Is a label, not a sentence: the AI wrote a pattern name or a few words instead of an explanation."
 _SAYS_NO_INACTIVITY = re.compile(r"\bno (?:inactive|quiet|dormant) period\b", re.IGNORECASE)
 # "No activity in the six months" when transactions exist (seen for one-transaction accounts).
 _SAYS_NO_ACTIVITY = re.compile(
@@ -103,20 +101,17 @@ def _pattern_label(name: str) -> str | None:
 
 
 def _sentence_issues(key: str, text: str, retry_allowed: bool) -> list[str]:
-    """Check one explanation: retry when it is missing or only a label, else list a gap.
+    """Check one explanation: retry when it is missing or only a label.
 
     "debit_only" (under three words) is a label, not an explanation: it costs the one
-    retry when ``retry_allowed``. A real sentence that names no month (202605 or "May")
-    and no figure is shown with that issue; it never costs a retry, because retries are
-    slow and Qwen's second answer is rarely better.
+    retry when ``retry_allowed``, and is shown with that issue after it. Any real
+    sentence is accepted as written; its figures are checked separately.
     """
-    if len(text.split()) < 3:
-        if retry_allowed:
-            raise _sentence_error(key)
-        return [_sentence_issue(text)] if text else []
-    if not re.search(r"\d", text) and not names_a_month(text):
-        return [_sentence_issue(text)]
-    return []
+    if len(text.split()) >= 3:
+        return []
+    if retry_allowed:
+        raise _sentence_error(key)
+    return [_sentence_issue(text)] if text else []
 
 
 def _schema_problems(exc: ValidationError) -> str:
@@ -129,7 +124,7 @@ def _schema_problems(exc: ValidationError) -> str:
 
 
 def _sentence_error(key: str) -> ModelOutputError:
-    return ModelOutputError(f"{key} must be a full sentence for staff with the month and amount, not a pattern name or none")
+    return ModelOutputError(f"{key} must be one or two full sentences for staff, not a pattern name or none")
 
 
 @dataclass(frozen=True)
@@ -226,7 +221,8 @@ class AnalysisService:
             _LlmCall(
                 stage="inactivity-burst-gaps-context",
                 checks=("activity_after_inactivity", "burst_and_gaps"),
-                system_prompt=INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
+                system_prompt=INACTIVITY_BURST_GAPS_SYSTEM_PROMPT
+                + inactivity_note(run, self._settings.dormancy_min_zero_months),
                 prompt_input=inactivity_burst_gaps_input(
                     monthly, run, self._settings.dormancy_min_zero_months, self._long_gap_days()),
                 model_type=_RawInactivityBurstGaps,
@@ -279,7 +275,7 @@ class AnalysisService:
                 raise ModelOutputError(f"{prefix}_months {months[0]} and {months[1]} show no change in this check's figures")
             pattern = canonical_pattern(name, check.pattern)
             updates = {f"{prefix}_pattern": pattern, f"{prefix}_months": ",".join(months)}
-            if problem := pattern_problem(name, pattern, monthly, months, self._long_gap_days()):
+            if problem := pattern_problem(name, pattern, monthly, months, **self._thresholds()):
                 found.append(f"Pattern label: {problem}")
         all_months = [row["year_month"] for row in monthly]
         allowed = quotable_numbers(monthly, months, _INSIGHT_FIELDS[name]) | self._reference_numbers()
@@ -314,7 +310,11 @@ class AnalysisService:
         if run is None:
             updates["inactivity_insight"] = ""
         else:
-            issues["activity_after_inactivity"] = self._inactivity_issues(raw.inactivity_insight, run, monthly, case_id)
+            try:
+                issues["activity_after_inactivity"] = self._inactivity_issues(
+                    raw.inactivity_insight, run, monthly, case_id, final_attempt)
+            except ModelOutputError as exc:
+                problems["activity_after_inactivity"] = str(exc)
         try:
             updates.update(self._checked_burst_gaps(raw, catalog, monthly, case_id, final_attempt, issues))
         except ModelOutputError as exc:
@@ -322,11 +322,11 @@ class AnalysisService:
         return self._accepted(raw, updates, issues, problems, case_id, final_attempt, ("burst_and_gaps",))
 
     def _inactivity_issues(
-        self, insight: str, run: InactivityRun, monthly: list[dict[str, Any]], case_id: str,
+        self, insight: str, run: InactivityRun, monthly: list[dict[str, Any]], case_id: str, final_attempt: bool,
     ) -> list[str]:
-        """The inactive run is computed by the code (see Key figures), so its explanation is
-        never retried; any problem is listed for staff instead."""
-        found = _sentence_issues("inactivity_insight", insight, retry_allowed=False)
+        """The inactive run is computed by the code; Qwen explains it. A missing explanation
+        costs the one retry; anything else is listed for staff."""
+        found = _sentence_issues("inactivity_insight", insight, retry_allowed=not final_attempt)
         if _SAYS_NO_INACTIVITY.search(insight):
             found.append(f"Says there was no inactive period, but the account had {run.zero_months} months with "
                          f"no transactions before {run.active_month}.")
@@ -348,13 +348,13 @@ class AnalysisService:
             self._validate_transaction_months(months, self._known_months(catalog), "burst_and_gaps")
             pattern = canonical_pattern("burst_and_gaps", raw.burst_gaps_pattern)
             updates = {"burst_gaps_months": ",".join(months), "burst_gaps_pattern": pattern}
-            if problem := pattern_problem("burst_and_gaps", pattern, monthly, months, self._long_gap_days()):
+            if problem := pattern_problem("burst_and_gaps", pattern, monthly, months, **self._thresholds()):
                 found.append(f"Pattern label: {problem}")
         all_months = [row["year_month"] for row in monthly]
         found += self._text_issues(raw.burst_gaps_insight, allowed_burst_gap_numbers(monthly), all_months)
         lowered = raw.burst_gaps_insight.casefold()
-        if has_burst(monthly) and _SAYS_NO_BURST.search(lowered):
-            found.append("Says there was no burst, but a month has a burst share above 0%.")
+        if burst_guide_months(monthly) and _SAYS_NO_BURST.search(lowered):
+            found.append("Says there was no burst, but a month has a burst share of 25% or more.")
         if not has_in_month_gap(monthly) and _SAYS_EVEN_SPACING.search(lowered):
             found.append("Describes the spacing of transactions, but no month has 2 or more transactions.")
         issues["burst_and_gaps"] = self._log_issues(case_id, "burst_and_gaps", found)
@@ -390,6 +390,10 @@ class AnalysisService:
 
     def _long_gap_days(self) -> Decimal:
         return Decimal(self._settings.review_long_gap_days)
+
+    def _thresholds(self) -> dict[str, Decimal]:
+        """The configured amounts the pattern checks compare against."""
+        return {"long_gap_days": self._long_gap_days(), "single_reference": self._single_reference()}
 
     def _single_reference(self) -> Decimal:
         return Decimal(str(self._settings.dormancy_review_single_amount))

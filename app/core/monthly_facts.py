@@ -70,10 +70,6 @@ def transaction_comparison_facts(rows: list[dict[str, Any]]) -> str:
         + "|debit_only=" + (",".join(debit_only) or "none")
         + "|credit_only=" + (",".join(credit_only) or "none")
         + "|mixed_flow=" + (",".join(mixed) or "none"),
-        "ACTIVITY_CANDIDATES|count_increase=" + _directional_pair(rows, "txn_count_monthly", True)
-        + "|count_decrease=" + _directional_pair(rows, "txn_count_monthly", False)
-        + "|total_increase=" + _directional_pair(rows, "total_amount", True)
-        + "|total_decrease=" + _directional_pair(rows, "total_amount", False),
         "FLOW_CANDIDATES|debit_increase=" + _directional_pair(rows, "monthly_debit", True)
         + "|debit_decrease=" + _directional_pair(rows, "monthly_debit", False)
         + "|credit_increase=" + _directional_pair(rows, "monthly_credit", True)
@@ -107,18 +103,11 @@ def amount_facts(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
             f"std={_money(_amount(row, 'std_amount'))}|largest_single={_money(_amount(row, 'max_amount'))}|"
             f"largest_share_of_total={_share(_amount(row, 'max_amount'), _amount(row, 'total_amount'))}"
         )
-    active = [row for row in rows if row["txn_count_monthly"] > 0]
     largest = max(rows, key=lambda row: _amount(row, "max_amount"))
-    highest = max(rows, key=lambda row: _amount(row, "total_amount"))
     reference = "above" if _amount(largest, "max_amount") >= single_reference else "below"
     lines.append(
         f"AMOUNT_CANDIDATES|largest_single_in_six_months={largest['year_month']}:{_money(_amount(largest, 'max_amount'))}|"
-        f"largest_single_vs_review_reference={reference} (reference {_money(single_reference)})|"
-        f"highest_monthly_total={highest['year_month']}:{_money(_amount(highest, 'total_amount'))}|"
-        f"active_months={len(active)}|"
-        "total_rise=" + _directional_pair(rows, "total_amount", True)
-        + "|total_fall=" + _directional_pair(rows, "total_amount", False)
-        + "|std_rise=" + _directional_pair(rows, "std_amount", True)
+        f"largest_single_vs_review_reference={reference} (reference {_money(single_reference)})"
     )
     return "\n".join(lines)
 
@@ -329,9 +318,9 @@ def no_inactivity_rationale(min_zero_months: int) -> str:
 # The model judges what the timing means; these helpers only lay the values out.
 
 GapBasis = Literal["in_month", "since_previous", "no_activity"]
-# Guide given to the model for a notable burst month; the model still decides.
+# A month is a burst month when its burst share is this or more (any number of transactions).
+# The prompt, the pattern check, the "says no burst" check and RISK_FACTS all use it.
 BURST_GUIDE_SHARE = Decimal("25.0")
-BURST_GUIDE_TRANSACTIONS = 4
 
 
 def _burst_share(row: dict[str, Any]) -> Decimal:
@@ -354,18 +343,13 @@ def gap_basis(row: dict[str, Any]) -> GapBasis:
     return "since_previous" if count == 1 and _gap_days(row) > 0 else "no_activity"
 
 
-def has_burst(rows: list[dict[str, Any]]) -> bool:
-    return any(_burst_share(row) > 0 for row in rows)
-
-
 def has_in_month_gap(rows: list[dict[str, Any]]) -> bool:
     return any(gap_basis(row) == "in_month" for row in rows)
 
 
 def burst_guide_months(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Months with burst share of 25% or more and 4 or more transactions (the burst guide)."""
-    return [row for row in rows
-            if _burst_share(row) >= BURST_GUIDE_SHARE and row["txn_count_monthly"] >= BURST_GUIDE_TRANSACTIONS]
+    """The burst months: burst share of 25% or more."""
+    return [row for row in rows if _burst_share(row) >= BURST_GUIDE_SHARE]
 
 
 def risk_facts(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
@@ -396,19 +380,14 @@ def burst_gap_facts(rows: list[dict[str, Any]], long_gap_days: Decimal) -> str:
             f"BURST|{row['year_month']}|transactions={row['txn_count_monthly']}|"
             f"burst_share={_burst_share(row)}%|avg_gap_days={_gap_days(row)}|gap_basis={gap_basis(row)}"
         )
-    burst = [row for row in rows if _burst_share(row) > 0]
     in_month = [row for row in rows if gap_basis(row) == "in_month"]
     since_previous = [row for row in rows if gap_basis(row) == "since_previous"]
-    peak = max(burst, key=_burst_share) if burst else None
     longest = max(in_month, key=_gap_days) if in_month else None
     shortest = min(in_month, key=_gap_days) if in_month else None
     longest_back = max(since_previous, key=_gap_days) if since_previous else None
-    rises = [(a, b) for a, b in zip(rows, rows[1:]) if _burst_share(b) > _burst_share(a)]
-    rise = max(rises, key=lambda pair: _burst_share(pair[1]) - _burst_share(pair[0])) if rises else None
-    guide = burst_guide_months(rows)
     lines.append(
-        "BURST_GUIDE|months_with_burst_share_25%_or_more_and_4_or_more_transactions="
-        + (",".join(f"{row['year_month']}:{_burst_share(row)}%" for row in guide) or "no month")
+        "BURST_GUIDE|burst_months_with_burst_share_25%_or_more="
+        + (",".join(f"{row['year_month']}:{_burst_share(row)}%" for row in burst_guide_months(rows)) or "no month")
     )
     days = _days(long_gap_days)
     lines.append(
@@ -417,12 +396,7 @@ def burst_gap_facts(rows: list[dict[str, Any]], long_gap_days: Decimal) -> str:
            or "no month")
     )
     lines.append(
-        "BURST_CANDIDATES|burst_months=" + (",".join(row["year_month"] for row in burst) or "none")
-        + "|peak_burst=" + (f"{peak['year_month']}:{_burst_share(peak)}%" if peak else "none")
-        + "|largest_burst_rise=" + (
-            f"{rise[0]['year_month']},{rise[1]['year_month']}:{_burst_share(rise[0])}%->{_burst_share(rise[1])}%"
-            if rise else "none")
-        + "|longest_in_month_gap=" + (f"{longest['year_month']}:{_gap_days(longest)}" if longest else "none")
+        "BURST_CANDIDATES|longest_in_month_gap=" + (f"{longest['year_month']}:{_gap_days(longest)}" if longest else "none")
         + "|shortest_in_month_gap=" + (f"{shortest['year_month']}:{_gap_days(shortest)}" if shortest else "none")
         + "|longest_gap_to_previous=" + (
             f"{longest_back['year_month']}:{_gap_days(longest_back)}" if longest_back else "none")
@@ -453,7 +427,7 @@ def burst_gap_evidence_months(rows: list[dict[str, Any]]) -> list[str]:
     previous transaction). Chronological order.
     """
     months: list[str] = []
-    burst = [row for row in rows if _burst_share(row) > 0]
+    burst = burst_guide_months(rows)
     if burst:
         months.append(max(burst, key=_burst_share)["year_month"])
     in_month = [row for row in rows if gap_basis(row) == "in_month"]
@@ -466,17 +440,16 @@ def burst_gap_evidence_months(rows: list[dict[str, Any]]) -> list[str]:
 
 
 def burst_gap_six_month_context(rows: list[dict[str, Any]]) -> str:
-    burst = [row for row in rows if _burst_share(row) > 0]
+    burst = burst_guide_months(rows)
     in_month = [row for row in rows if gap_basis(row) == "in_month"]
     since_previous = [row for row in rows if gap_basis(row) == "since_previous"]
+    peak = max(rows, key=_burst_share)
     if burst:
-        peak = max(burst, key=_burst_share)
-        burst_text = (
-            f"Burst (same counterparty more than 3 times in a month) in {len(burst)} of {len(rows)} months, "
-            f"peak {_burst_share(peak)}% in {peak['year_month']} ({_count_label(peak['txn_count_monthly'], 'transaction')})"
-        )
+        burst_text = "Burst (25% or more of a month's activity with one counterparty) in " + ", ".join(
+            f"{row['year_month']} ({_burst_share(row)}%)" for row in burst)
     else:
-        burst_text = "No burst (same counterparty more than 3 times in a month) in any month"
+        burst_text = (f"No month reaches the 25% burst level (highest {_burst_share(peak)}% in {peak['year_month']})"
+                      if _burst_share(peak) > 0 else "No burst activity in any month")
     if in_month:
         gaps = [_gap_days(row) for row in in_month]
         gap_text = f"average gap {_days(min(gaps))}-{_days(max(gaps))} days in months with 2+ transactions"
@@ -590,15 +563,13 @@ def debit_credit_mix_facts(rows: list[dict[str, Any]]) -> str:
 # staff under the model's sentence; nothing the model wrote is hidden.
 
 PATTERN_NAMES: dict[str, tuple[str, ...]] = {
-    "activity_and_amount_change": ("large_transaction", "total_increase", "total_decrease"),
+    "activity_and_amount_change": ("large_transaction",),
     "money_in_and_out": ("debits", "credits", "debit_credit_mix_change"),
     "burst_and_gaps": ("burst", "long_gap", "gap_change"),
 }
 # How each pattern is shown to staff.
 PATTERN_LABELS: dict[str, str] = {
     "large_transaction": "Large transaction",
-    "total_increase": "Monthly total increased",
-    "total_decrease": "Monthly total decreased",
     "debits": "Debits (money out)",
     "credits": "Credits (money in)",
     "debit_credit_mix_change": "Debit/credit mix changed",
@@ -610,8 +581,6 @@ PATTERN_LABELS: dict[str, str] = {
 _PATTERN_WORDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "activity_and_amount_change": (
         ("large_transaction", ("large", "single", "big")),
-        ("total_increase", ("increase", "rose", "rise", "start", "grow", "higher")),
-        ("total_decrease", ("decrease", "fell", "fall", "stop", "drop", "declin", "lower")),
     ),
     "money_in_and_out": (
         ("debit_credit_mix_change", ("mix", "shift", "switch", "direction")),
@@ -643,7 +612,8 @@ def canonical_pattern(check: str, name: str) -> str:
 
 
 def pattern_problem(
-    check: str, pattern: str, rows: list[dict[str, Any]], months: list[str], long_gap_days: Decimal,
+    check: str, pattern: str, rows: list[dict[str, Any]], months: list[str], *,
+    long_gap_days: Decimal, single_reference: Decimal,
 ) -> str | None:
     """Why the pattern name does not fit the selected months, in plain words; None when it fits."""
     by_month = {row["year_month"]: row for row in rows}
@@ -652,7 +622,7 @@ def pattern_problem(
         return "No pattern label was given for a found pattern."
     if pattern not in PATTERN_NAMES.get(check, ()):
         return f'"{pattern}" is not one of the pattern labels for this check.'
-    fits = _pattern_fits(check, pattern, rows, selected, long_gap_days)
+    fits = _pattern_fits(pattern, rows, selected, long_gap_days, single_reference)
     return None if fits else (
         f'"{PATTERN_LABELS[pattern]}" does not fit the selected months: {_selected_facts(check, rows, selected)}.'
     )
@@ -667,13 +637,13 @@ def _before_after(rows: list[dict[str, Any]], selected: list[dict[str, Any]]) ->
 
 
 def _pattern_fits(
-    check: str, pattern: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]], long_gap_days: Decimal,
+    pattern: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]], long_gap_days: Decimal,
+    single_reference: Decimal,
 ) -> bool:
     if pattern == "large_transaction":
-        largest = max(_amount(row, "max_amount") for row in rows)
-        return any(_amount(row, "max_amount") == largest > 0 for row in selected)
+        return any(_amount(row, "max_amount") >= single_reference for row in selected)
     if pattern == "burst":
-        return any(_burst_share(row) > 0 for row in selected)
+        return bool(burst_guide_months(selected))
     if pattern == "long_gap":
         return bool(long_gap_months(selected, long_gap_days))
     pair = _before_after(rows, selected)
@@ -681,8 +651,6 @@ def _pattern_fits(
         return False
     before, after = pair
     compare = {
-        "total_increase": lambda: _amount(after, "total_amount") > _amount(before, "total_amount"),
-        "total_decrease": lambda: _amount(after, "total_amount") < _amount(before, "total_amount"),
         # Debits/credits: that side changed, or both months had only that side.
         "debits": lambda: (_amount(after, "monthly_debit") != _amount(before, "monthly_debit")
                            or _structure(before) == _structure(after) == "debit_only"),
@@ -740,11 +708,6 @@ _MONTH_NAME = re.compile(
     r"\b(?:(January|February|March|April|June|July|August|September|October|November|December"
     r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\.?(?:\s+(\d{4}))?|(May)\s+(\d{4}))\b"
 )
-
-
-def names_a_month(text: str) -> bool:
-    """True when the text names a month in words ("April", "Nov 2025")."""
-    return bool(_MONTH_NAME.search(text))
 
 
 def unmatched_month_name(text: str, months: list[str]) -> str | None:
