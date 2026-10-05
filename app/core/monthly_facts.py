@@ -5,6 +5,7 @@ from __future__ import annotations
 These functions do not assign risk or decide whether a pattern is material.
 """
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
@@ -357,9 +358,9 @@ def _burst_month_phrase(row: dict[str, Any]) -> str:
 
 
 def burst_gap_pair_facts(rows: list[dict[str, Any]], months: list[str]) -> str:
-    """Exact values for the given months, appended under the model's insight."""
+    """Exact values for the given months, as a short factual line."""
     by_month = {row["year_month"]: row for row in rows}
-    return "Facts: " + "; ".join(_burst_month_phrase(by_month[month]) for month in months) + "."
+    return "; ".join(_burst_month_phrase(by_month[month]) for month in months) + "."
 
 
 def burst_gap_evidence_months(rows: list[dict[str, Any]]) -> list[str]:
@@ -415,3 +416,169 @@ def allowed_burst_gap_numbers(rows: list[dict[str, Any]]) -> set[Decimal]:
             for places in ("1", "0.1", "0.01"):
                 allowed.add(value.quantize(Decimal(places)).normalize())
     return {value.normalize() for value in allowed}
+
+
+# --- Evidence tables ----------------------------------------------------------
+# Every check shows all six months so staff see the context; the months the model
+# selected are highlighted. Values are formatted once here, so the page and the
+# HTML report always show identical figures.
+
+def _count(row: dict[str, Any], field: str) -> str:
+    return str(row[field])
+
+
+def _avg_days_cell(row: dict[str, Any]) -> str:
+    basis = gap_basis(row)
+    if basis == "in_month":
+        return _days(_gap_days(row))
+    if basis == "since_previous":
+        return f"{_days(_gap_days(row))} (since previous transaction)"
+    return "-"
+
+
+_TABLE_COLUMNS: dict[str, tuple[tuple[str, Any], ...]] = {
+    "activity_after_inactivity": (
+        ("Month", lambda r: r["year_month"]),
+        ("Transactions", lambda r: _count(r, "txn_count_monthly")),
+        ("Total amount", lambda r: _money(_amount(r, "total_amount"))),
+        ("Largest single amount", lambda r: _money(_amount(r, "max_amount"))),
+        ("Debit amount", lambda r: _money(_amount(r, "monthly_debit"))),
+        ("Credit amount", lambda r: _money(_amount(r, "monthly_credit"))),
+    ),
+    "activity_and_amount_change": (
+        ("Month", lambda r: r["year_month"]),
+        ("Transactions", lambda r: _count(r, "txn_count_monthly")),
+        ("Total amount", lambda r: _money(_amount(r, "total_amount"))),
+        ("Largest single amount", lambda r: _money(_amount(r, "max_amount"))),
+    ),
+    "money_in_and_out": (
+        ("Month", lambda r: r["year_month"]),
+        ("Debit count", lambda r: _count(r, "debit_count_monthly")),
+        ("Debit amount", lambda r: _money(_amount(r, "monthly_debit"))),
+        ("Credit count", lambda r: _count(r, "credit_count_monthly")),
+        ("Credit amount", lambda r: _money(_amount(r, "monthly_credit"))),
+    ),
+    "burst_and_gaps": (
+        ("Month", lambda r: r["year_month"]),
+        ("Transactions", lambda r: _count(r, "txn_count_monthly")),
+        ("Burst % (same counterparty more than 3 times)", lambda r: f"{_burst_share(r)}%"),
+        ("Avg days between transactions", _avg_days_cell),
+    ),
+}
+
+
+def check_table(check: str, rows: list[dict[str, Any]], highlight_months: list[str]) -> tuple[list[str], list[list[str]], list[int]]:
+    """(columns, rows, highlighted row indexes) for one check's evidence table."""
+    spec = _TABLE_COLUMNS[check]
+    body = [[render(row) for _, render in spec] for row in rows]
+    highlighted = [index for index, row in enumerate(rows) if row["year_month"] in highlight_months]
+    return [label for label, _ in spec], body, highlighted
+
+
+# --- Pattern checks -----------------------------------------------------------
+# The model names the kind of change it saw. These checks confirm the name against
+# the rows for the months it selected. A mismatch only hides the model's sentence
+# (the outcome, months and table stay), so a wrong description never reaches staff.
+
+def _structure(row: dict[str, Any]) -> str:
+    debit, credit = row["debit_count_monthly"] > 0, row["credit_count_monthly"] > 0
+    return "mixed" if debit and credit else "debit_only" if debit else "credit_only" if credit else "zero"
+
+
+def pattern_problem(check: str, pattern: str, rows: list[dict[str, Any]], months: list[str]) -> str | None:
+    """Why the pattern name does not fit the selected months, or None when it fits."""
+    by_month = {row["year_month"]: row for row in rows}
+    selected = [by_month[month] for month in months if month in by_month]
+    if pattern == "none" or not selected:
+        return "no pattern named for a found pattern"
+    first, last = selected[0], selected[-1]
+    if check == "activity_and_amount_change":
+        count_up = last["txn_count_monthly"] > first["txn_count_monthly"]
+        count_down = last["txn_count_monthly"] < first["txn_count_monthly"]
+        total_up = _amount(last, "total_amount") > _amount(first, "total_amount")
+        total_down = _amount(last, "total_amount") < _amount(first, "total_amount")
+        fits = {
+            "rose": count_up or total_up,
+            "fell": count_down or total_down,
+            "started": first["txn_count_monthly"] == 0 and last["txn_count_monthly"] > 0,
+            "stopped": first["txn_count_monthly"] > 0 and last["txn_count_monthly"] == 0,
+        }
+    elif check == "money_in_and_out":
+        fits = {
+            "money_in_only": all(_structure(row) == "credit_only" for row in selected),
+            "money_out_only": all(_structure(row) == "debit_only" for row in selected),
+            "in_out_mix_changed": _structure(first) != _structure(last),
+            "amounts_changed": (_amount(first, "monthly_debit") != _amount(last, "monthly_debit")
+                                or _amount(first, "monthly_credit") != _amount(last, "monthly_credit")),
+        }
+    elif check == "burst_and_gaps":
+        peak = max((_burst_share(row) for row in rows), default=Decimal(0))
+        fits = {
+            "burst_peak": peak > 0 and any(_burst_share(row) == peak for row in selected),
+            "burst_rising": len(selected) == 2 and _burst_share(last) > _burst_share(first),
+            "gap_changed": (len(selected) == 2 and gap_basis(first) == gap_basis(last) == "in_month"
+                            and _gap_days(first) != _gap_days(last)),
+            "long_gap_before": any(gap_basis(row) == "since_previous" for row in selected),
+        }
+    else:
+        return f"unknown check {check}"
+    if pattern not in fits:
+        return f"unknown pattern {pattern}"
+    return None if fits[pattern] else f"{pattern} does not match the selected months"
+
+
+# --- Numbers a model sentence may quote ------------------------------------------
+
+_SMALL_COUNTS = {Decimal(n) for n in range(0, 13)}
+_NUMBER_IN_TEXT = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _with_roundings(values: set[Decimal]) -> set[Decimal]:
+    rounded: set[Decimal] = set()
+    for value in values:
+        rounded.add(value.normalize())
+        for places in ("1", "0.1", "0.01"):
+            rounded.add(value.quantize(Decimal(places)).normalize())
+    return rounded
+
+
+def quotable_numbers(rows: list[dict[str, Any]], months: list[str], fields: tuple[str, ...]) -> set[Decimal]:
+    """Months, years, small counts, and the given fields of the given months."""
+    selected = [row for row in rows if row["year_month"] in months] if months else rows
+    values = set(_SMALL_COUNTS)
+    for row in rows:
+        values.update({Decimal(row["year_month"]), Decimal(row["year_month"][:4])})
+    for row in selected:
+        values.update(Decimal(str(row[field])) for field in fields)
+    return _with_roundings(values)
+
+
+def numbers_in_text(text: str) -> set[Decimal]:
+    """Every number written in a prompt input, with roundings (for summary grounding)."""
+    return _with_roundings({Decimal(token.replace(",", "")) for token in _NUMBER_IN_TEXT.findall(text)} | _SMALL_COUNTS)
+
+
+def unquotable_number(text: str, allowed: set[Decimal]) -> str | None:
+    """The first number in ``text`` that is not allowed, or None."""
+    for token in _NUMBER_IN_TEXT.findall(text):
+        if Decimal(token.replace(",", "")).normalize() not in allowed:
+            return token
+    return None
+
+
+# --- Rows for the summary call ------------------------------------------------------
+
+def summary_month_lines(rows: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "MONTH|month|transactions|total|debit_count|debit_amount|credit_count|credit_amount|"
+        "largest_single|burst_%|avg_days_between_transactions"
+    ]
+    for row in rows:
+        lines.append(
+            f"MONTH|{row['year_month']}|{row['txn_count_monthly']}|{_money(_amount(row, 'total_amount'))}|"
+            f"{row['debit_count_monthly']}|{_money(_amount(row, 'monthly_debit'))}|"
+            f"{row['credit_count_monthly']}|{_money(_amount(row, 'monthly_credit'))}|"
+            f"{_money(_amount(row, 'max_amount'))}|{_burst_share(row)}%|{_avg_days_cell(row)}"
+        )
+    return lines
+
