@@ -76,6 +76,9 @@ class Settings:
     # PLACEHOLDER DEFAULTS: set the compliance-approved values.
     dormancy_review_single_amount: float = float(os.getenv("DORMANCY_REVIEW_SINGLE_AMOUNT", "5000"))
     dormancy_review_month_total: float = float(os.getenv("DORMANCY_REVIEW_MONTH_TOTAL", "10000"))
+    # Burst and gaps: a one-transaction month this many days or more after the previous
+    # transaction is listed to the LLM as a long gap. Context only, never a risk level.
+    review_long_gap_days: int = int(os.getenv("REVIEW_LONG_GAP_DAYS", "60"))
     # Retained for backwards-compatible .env files; no longer used by the
     # account-context workflow.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
@@ -129,6 +132,7 @@ class Settings:
             "DORMANCY_MIN_ZERO_MONTHS": self.dormancy_min_zero_months,
             "DORMANCY_REVIEW_SINGLE_AMOUNT": self.dormancy_review_single_amount,
             "DORMANCY_REVIEW_MONTH_TOTAL": self.dormancy_review_month_total,
+            "REVIEW_LONG_GAP_DAYS": self.review_long_gap_days,
             "LLM_TIMELINE_MAX_RESPONSE_TOKENS": self.llm_timeline_max_response_tokens,
             "LLM_FLOW_MAX_RESPONSE_TOKENS": self.llm_flow_max_response_tokens,
             "LLM_PROFILE_MAX_RESPONSE_TOKENS": self.llm_profile_max_response_tokens,

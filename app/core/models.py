@@ -154,4 +154,5 @@ class LlmClient(Protocol):
         response_schema: dict[str, Any],
         schema_name: str,
         max_response_tokens: int | None = None,
+        single_object: bool = False,
     ) -> dict[str, Any]: ...

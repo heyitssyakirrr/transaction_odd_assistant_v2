@@ -362,7 +362,12 @@ def has_in_month_gap(rows: list[dict[str, Any]]) -> bool:
     return any(gap_basis(row) == "in_month" for row in rows)
 
 
-def burst_gap_facts(rows: list[dict[str, Any]]) -> str:
+def long_gap_months(rows: list[dict[str, Any]], long_gap_days: Decimal) -> list[dict[str, Any]]:
+    """One-transaction months whose gap back to the previous transaction is ``long_gap_days`` or more."""
+    return [row for row in rows if gap_basis(row) == "since_previous" and _gap_days(row) >= long_gap_days]
+
+
+def burst_gap_facts(rows: list[dict[str, Any]], long_gap_days: Decimal) -> str:
     """Labelled per-month timing facts and a few candidates, for the timing prompt."""
     lines = [
         "BURST_GAP_FACTS — burst_share = share of the month's activity where the same counterparty transacted more "
@@ -387,6 +392,12 @@ def burst_gap_facts(rows: list[dict[str, Any]]) -> str:
     lines.append(
         "BURST_GUIDE|months_with_burst_share_25%_or_more_and_4_or_more_transactions="
         + (",".join(f"{row['year_month']}:{_burst_share(row)}%" for row in guide) or "no month")
+    )
+    days = _days(long_gap_days)
+    lines.append(
+        f"GAP_GUIDE|months_with_{days}_or_more_days_since_the_previous_transaction="
+        + (",".join(f"{row['year_month']}:{_days(_gap_days(row))} days" for row in long_gap_months(rows, long_gap_days))
+           or "no month")
     )
     lines.append(
         "BURST_CANDIDATES|burst_months=" + (",".join(row["year_month"] for row in burst) or "none")
@@ -527,14 +538,38 @@ def check_table(check: str, rows: list[dict[str, Any]], highlight_months: list[s
     return [label for label, _ in spec], body, highlighted
 
 
-# --- Pattern checks -----------------------------------------------------------
-# The model names the kind of change it saw. These checks confirm the name against
-# the rows for the months it selected. A mismatch only hides the model's sentence
-# (the outcome, months and table stay), so a wrong description never reaches staff.
+# --- Debit/credit type of each month -----------------------------------------------
 
 def _structure(row: dict[str, Any]) -> str:
     debit, credit = row["debit_count_monthly"] > 0, row["credit_count_monthly"] > 0
     return "mixed" if debit and credit else "debit_only" if debit else "credit_only" if credit else "zero"
+
+
+_STRUCTURE_WORDS = {
+    "mixed": "debits and credits", "debit_only": "debits only", "credit_only": "credits only", "zero": "no transactions",
+}
+
+
+def debit_credit_mix_facts(rows: list[dict[str, Any]]) -> str:
+    """Each month's debit/credit type in order, and every change between neighbouring months.
+
+    Qwen 7B misreads the grouped MONTH_STRUCTURE line; the same facts laid out month by
+    month, with the changes already listed, let it pick a correct pair. It still decides.
+    """
+    changes = [
+        f"{before['year_month']} {_structure(before)} -> {after['year_month']} {_structure(after)}"
+        for before, after in zip(rows, rows[1:]) if _structure(before) != _structure(after)
+    ]
+    return "\n".join((
+        "DEBIT_CREDIT_BY_MONTH|" + "|".join(f"{row['year_month']}={_structure(row)}" for row in rows),
+        "MIX_CHANGES|" + ("|".join(changes) or "none"),
+    ))
+
+
+# --- Pattern checks -----------------------------------------------------------
+# The model names the kind of change it saw. These checks confirm the name against
+# the rows for the months it selected. A mismatch is listed for staff under the
+# model's sentence; nothing the model wrote is hidden.
 
 
 # Pattern names the model may give, per check, with the names Qwen has been seen to
@@ -552,8 +587,10 @@ _PATTERN_SYNONYMS: dict[str, dict[str, str]] = {
     "activity_and_amount_change": {
         "rose": "total_rose", "increase": "total_rose", "total_increase": "total_rose", "amount_rose": "total_rose",
         "fell": "total_fell", "decrease": "total_fell", "total_decrease": "total_fell", "amount_fell": "total_fell",
+        "total_fall": "total_fell", "total_rise": "total_rose", "std_rise": "amounts_more_varied",
         "large_single": "large_single_amount", "large_transaction": "large_single_amount",
         "large_single_transaction": "large_single_amount", "std_rose": "amounts_more_varied",
+        "count_increase": "started", "count_decrease": "stopped",
         "more_varied": "amounts_more_varied",
     },
     "money_in_and_out": {
@@ -570,25 +607,65 @@ _PATTERN_SYNONYMS: dict[str, dict[str, str]] = {
 }
 
 
+# How each pattern name is shown to staff.
+PATTERN_LABELS: dict[str, str] = {
+    "large_single_amount": "Large single transaction", "total_rose": "Monthly total rose",
+    "total_fell": "Monthly total fell", "amounts_more_varied": "Amounts more varied",
+    "started": "Started after no activity", "stopped": "Stopped",
+    "debit_only": "Money out only (debits)", "credit_only": "Money in only (credits)",
+    "debit_credit_mix_changed": "Debit/credit mix changed", "debit_amount_changed": "Debit amount changed",
+    "credit_amount_changed": "Credit amount changed",
+    "burst_peak": "Burst peak", "burst_rising": "Burst rising",
+    "gap_changed": "Gap between transactions changed", "long_gap_before": "Long gap before transaction",
+}
+_MONTH_TYPES = {"mixed", "mixed_flow", "debit_only", "credit_only", "zero", "zero_activity"}
+
+
 def canonical_pattern(check: str, name: str) -> str:
-    """The standard pattern name for what the model wrote ("none" stays "none")."""
+    """The standard pattern name for what the model wrote ("none" stays "none").
+
+    Two month types joined by a comma ("credit_only,debit_only") mean the type changed.
+    """
+    parts = [part.strip() for part in name.split(",")]
+    if check == "money_in_and_out" and len(parts) == 2 and all(part in _MONTH_TYPES for part in parts):
+        return "debit_credit_mix_changed"
     return _PATTERN_SYNONYMS.get(check, {}).get(name, name)
 
 
-def pattern_problem(check: str, pattern: str, rows: list[dict[str, Any]], months: list[str]) -> str | None:
-    """Why the pattern name does not fit the selected months, or None when it fits.
-
-    The model names the kind of change it saw; this confirms the name against the
-    rows. A mismatch only hides the model's sentence (outcome, months and table stay).
-    """
+def pattern_problem(
+    check: str, pattern: str, rows: list[dict[str, Any]], months: list[str], long_gap_days: Decimal,
+) -> str | None:
+    """Why the pattern name does not fit the selected months, in plain words; None when it fits."""
     by_month = {row["year_month"]: row for row in rows}
     selected = [by_month[month] for month in months if month in by_month]
     if pattern == "none" or not selected:
-        return "no pattern named for a found pattern"
+        return "No pattern label was given for a found pattern."
     if pattern not in PATTERN_NAMES.get(check, ()):
-        return f"unknown pattern {pattern}"
+        return f'"{pattern}" is not one of the pattern labels for this check.'
+    fits = _pattern_fits(check, pattern, rows, selected, long_gap_days)
+    return None if fits else (
+        f'"{PATTERN_LABELS[pattern]}" does not fit the selected months: {_selected_facts(check, rows, selected)}.'
+    )
+
+
+def _selected_facts(check: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]]) -> str:
+    """What the rows actually show for the selected months, for a mismatch message."""
+    if check == "money_in_and_out":
+        return "; ".join(f"{row['year_month']} has {_STRUCTURE_WORDS[_structure(row)]}" for row in selected)
+    if check == "burst_and_gaps":
+        return "; ".join(_burst_month_phrase(row) for row in selected)
+    largest = max(rows, key=lambda row: _amount(row, "max_amount"))
+    return "; ".join(
+        f"{row['year_month']} total {_rm(_amount(row, 'total_amount'))}, largest single {_rm(_amount(row, 'max_amount'))}"
+        for row in selected
+    ) + f" (largest single in six months: {_rm(_amount(largest, 'max_amount'))} in {largest['year_month']})"
+
+
+def _pattern_fits(
+    check: str, pattern: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]], long_gap_days: Decimal,
+) -> bool:
     first, last = selected[0], selected[-1]
-    pair = len(selected) == 2
+    pair = len(selected) >= 2
     if check == "activity_and_amount_change":
         largest = max(_amount(row, "max_amount") for row in rows)
         fits = {
@@ -614,9 +691,9 @@ def pattern_problem(check: str, pattern: str, rows: list[dict[str, Any]], months
             "burst_rising": pair and _burst_share(last) > _burst_share(first),
             "gap_changed": (pair and gap_basis(first) == gap_basis(last) == "in_month"
                             and _gap_days(first) != _gap_days(last)),
-            "long_gap_before": any(gap_basis(row) == "since_previous" for row in selected),
+            "long_gap_before": bool(long_gap_months(selected, long_gap_days)),
         }
-    return None if fits[pattern] else f"{pattern} does not match the selected months"
+    return fits[pattern]
 
 
 # --- Numbers a model sentence may quote ------------------------------------------
@@ -650,6 +727,11 @@ _MONTH_NAME = re.compile(
     r"\b(?:(January|February|March|April|June|July|August|September|October|November|December"
     r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\.?(?:\s+(\d{4}))?|(May)\s+(\d{4}))\b"
 )
+
+
+def names_a_month(text: str) -> bool:
+    """True when the text names a month in words ("April", "Nov 2025")."""
+    return bool(_MONTH_NAME.search(text))
 
 
 def unmatched_month_name(text: str, months: list[str]) -> str | None:

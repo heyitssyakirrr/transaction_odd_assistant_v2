@@ -76,7 +76,15 @@ class OpenAICompatibleClient:
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
         max_response_tokens: int | None = None,
+        single_object: bool = False,
     ) -> dict[str, Any]:
+        """Ask for one JSON object.
+
+        ``single_object`` marks answers that are always one block (summary, profile): the
+        loader then stops at the first } (when LLM_STOP_AFTER_JSON_OBJECT is on), so Qwen
+        cannot repeat the object until the token limit. Other answers are not cut there,
+        because Qwen sometimes splits them into two blocks; those blocks are merged.
+        """
         if not self._settings.llm_base_url:
             raise LlmServiceError(
                 "LLM_BASE_URL is not configured. Copy .env.example to .env in the "
@@ -91,6 +99,7 @@ class OpenAICompatibleClient:
             response_schema=response_schema,
             schema_name=schema_name,
             max_response_tokens=max_response_tokens,
+            stop_after_object=single_object and self._settings.llm_stop_after_json_object,
         )
         self._validate_context_budget(body)
         payload = await self._post_with_retries(body, headers)
@@ -103,19 +112,20 @@ class OpenAICompatibleClient:
         )
         content = _extract_content(payload)
         self._log_raw_response(content)
-        if self._settings.llm_stop_after_json_object and choice.get("finish_reason") == "stop":
+        if body.get("stop") and _OBJECT_END in body["stop"] and choice.get("finish_reason") == "stop":
             content = _restore_object_end(content)
+        # Qwen may split the answer into two blocks, repeat it, or explain it afterwards
+        # (sometimes until the token limit). The complete blocks at the start are the
+        # answer: they are merged, and anything after them is ignored.
+        merged = _merged_objects_at_start(content) if isinstance(content, str) else None
         if choice.get("finish_reason") == "length":
-            # Qwen sometimes writes a complete answer and then repeats it or explains
-            # itself until the token limit. A complete JSON object at the start is the
-            # answer; anything after it is ignored. It is still validated as usual.
-            complete = _first_complete_object_at_start(_strip_code_fence_start(content)) if isinstance(content, str) else None
-            if complete is None:
+            if merged is None:
                 raise LlmOutputTruncatedError(
                     "LLM output reached MAX_RESPONSE_TOKENS and was rejected; it was not used as an assessment."
                 )
             logger.warning("LLM output hit the token limit after a complete JSON object; extra text ignored.")
-            content = complete
+        if merged is not None:
+            content = merged
         try:
             return _parse_json_content(content, repair=self._settings.llm_json_repair_enabled)
         except LlmOutputFormatError:
@@ -145,6 +155,7 @@ class OpenAICompatibleClient:
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
         max_response_tokens: int | None = None,
+        stop_after_object: bool = False,
     ) -> dict[str, Any]:
         requested_tokens = max_response_tokens or self._settings.max_response_tokens
         output_tokens = min(requested_tokens, _QWEN_ASSESSMENT_TOKEN_CAP)
@@ -167,7 +178,7 @@ class OpenAICompatibleClient:
         if self._settings.llm_repetition_penalty:
             body["repetition_penalty"] = self._settings.llm_repetition_penalty
         stop = list(self._settings.llm_stop_sequences)
-        if self._settings.llm_stop_after_json_object:
+        if stop_after_object:
             stop.append(_OBJECT_END)
         if stop:
             body["stop"] = stop
@@ -370,6 +381,34 @@ def _restore_object_end(content: str | dict[str, Any]) -> str | dict[str, Any]:
     if isinstance(content, str) and "{" in content and not content.rstrip().endswith(_OBJECT_END):
         return content.rstrip() + _OBJECT_END
     return content
+
+
+def _merged_objects_at_start(text: str) -> str | None:
+    """The complete JSON objects at the start of ``text``, merged into one, or None.
+
+    Handles ``{a}{b}`` (an answer split in two), ``{a} {a}`` (a repeat) and ``{a}`` followed
+    by prose. Objects may be separated by whitespace, commas or code fences. The first value
+    of a key wins; a duplicate key inside one object is still rejected. Nothing is invented.
+    """
+    decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_json_keys)
+    merged: dict[str, Any] = {}
+    position, found = 0, 0
+    while True:
+        position = len(text) - len(re.sub(r"^(?:\s|,|```(?:json)?)*", "", text[position:], flags=re.IGNORECASE))
+        if position >= len(text) or text[position] != "{":
+            break
+        try:
+            value, position = decoder.raw_decode(text, position)
+        except (json.JSONDecodeError, ValueError):
+            break
+        if not isinstance(value, dict):
+            break
+        found += 1
+        for key, item in value.items():
+            merged.setdefault(key, item)
+    if found > 1:
+        logger.warning("LLM answer came as %d JSON objects; merged into one.", found)
+    return json.dumps(merged) if found else None
 
 
 def _strip_code_fence_start(text: str) -> str:

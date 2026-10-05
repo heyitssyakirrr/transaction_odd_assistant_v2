@@ -14,10 +14,10 @@ from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedErro
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
-    InactivityRun, activity_pair_context, activity_six_month_context, allowed_burst_gap_numbers,
+    PATTERN_LABELS, InactivityRun, activity_pair_context, activity_six_month_context, allowed_burst_gap_numbers,
     burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context, calendar_numbers,
     canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, flow_pair_context,
-    flow_six_month_context, has_burst, has_in_month_gap, no_inactivity_rationale, numbers_in_text,
+    flow_six_month_context, has_burst, has_in_month_gap, names_a_month, no_inactivity_rationale, numbers_in_text,
     pattern_problem, quotable_numbers, unmatched_month_name, unquotable_number,
 )
 from app.core.models import (
@@ -46,17 +46,6 @@ _CHECK_TITLES: dict[ReviewCheckName, str] = {
     "money_in_and_out": "Money in and money out",
     "burst_and_gaps": "Burst and gaps",
 }
-# The model's pattern names, shown to staff in plain words.
-_PATTERN_LABELS: dict[str, str] = {
-    "large_single_amount": "Large single transaction", "total_rose": "Monthly total rose",
-    "total_fell": "Monthly total fell", "amounts_more_varied": "Amounts more varied",
-    "started": "Started after no activity", "stopped": "Stopped",
-    "debit_only": "Money out only (debits)", "credit_only": "Money in only (credits)",
-    "debit_credit_mix_changed": "Debit/credit mix changed", "debit_amount_changed": "Debit amount changed",
-    "credit_amount_changed": "Credit amount changed",
-    "burst_peak": "Burst peak", "burst_rising": "Burst rising",
-    "gap_changed": "Gap between transactions changed", "long_gap_before": "Long gap before transaction",
-}
 # CSV fields attached as evidence for the months the model selected (at most 9 items: 3 burst months x 3 fields).
 _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "activity_and_amount_change": ("txn_count_monthly", "total_amount", "max_amount"),
@@ -68,7 +57,17 @@ _INSIGHT_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "activity_and_amount_change": ("txn_count_monthly", "total_amount", "avg_amount", "std_amount", "max_amount"),
     "money_in_and_out": ("debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit", "total_amount"),
 }
-_NOT_A_SENTENCE = "Not a full sentence: the AI wrote a label or a phrase without a month or figure."
+def _sentence_issue(text: str) -> str:
+    """Why an explanation does not count as one, in plain words for staff."""
+    if len(text.split()) < 3:
+        return "Is a label, not a sentence: the AI wrote a pattern name or a few words instead of an explanation."
+    return "Names no month or figure: the explanation does not say which month or amount it is about."
+_SAYS_NO_INACTIVITY = re.compile(r"\bno (?:inactive|quiet|dormant) period\b", re.IGNORECASE)
+# "No activity in the six months" when transactions exist (seen for one-transaction accounts).
+_SAYS_NO_ACTIVITY = re.compile(
+    r"\bno (?:activity|transactions?|debit or credit flow|flow)\b[^.]{0,30}\bsix months\b", re.IGNORECASE)
+# Answers that are always one JSON block; the loader may stop them at the first }.
+_SINGLE_OBJECT_STAGES = frozenset({"overall-summary", "profile-context"})
 _SUMMARY_FIELD_NAMES = {
     "headline": "Headline", "point_1": "Point 1", "point_2": "Point 2", "point_3": "Point 3",
     "why_it_matters": "Why it matters", "verify_1": "Verify 1", "verify_2": "Verify 2", "risk_reason": "Risk reason",
@@ -102,30 +101,47 @@ class ModelOutputError(ValueError):
 
 def _pattern_label(name: str) -> str | None:
     """The staff label for a pattern name; an unrecognised name is shown as the model wrote it."""
-    return None if name == "none" else _PATTERN_LABELS.get(name, name)
+    return None if name == "none" else PATTERN_LABELS.get(name, name)
 
 
 def _is_sentence(text: str, needs_figure: bool) -> bool:
-    """A real explanation: three or more words and, for a found pattern, a month or figure.
+    """A real explanation: three or more words and, when ``needs_figure``, a month or figure.
 
-    "debit_only" or "monthly total rose" is a label or phrase, not an explanation.
+    "debit_only" or "monthly total rose" is a label or phrase, not an explanation. A month
+    may be written as 202605 or in words ("April and May").
     """
-    return len(text.split()) >= 3 and (not needs_figure or bool(re.search(r"\d", text)))
+    if len(text.split()) < 3:
+        return False
+    return not needs_figure or bool(re.search(r"\d", text)) or names_a_month(text)
 
 
-def _not_a_sentence_error(keys: list[str]) -> ModelOutputError:
+def _schema_problems(exc: ValidationError) -> str:
+    """A validation error as a short instruction, e.g. "money_flow_outcome is missing"."""
+    problems = []
+    for error in exc.errors():
+        key = ".".join(str(part) for part in error["loc"]) or "the answer"
+        problems.append(f"{key} is missing" if error["type"] == "missing" else f"{key}: {error['msg']}")
+    return "; ".join(problems) + ". Return every key in one JSON object"
+
+
+def _sentence_error(key: str) -> ModelOutputError:
     return ModelOutputError(
-        f"{', '.join(keys)} must be plain sentences that name the month as YYYYMM and quote a figure from the facts; "
-        "never a pattern name such as large_single_amount, and never none")
+        f"{key} must be a plain sentence that names the month and quotes a figure from the facts, "
+        "never a pattern name such as large_single_amount and never none")
 
 
 @dataclass(frozen=True)
 class _Check:
-    outcome: Outcome
+    """One check's part of a flat answer; keys are ``{prefix}_insight``, ``{prefix}_months`` and so on."""
+    prefix: str
+    outcome: Outcome | None
     insight: str
     pattern: str
-    months_text: str
-    insight_key: str
+    months_text: str | None
+
+    @property
+    def insight_key(self) -> str:
+        return f"{self.prefix}_insight"
 
 
 @dataclass(frozen=True)
@@ -209,103 +225,151 @@ class AnalysisService:
                 stage="inactivity-burst-gaps-context",
                 checks=("activity_after_inactivity", "burst_and_gaps"),
                 system_prompt=INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
-                prompt_input=inactivity_burst_gaps_input(monthly, run, self._settings.dormancy_min_zero_months),
+                prompt_input=inactivity_burst_gaps_input(
+                    monthly, run, self._settings.dormancy_min_zero_months, self._long_gap_days()),
                 model_type=_RawInactivityBurstGaps,
                 validator=lambda raw, final: self._validate_inactivity_burst_gaps(raw, catalog, monthly, run, case_id, final),
             ),
         ]
 
     # --- validation: calls 1 and 2 -------------------------------------------------
-    # Wrong months, or a found pattern without a real explanation, cost one retry.
-    # Nothing the model wrote is ever hidden or removed: a sentence or pattern name that
-    # does not match the CSV is shown as written, with the problem listed under it for
-    # staff (UAT needs to see the real issues). The months and evidence table always stay.
+    # Each check in an answer is judged on its own. A check whose answer is incomplete
+    # (a missing outcome, months that are not in the data, a found pattern without a
+    # real sentence) costs one retry, and the retry is told exactly what was wrong. If the
+    # retry is still incomplete, only that check is marked not verified; the other check
+    # in the same answer is kept.
+    # Nothing the model wrote is ever hidden: a sentence or pattern name that does not
+    # match the CSV is shown as written, with the problem listed under it for staff.
 
     def _validate_activity_money(
         self, raw: "_RawActivityMoney", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
         case_id: str, final_attempt: bool,
     ) -> "_RawActivityMoney":
-        checks = raw.checks()
-        not_sentences = [
-            check.insight_key for check in checks.values()
-            if check.outcome == "pattern_found" and not _is_sentence(check.insight, needs_figure=True)
-        ]
-        if not final_attempt and not_sentences:
-            raise _not_a_sentence_error(not_sentences)
         known_months = self._known_months(catalog)
-        by_month = {row["year_month"]: row for row in monthly}
         updates: dict[str, Any] = {}
         issues: dict[str, list[str]] = {}
-        for name, prefix in (("activity_and_amount_change", "activity"), ("money_in_and_out", "money_flow")):
-            check = checks[name]
+        problems: dict[str, str] = {}
+        for name, check in raw.checks().items():
+            try:
+                updates.update(self._checked_amount_or_flow(
+                    name, check, monthly, known_months, case_id, final_attempt, issues))
+            except ModelOutputError as exc:
+                problems[name] = str(exc)
+        return self._accepted(raw, updates, issues, problems, case_id, final_attempt, tuple(raw.checks()))
+
+    def _checked_amount_or_flow(
+        self, name: ReviewCheckName, check: _Check, monthly: list[dict[str, Any]], known_months: set[str],
+        case_id: str, final_attempt: bool, issues: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        """Validate one check of call 1; returns its corrected fields and records its issues."""
+        prefix = check.prefix
+        if check.outcome is None:
+            raise ModelOutputError(f"{prefix}_outcome is missing; it must be pattern_found or no_pattern_found")
+        found: list[str] = []
+        months: list[str] = []
+        updates: dict[str, Any] = {f"{prefix}_pattern": "none", f"{prefix}_months": _NO_MONTHS}
+        if check.outcome == "pattern_found":
+            if not _is_sentence(check.insight, needs_figure=True):
+                if not final_attempt:
+                    raise _sentence_error(check.insight_key)
+                if check.insight:
+                    found.append(_sentence_issue(check.insight))
+            min_months = 1 if name == "activity_and_amount_change" else 2
+            months = self._split_months(check.months_text or "", f"{prefix}_months", min_count=min_months, max_count=2)
+            self._validate_transaction_months(months, known_months, name)
+            if len(months) == 2 and self._unchanged(name, monthly, months):
+                raise ModelOutputError(f"{prefix}_months {months[0]} and {months[1]} show no change in this check's figures")
             pattern = canonical_pattern(name, check.pattern)
-            updates[f"{prefix}_pattern"] = pattern
-            found: list[str] = []
-            if check.outcome == "no_pattern_found":
-                updates[f"{prefix}_months"], updates[f"{prefix}_pattern"] = _NO_MONTHS, "none"
-                months: list[str] = []
-            else:
-                min_months = 1 if name == "activity_and_amount_change" else 2
-                months = self._split_months(check.months_text, f"{name} months", min_count=min_months, max_count=2)
-                self._validate_transaction_months(months, known_months, name)
-                if len(months) == 2:
-                    first, second = (by_month[month] for month in months)
-                    fields = _EVIDENCE_FIELDS[name]
-                    unchanged = all(Decimal(str(first[field])) == Decimal(str(second[field])) for field in fields)
-                    persistent_one_sided = name == "money_in_and_out" and (
-                        (first["debit_count_monthly"] > 0 and second["debit_count_monthly"] > 0
-                         and first["credit_count_monthly"] == second["credit_count_monthly"] == 0)
-                        or (first["credit_count_monthly"] > 0 and second["credit_count_monthly"] > 0
-                            and first["debit_count_monthly"] == second["debit_count_monthly"] == 0)
-                    )
-                    if unchanged and not persistent_one_sided:
-                        raise ModelOutputError(f"{name} selected months show no change in the cited fields")
-                updates[f"{prefix}_months"] = ",".join(months)
-                if problem := pattern_problem(name, pattern, monthly, months):
-                    found.append(f"Pattern label: {problem}.")
-            if check.insight and check.insight_key in not_sentences:  # empty means not provided
-                found.append(_NOT_A_SENTENCE)
-            allowed = quotable_numbers(monthly, months, _INSIGHT_FIELDS[name]) | self._reference_numbers()
-            found += self._text_issues(check.insight, allowed, months or list(by_month))
-            issues[name] = self._log_issues(case_id, name, found)
-        return self._with_issues(raw.model_copy(update=updates), issues)
+            updates = {f"{prefix}_pattern": pattern, f"{prefix}_months": ",".join(months)}
+            if problem := pattern_problem(name, pattern, monthly, months, self._long_gap_days()):
+                found.append(f"Pattern label: {problem}")
+        all_months = [row["year_month"] for row in monthly]
+        allowed = quotable_numbers(monthly, months, _INSIGHT_FIELDS[name]) | self._reference_numbers()
+        found += self._text_issues(check.insight, allowed, months or all_months)
+        if any(row["txn_count_monthly"] for row in monthly) and _SAYS_NO_ACTIVITY.search(check.insight):
+            found.append("Says there was no activity in the six months, but transactions were recorded.")
+        issues[name] = self._log_issues(case_id, name, found)
+        return updates
+
+    @staticmethod
+    def _unchanged(name: ReviewCheckName, monthly: list[dict[str, Any]], months: list[str]) -> bool:
+        """True when two selected months show the same figures for this check (not a comparison)."""
+        by_month = {row["year_month"]: row for row in monthly}
+        first, second = (by_month[month] for month in months)
+        unchanged = all(Decimal(str(first[field])) == Decimal(str(second[field])) for field in _EVIDENCE_FIELDS[name])
+        persistent_one_sided = name == "money_in_and_out" and (
+            (first["debit_count_monthly"] > 0 and second["debit_count_monthly"] > 0
+             and first["credit_count_monthly"] == second["credit_count_monthly"] == 0)
+            or (first["credit_count_monthly"] > 0 and second["credit_count_monthly"] > 0
+                and first["debit_count_monthly"] == second["debit_count_monthly"] == 0)
+        )
+        return unchanged and not persistent_one_sided
 
     def _validate_inactivity_burst_gaps(
         self, raw: "_RawInactivityBurstGaps", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
         run: InactivityRun | None, case_id: str, final_attempt: bool,
     ) -> "_RawInactivityBurstGaps":
-        burst_found = raw.burst_gaps_outcome == "pattern_found"
-        needs_sentence = {"burst_gaps_insight": burst_found, "inactivity_insight": run is not None}
-        not_sentences = [
-            key for key, figure in needs_sentence.items()
-            if (key == "burst_gaps_insight" or run is not None) and not _is_sentence(getattr(raw, key), figure)
-        ]
-        if not final_attempt and not_sentences:
-            raise _not_a_sentence_error(not_sentences)
-        all_months = [row["year_month"] for row in monthly]
         updates: dict[str, Any] = {}
         issues: dict[str, list[str]] = {}
-        # Activity after inactivity is a computed fact; the model only explains it.
+        problems: dict[str, str] = {}
+        # Activity after inactivity is a computed fact; the model only explains it, so a
+        # weak explanation is retried once and then shown with its issues.
         if run is None:
             updates["inactivity_insight"] = ""
         else:
-            found = [_NOT_A_SENTENCE] if raw.inactivity_insight and "inactivity_insight" in not_sentences else []
-            found += self._text_issues(
-                raw.inactivity_insight, self._inactivity_numbers(run, monthly), self._run_months(run, monthly))
-            issues["activity_after_inactivity"] = self._log_issues(case_id, "activity_after_inactivity", found)
+            try:
+                issues["activity_after_inactivity"] = self._inactivity_issues(
+                    raw.inactivity_insight, run, monthly, case_id, final_attempt)
+            except ModelOutputError as exc:
+                problems["activity_after_inactivity"] = str(exc)
+        try:
+            updates.update(self._checked_burst_gaps(raw, catalog, monthly, case_id, final_attempt, issues))
+        except ModelOutputError as exc:
+            problems["burst_and_gaps"] = str(exc)
+        return self._accepted(raw, updates, issues, problems, case_id, final_attempt, ("burst_and_gaps",))
 
-        pattern = canonical_pattern("burst_and_gaps", raw.burst_gaps_pattern)
-        updates["burst_gaps_pattern"] = pattern
-        found = [_NOT_A_SENTENCE] if raw.burst_gaps_insight and "burst_gaps_insight" in not_sentences else []
-        if burst_found:
+    def _inactivity_issues(
+        self, insight: str, run: InactivityRun, monthly: list[dict[str, Any]], case_id: str, final_attempt: bool,
+    ) -> list[str]:
+        found: list[str] = []
+        if not _is_sentence(insight, needs_figure=True):
+            if not final_attempt:
+                raise _sentence_error("inactivity_insight")
+            if insight:
+                found.append(_sentence_issue(insight))
+        if _SAYS_NO_INACTIVITY.search(insight):
+            if not final_attempt:
+                raise ModelOutputError(
+                    f"inactivity_insight says there was no inactive period, but INACTIVITY_RUN status=present "
+                    f"({run.zero_months} months with no transactions before {run.active_month})")
+            found.append(f"Says there was no inactive period, but the account had {run.zero_months} months with "
+                         f"no transactions before {run.active_month}.")
+        found += self._text_issues(insight, self._inactivity_numbers(run, monthly), self._run_months(run, monthly))
+        return self._log_issues(case_id, "activity_after_inactivity", found)
+
+    def _checked_burst_gaps(
+        self, raw: "_RawInactivityBurstGaps", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
+        case_id: str, final_attempt: bool, issues: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        if raw.burst_gaps_outcome is None:
+            raise ModelOutputError("burst_gaps_outcome is missing; it must be pattern_found or no_pattern_found")
+        found: list[str] = []
+        # The sentence covers both bursts and gaps, so it always quotes a month or figure.
+        if not _is_sentence(raw.burst_gaps_insight, needs_figure=True):
+            if not final_attempt:
+                raise _sentence_error("burst_gaps_insight")
+            if raw.burst_gaps_insight:
+                found.append(_sentence_issue(raw.burst_gaps_insight))
+        updates: dict[str, Any] = {"burst_gaps_months": _NO_MONTHS, "burst_gaps_pattern": "none"}
+        if raw.burst_gaps_outcome == "pattern_found":
             months = self._split_months(
-                raw.burst_gaps_months, "burst_and_gaps months", min_count=1, max_count=_MAX_BURST_MONTHS)
+                raw.burst_gaps_months or "", "burst_gaps_months", min_count=1, max_count=_MAX_BURST_MONTHS)
             self._validate_transaction_months(months, self._known_months(catalog), "burst_and_gaps")
-            updates["burst_gaps_months"] = ",".join(months)
-            if problem := pattern_problem("burst_and_gaps", pattern, monthly, months):
-                found.append(f"Pattern label: {problem}.")
-        else:
-            updates["burst_gaps_months"], updates["burst_gaps_pattern"] = _NO_MONTHS, "none"
+            pattern = canonical_pattern("burst_and_gaps", raw.burst_gaps_pattern)
+            updates = {"burst_gaps_months": ",".join(months), "burst_gaps_pattern": pattern}
+            if problem := pattern_problem("burst_and_gaps", pattern, monthly, months, self._long_gap_days()):
+                found.append(f"Pattern label: {problem}")
+        all_months = [row["year_month"] for row in monthly]
         found += self._text_issues(raw.burst_gaps_insight, allowed_burst_gap_numbers(monthly), all_months)
         lowered = raw.burst_gaps_insight.casefold()
         if has_burst(monthly) and _SAYS_NO_BURST.search(lowered):
@@ -313,7 +377,24 @@ class AnalysisService:
         if not has_in_month_gap(monthly) and _SAYS_EVEN_SPACING.search(lowered):
             found.append("Describes the spacing of transactions, but no month has 2 or more transactions.")
         issues["burst_and_gaps"] = self._log_issues(case_id, "burst_and_gaps", found)
-        return self._with_issues(raw.model_copy(update=updates), issues)
+        return updates
+
+    def _accepted(
+        self, raw: Any, updates: dict[str, Any], issues: dict[str, list[str]], problems: dict[str, str],
+        case_id: str, final_attempt: bool, decided: tuple[str, ...],
+    ) -> Any:
+        """Accept the answer, retry it once, or keep the complete checks and mark the rest not verified.
+
+        ``decided`` names the checks this answer decides; when none of them is usable the
+        whole call fails, exactly as an unreadable answer does.
+        """
+        if problems and (not final_attempt or set(decided) <= set(problems)):
+            raise ModelOutputError("; ".join(problems.values()))
+        for name, problem in problems.items():
+            logger.warning("Check not verified: case=%s check=%s problem=%s", case_id, name, problem)
+        result = raw.model_copy(update=updates)
+        result.issues, result.unverified = issues, problems
+        return result
 
     @staticmethod
     def _log_issues(case_id: str, check: str, issues: list[str]) -> list[str]:
@@ -325,6 +406,9 @@ class AnalysisService:
     def _with_issues(raw: Any, issues: dict[str, list[str]]) -> Any:
         raw.issues = issues
         return raw
+
+    def _long_gap_days(self) -> Decimal:
+        return Decimal(self._settings.review_long_gap_days)
 
     def _single_reference(self) -> Decimal:
         return Decimal(str(self._settings.dormancy_review_single_amount))
@@ -373,10 +457,11 @@ class AnalysisService:
         self, name: ReviewCheckName, raw: Any, monthly: list[dict[str, Any]],
         catalog: dict[str, EvidenceItem], run: InactivityRun | None,
     ) -> ReviewCheck:
-        if raw is None:
+        if raw is None or name in raw.unverified:
             return ReviewCheck(
                 check=name, title=_CHECK_TITLES[name], outcome="not_verified",
                 facts="The LLM result for this check could not be verified. Review the figures below directly.",
+                issues=[f"Incomplete AI answer after one retry: {raw.unverified[name]}."] if raw is not None else [],
                 table=self._table(name, monthly, []),
             )
         if name == "activity_after_inactivity":
@@ -446,7 +531,7 @@ class AnalysisService:
             monthly, run, self._settings.dormancy_min_zero_months,
             [self._check_line(check) for check in checks],
             [check.check for check in checks if check.outcome == "not_verified"],
-            self._profile_lines(profile, profile_context),
+            self._profile_lines(profile, profile_context), self._single_reference(),
         )
         quotable = numbers_in_text(prompt_input) | calendar_numbers(monthly)
         try:
@@ -585,6 +670,7 @@ class AnalysisService:
                 system_prompt=system_prompt, user_payload=prompt_input,
                 response_schema=model_type.model_json_schema(), schema_name=stage.replace("-", "_"),
                 max_response_tokens=max_response_tokens,
+                single_object=stage.removesuffix("-format-retry") in _SINGLE_OBJECT_STAGES,
             ),
         )
         prepare = getattr(model_type, "prepare_payload", None)
@@ -593,7 +679,8 @@ class AnalysisService:
         try:
             return model_type.model_validate(result)
         except ValidationError as exc:
-            raise ModelOutputError(f"{stage} output did not meet the required schema: {exc}") from exc
+            # Plain words, because this text is also the retry instruction to the model.
+            raise ModelOutputError(_schema_problems(exc)) from exc
 
     # --- unchanged helpers (LLM retry, profile, evidence) ----------------------------
 
@@ -803,6 +890,16 @@ class _RawAnswer(BaseModel):
     _TEXT_LIMITS: ClassVar[dict[str, int]] = {}
     # Problems the validators found, per check, for staff to see (never hidden).
     _issues: dict[str, list[str]] = PrivateAttr(default_factory=dict)
+    # Checks whose part of the answer was still incomplete after the retry, with the reason.
+    _unverified: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @property
+    def unverified(self) -> dict[str, str]:
+        return self._unverified
+
+    @unverified.setter
+    def unverified(self, value: dict[str, str]) -> None:
+        self._unverified = value
 
     @property
     def issues(self) -> dict[str, list[str]]:
@@ -833,6 +930,14 @@ class _RawAnswer(BaseModel):
         for key in cls._PATTERN_KEYS:
             if isinstance(payload.get(key), str):
                 payload[key] = re.sub(r"[\s-]+", "_", payload[key].strip().lower()) or "none"
+                # Qwen sometimes writes its decision in the pattern field and leaves out the
+                # outcome (logged 2026-10-05: "money_flow_pattern":"no_pattern_found"). The
+                # decision is still Qwen's; it is only moved to the right field.
+                outcome_key = key.removesuffix("_pattern") + "_outcome"
+                decision = _OUTCOME_SYNONYMS.get(payload[key])
+                if decision and outcome_key in cls._OUTCOME_KEYS and outcome_key not in payload:
+                    logger.warning("Outcome given in %s; moved to %s.", key, outcome_key)
+                    payload[outcome_key], payload[key] = decision, "none"
         for key in cls.model_fields:
             if key.endswith("_months") and isinstance(payload.get(key), str) and not payload[key].strip():
                 payload[key] = _NO_MONTHS
@@ -850,21 +955,21 @@ class _RawActivityMoney(_RawAnswer):
     _TEXT_LIMITS: ClassVar[dict[str, int]] = {"activity_insight": 300, "money_flow_insight": 300}
     activity_insight: str = Field(default="", max_length=300)
     activity_pattern: str = Field(default="none", max_length=40)
-    activity_months: str = Field(min_length=1, max_length=32)
-    activity_outcome: Outcome
+    # Outcome and months may be missing; the validator then retries or marks only that check.
+    activity_months: str | None = Field(default=None, max_length=32)
+    activity_outcome: Outcome | None = None
     money_flow_insight: str = Field(default="", max_length=300)
     money_flow_pattern: str = Field(default="none", max_length=40)
-    money_flow_months: str = Field(min_length=1, max_length=32)
-    money_flow_outcome: Outcome
+    money_flow_months: str | None = Field(default=None, max_length=32)
+    money_flow_outcome: Outcome | None = None
 
     def checks(self) -> dict[ReviewCheckName, _Check]:
         return {
             "activity_and_amount_change": _Check(
-                self.activity_outcome, self.activity_insight, self.activity_pattern, self.activity_months,
-                "activity_insight"),
+                "activity", self.activity_outcome, self.activity_insight, self.activity_pattern, self.activity_months),
             "money_in_and_out": _Check(
-                self.money_flow_outcome, self.money_flow_insight, self.money_flow_pattern, self.money_flow_months,
-                "money_flow_insight"),
+                "money_flow", self.money_flow_outcome, self.money_flow_insight, self.money_flow_pattern,
+                self.money_flow_months),
         }
 
 
@@ -875,8 +980,8 @@ class _RawInactivityBurstGaps(_RawAnswer):
     inactivity_insight: str = Field(default="", max_length=300)
     burst_gaps_insight: str = Field(default="", max_length=300)
     burst_gaps_pattern: str = Field(default="none", max_length=40)
-    burst_gaps_months: str = Field(min_length=1, max_length=32)
-    burst_gaps_outcome: Outcome
+    burst_gaps_months: str | None = Field(default=None, max_length=32)
+    burst_gaps_outcome: Outcome | None = None
 
 
 class _RawOverallSummary(_RawAnswer):
