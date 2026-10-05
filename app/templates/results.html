@@ -36,11 +36,12 @@
       <section id="decision-card" class="decision-card">
         <div class="decision-main">
           <div class="decision-head">
-            <p class="eyebrow">Recommendation</p>
+            <p class="eyebrow">Overall assessment</p>
             <span id="risk-badge" class="risk-badge"></span>
           </div>
           <h2 id="decision"></h2>
-          <p id="decision-rationale"></p>
+          <p id="headline" class="headline"></p>
+          <p id="decision-rationale" class="decision-note"></p>
         </div>
         <div class="decision-stats">
           <div><span>Account</span><strong id="acct-num"></strong></div>
@@ -51,35 +52,40 @@
       </section>
 
       <section class="section">
-        <h3>Executive summary</h3>
-        <p id="summary"></p>
+        <h3>Summary</h3>
+        <ul id="summary-points" class="summary-points"></ul>
+        <div class="summary-grid">
+          <div id="why-block" class="summary-block">
+            <h4>Why it matters</h4>
+            <p id="why-it-matters"></p>
+          </div>
+          <div id="verify-block" class="summary-block">
+            <h4>What to verify first</h4>
+            <ol id="verify-first"></ol>
+          </div>
+        </div>
+        <p id="risk-reason" class="risk-reason"></p>
       </section>
 
       <section class="section">
         <div class="section-head">
-          <h3>Mandatory review coverage</h3>
-          <span class="findings-count">All four checks reviewed</span>
+          <h3>Review checks</h3>
+          <span id="checks-count" class="findings-count"></span>
         </div>
-        <p class="section-hint">Each transaction pattern is reviewed, including when no indicator is found.</p>
-        <div id="review-checks" class="findings-grid"></div>
+        <p class="section-hint">Each check is always reviewed. Explanations are written by the AI; every figure in the tables comes from the uploaded CSV. Months the AI selected are in <strong>bold</strong>.</p>
+        <div id="review-checks" class="check-list"></div>
       </section>
 
       <section id="customer-profile-section" class="section hidden">
-        <h3>Customer profile context</h3>
-        <div id="customer-profile-context" class="findings-grid"></div>
+        <h3 id="customer-profile-title">Customer profile vs activity</h3>
+        <div id="customer-profile-context"></div>
       </section>
 
       <section class="section">
-        <div class="section-head">
-          <h3>Material findings</h3>
-          <span id="findings-count" class="findings-count"></span>
-        </div>
-        <div id="findings" class="findings-grid"></div>
-      </section>
-
-      <section class="section">
-        <h3>Limitations</h3>
-        <ul id="limitations"></ul>
+        <details class="limitations">
+          <summary id="limitations-title">Limitations</summary>
+          <ul id="limitations"></ul>
+        </details>
       </section>
 
       <section class="section actions-row">

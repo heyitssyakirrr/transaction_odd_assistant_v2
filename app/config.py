@@ -56,11 +56,14 @@ class Settings:
     )
     # Compatibility default for callers outside the account-context workflow.
     max_response_tokens: int = int(os.getenv("MAX_RESPONSE_TOKENS", "700"))
-    # Three focused calls per account run concurrently through the shared work
-    # queue: activity/flow and timing (dormancy + burst/gaps) each use the
-    # transaction cap below; the profile call uses its own cap.
+    # Four LLM calls per account. Calls 1-3 run concurrently through the shared work
+    # queue: change in activity and amounts + money in and out, and activity after
+    # inactivity + burst and gaps (both use the transaction cap below), and the
+    # profile (its own cap). Call 4, the overall summary, runs after them.
     llm_transaction_max_response_tokens: int = int(os.getenv("LLM_TRANSACTION_MAX_RESPONSE_TOKENS", "500"))
     llm_profile_context_max_response_tokens: int = int(os.getenv("LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS", "320"))
+    # Call 4: the overall summary and risk decision, run after calls 1-3 finish.
+    llm_summary_max_response_tokens: int = int(os.getenv("LLM_SUMMARY_MAX_RESPONSE_TOKENS", "450"))
     # Activity after an inactive period. The run is computed from the six rows (see
     # app/core/monthly_facts.py) and given to the timing LLM call as a fact. It needs
     # at least this many consecutive zero-transaction months before a month with
@@ -118,6 +121,7 @@ class Settings:
             "MAX_RESPONSE_TOKENS": self.max_response_tokens,
             "LLM_TRANSACTION_MAX_RESPONSE_TOKENS": self.llm_transaction_max_response_tokens,
             "LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS": self.llm_profile_context_max_response_tokens,
+            "LLM_SUMMARY_MAX_RESPONSE_TOKENS": self.llm_summary_max_response_tokens,
             "DORMANCY_MIN_ZERO_MONTHS": self.dormancy_min_zero_months,
             "DORMANCY_REVIEW_SINGLE_AMOUNT": self.dormancy_review_single_amount,
             "DORMANCY_REVIEW_MONTH_TOTAL": self.dormancy_review_month_total,

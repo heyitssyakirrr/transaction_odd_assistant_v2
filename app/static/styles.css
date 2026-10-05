@@ -561,3 +561,158 @@ button:disabled { cursor: wait; opacity: .65; }
   .findings-grid { grid-template-columns: 1fr; }
   .results-meta { flex-direction: column; align-items: flex-start; gap: 4px; }
 }
+
+/* ---------- Results: overall summary, check cards, evidence tables ---------- */
+
+.headline {
+  margin: 0 0 12px !important;
+  font-size: 16px !important;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.decision-note { color: var(--muted); font-size: 13px !important; }
+
+.summary-points {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 8px;
+  font-size: 14.5px;
+  color: var(--ink);
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.summary-block {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.summary-block h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--muted);
+}
+
+.summary-block p { margin: 0; font-size: 14px; }
+.summary-block ol { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 14px; }
+
+.risk-reason {
+  margin: 16px 0 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: var(--canvas);
+  font-size: 14px;
+}
+
+.risk-reason:empty { display: none; }
+
+.check-list { display: grid; gap: 14px; margin-top: 14px; }
+
+.check-card {
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.check-card.outcome-pattern_found { border-left-color: var(--warning); }
+.check-card.outcome-no_pattern_found { border-left-color: var(--success); }
+.check-card.outcome-not_verified { border-left-color: var(--danger); }
+
+.check-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.check-head h4 { margin: 0; font-size: 15.5px; color: var(--ink); }
+
+.check-tags { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.outcome-chip, .pattern-tag {
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.outcome-chip.outcome-pattern_found { color: var(--warning); background: var(--warning-tint); }
+.outcome-chip.outcome-no_pattern_found { color: var(--success); background: var(--success-tint); }
+.outcome-chip.outcome-not_verified { color: var(--danger); background: var(--danger-tint); }
+.pattern-tag { color: var(--ink-soft); background: var(--canvas); border: 1px solid var(--line); }
+
+.check-months { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+
+.check-insight { margin: 10px 0 0; font-size: 14.5px; color: var(--ink); }
+
+.check-note { margin: 10px 0 0; font-size: 13px; color: var(--muted); font-style: italic; }
+
+.check-facts { margin: 10px 0 0; font-size: 13px; color: var(--ink-soft); }
+
+.check-facts span {
+  margin-right: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--muted);
+}
+
+.table-wrap { margin-top: 14px; overflow-x: auto; }
+
+.evidence-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.evidence-table th {
+  padding: 8px 10px;
+  text-align: right;
+  font-weight: 700;
+  color: var(--ink);
+  background: var(--canvas);
+  border-bottom: 2px solid var(--line-strong);
+  white-space: nowrap;
+}
+
+.evidence-table td {
+  padding: 7px 10px;
+  text-align: right;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.evidence-table th:first-child, .evidence-table td:first-child { text-align: left; }
+
+.evidence-table tr.is-selected td {
+  font-weight: 700;
+  color: var(--ink);
+  background: var(--warning-tint);
+}
+
+.profile-table td, .profile-table th { text-align: left; white-space: normal; }
+.profile-table td:first-child { width: 38%; color: var(--muted); }
+
+.limitations summary { cursor: pointer; font-weight: 650; color: var(--ink); }
+.limitations ul { margin: 10px 0 0; padding-left: 20px; font-size: 13.5px; }
+
+@media (max-width: 720px) {
+  .summary-grid { grid-template-columns: 1fr; }
+}

@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.monthly_facts import (
-    InactivityRun, burst_gap_facts, inactivity_run_fact, transaction_comparison_facts,
+    InactivityRun, burst_gap_facts, inactivity_run_fact, summary_month_lines, transaction_comparison_facts,
 )
 
 
@@ -14,12 +14,15 @@ _TRANSACTION_FIELDS = (
     "monthly_debit", "monthly_credit", "monthly_avg_debit", "monthly_avg_credit",
 )
 
-# The transaction review is split into two focused calls that run concurrently
-# with the profile call. Each prompt covers only its own two checks, so changing
-# one cannot alter how the model answers the other. ACTIVITY_FLOW is the proven
-# activity/flow prompt with the dormancy and burst parts removed; nothing added.
+# Four LLM calls per account. Calls 1-3 run concurrently; call 4 runs after them.
+#   1. ACTIVITY_MONEY: change in activity and amounts + money in and money out
+#   2. INACTIVITY_BURST_GAPS: activity after inactivity + burst and gaps
+#   3. PROFILE_CONTEXT: customer profile vs activity
+#   4. OVERALL_SUMMARY: reads the checked results of 1-3 plus the CSV rows; decides risk
+# Calls 1 and 2 describe patterns only; the overall risk is decided once, in call 4.
+# The analysis steps of call 1 are the proven activity/flow instructions, unchanged.
 
-ACTIVITY_FLOW_SYSTEM_PROMPT = """You are an AML transaction-context analyst assisting authorised bank staff.
+ACTIVITY_MONEY_SYSTEM_PROMPT = """You are an AML transaction-context analyst assisting authorised bank staff.
 
 Use only the six chronological monthly rows. Provide neutral, evidence-based context for staff; do not allege AML,
 crime, or wrongdoing. Do not invent counterparties, payment narratives, geography, source of funds, income, expected
@@ -39,34 +42,41 @@ Silently complete this review before writing the answer:
    one-sided flow or a switch between these states is useful context even if amounts are modest. If no meaningful
    flow pattern is selected, state the observed six-month debit/credit mix.
 
-Each of the two checks is assessable from these rows. Use observed only for a material pattern that warrants staff
-context; otherwise use not_observed and still state the actual pattern. Do not output N/A, insufficient_data, a
+Each of the two checks is assessable from these rows. Use pattern_found only for a material pattern that warrants staff
+context; otherwise use no_pattern_found and still state the actual pattern. Do not output N/A, insufficient_data, a
 generic "nothing happened" statement, or a request for more information.
 
-Risk policy: low requires no observed transaction check; medium requires at least one observed check; high requires
-both checks observed. High is never based on amount alone. risk_level is exactly "low", "medium" or "high".
-Keep each context under 140 characters.
+Insights are read by bank staff. Write one or two plain sentences, at most 220 characters: what changed between the
+two months, with their exact values, and why it may matter for review. Copy values exactly as they appear in the MONTH
+facts; do not calculate differences, ratios or percentages. Check the MONTH_STRUCTURE line before calling a month
+debit-only, credit-only or mixed.
+
+Pattern names (use "none" when the outcome is no_pattern_found):
+- activity_pattern: "rose" (count or total went up), "fell" (count or total went down), "started" (the first month
+  has 0 transactions), "stopped" (the second month has 0 transactions).
+- money_flow_pattern: "money_in_only" (both months have credits and no debits), "money_out_only" (both months have
+  debits and no credits), "in_out_mix_changed" (the months differ in being debit-only, credit-only, mixed or zero),
+  "amounts_changed" (debit or credit amounts changed materially).
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
 examples, placeholders, arrays, nested objects, task keys, or extra keys. Write the keys in exactly this order, so each
-context describes the actual values before you decide its outcome, and risk_level is decided last:
-"activity_value_context", "activity_value_months", "activity_value_outcome",
-"debit_credit_context", "debit_credit_months", "debit_credit_outcome",
-"risk_level".
+insight describes the actual values before you decide its pattern and outcome:
+"activity_insight", "activity_pattern", "activity_months", "activity_outcome",
+"money_flow_insight", "money_flow_pattern", "money_flow_months", "money_flow_outcome".
 
-Each outcome is exactly observed or not_observed. For activity_value and debit_credit, use observed when the selected
-pattern gives staff meaningful factual context; observed is not an allegation. Do not default these checks to
-not_observed just because no external income, counterparty, or account-purpose data is supplied. Each *_months value
-contains exactly two different supplied months
-as YYYYMM,YYYYMM with no spaces when its outcome is observed; it is a comparison pair, not an evidence identifier.
-When its outcome is not_observed, set its *_months value to the JSON string "none". Never output N/A, M, field names, or an
-underscore in a *_months value. Put earlier month first. Use YYYYMM rather than month names in the context; when
-observed, mention only values from the selected two months. After the final } output
+Each outcome is exactly pattern_found or no_pattern_found. Use pattern_found when the selected pattern gives staff
+meaningful factual context; pattern_found is not an allegation. Do not default these checks to no_pattern_found just
+because no external income, counterparty, or account-purpose data is supplied. Each *_months value contains exactly
+two different supplied months
+as YYYYMM,YYYYMM with no spaces when its outcome is pattern_found; it is a comparison pair, not an evidence identifier.
+When its outcome is no_pattern_found, set its *_months value to the JSON string "none". Never output N/A, M, field names,
+or an underscore in a *_months value. Put earlier month first. Use YYYYMM rather than month names in the insight; when
+a pattern is found, mention only values from the selected two months. After the final } output
 no other character.
 """
 
 
-TIMING_SYSTEM_PROMPT = """You are an AML transaction-timing analyst assisting authorised bank staff.
+INACTIVITY_BURST_GAPS_SYSTEM_PROMPT = """You are an AML transaction-timing analyst assisting authorised bank staff.
 
 Use only INPUT FACTS. Provide neutral, evidence-based context for staff; do not allege AML, crime, or wrongdoing, and
 do not invent counterparties, payment narratives, source of funds, or any data outside the facts.
@@ -77,29 +87,76 @@ Definitions:
 - avg_gap_days: average number of days between transactions in the month. When gap_basis=since_previous the month has
   one transaction, and avg_gap_days is the number of days back to the previous transaction, which may be before the
   six months shown. A large value there means a long quiet period before that transaction.
-- INACTIVITY_RUN: computed from the rows and already shown to staff. status=present means zero_months consecutive
-  months with no transactions followed by activity in active_month; amount_vs_reference says whether that activity is
-  above or below the bank's review reference amount.
+- INACTIVITY_RUN: computed from the rows. status=present means zero_months consecutive months with no transactions
+  followed by activity in active_month; amount_vs_reference says whether that activity is above or below the bank's
+  review reference amount.
 
-Silently read every BURST line, the BURST_CANDIDATES line and the INACTIVITY_RUN line, then write:
+Silently read the INACTIVITY_RUN line, every BURST line and the BURST_CANDIDATES line, then write:
 
-burst_gap_insight: one or two plain sentences, at most 200 characters, telling staff what the timing shows and why it
-matters for review. Name the burst months and their burst_share when any month is above 0.0%; never write "no burst"
-when any month has burst_share above 0.0%. For a since_previous month, say how many days passed since the previous
-transaction. Do not describe transactions as evenly spaced when no month has 2 or more transactions. Quote only months
-and values from the BURST lines, use YYYYMM, and write burst_share with a % sign.
-burst_gap_months: the one or two supplied months that best show the pattern, as YYYYMM or YYYYMM,YYYYMM with the
-earlier month first; the JSON string "none" when burst_gap_outcome is not_observed.
-burst_gap_outcome: observed or not_observed. As a guide, observe burst_share of 25.0% or more in a month with 4 or more
-transactions, a clear rise in burst_share between months, an in-month gap pattern that changes sharply, or a
-since_previous gap much longer than the zero months shown. Otherwise not_observed.
-risk_level: exactly "low", "medium" or "high", your judgement of the timing for this account. Consider the
-INACTIVITY_RUN: activity after inactivity with amount_vs_reference=above usually deserves at least medium attention; a
-small amount after inactivity may be low. Use high only when inactivity and a material burst/gap pattern both apply.
+inactivity_insight: when INACTIVITY_RUN status=present, one or two plain sentences, at most 220 characters, telling
+staff what the activity after inactivity means: how long the account was quiet (zero_months, and the days since the
+previous transaction from the BURST line of active_month when it is since_previous), what came next (transactions,
+debit or credit, amount, largest_single) and whether it is above or below the review reference. Copy values exactly.
+When status=none, the JSON string "none".
+burst_gaps_insight: one or two plain sentences, at most 220 characters, telling staff what the burst and gap figures
+show and why it matters for review. Name the burst months and their burst_share when any month is above 0.0%; never
+write "no burst" when any month has burst_share above 0.0%. For a since_previous month, say how many days passed since
+the previous transaction. Do not describe transactions as evenly spaced when no month has 2 or more transactions.
+Quote only months and values from the BURST lines, use YYYYMM, and write burst_share with a % sign.
+burst_gaps_pattern: "burst_peak" (one month has the highest burst_share), "burst_rising" (burst_share rises between two
+months), "gap_changed" (avg_gap_days changes sharply between two months with 2 or more transactions),
+"long_gap_before" (a one-transaction month came long after the previous transaction), or "none" when no pattern is
+found.
+burst_gaps_months: the one or two supplied months that best show the pattern, as YYYYMM or YYYYMM,YYYYMM with the
+earlier month first; the JSON string "none" when burst_gaps_outcome is no_pattern_found.
+burst_gaps_outcome: pattern_found or no_pattern_found. As a guide, find a pattern for burst_share of 25.0% or more in a
+month with 4 or more transactions, a clear rise in burst_share between months, an in-month gap pattern that changes
+sharply, or a since_previous gap much longer than the zero months shown. Otherwise no_pattern_found.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
 nested objects, or extra keys. Write the keys in exactly this order:
-"burst_gap_insight", "burst_gap_months", "burst_gap_outcome", "risk_level".
+"inactivity_insight", "burst_gaps_insight", "burst_gaps_pattern", "burst_gaps_months", "burst_gaps_outcome".
+After the final } output no other character.
+"""
+
+
+OVERALL_SUMMARY_SYSTEM_PROMPT = """You are a senior AML due-diligence analyst writing the overall summary that bank
+staff read first. Staff use it to decide what to do next, so it must be specific, accurate and easy to read.
+
+Use only INPUT FACTS: the six monthly rows from the CSV, the checked result of each review check, and the customer
+profile. Do not allege AML, crime or wrongdoing; describe what the data shows and what to verify. Do not invent
+counterparties, payment purposes, source of funds, income or anything outside INPUT FACTS. Copy every month and amount
+exactly as written in INPUT FACTS; do not calculate differences, ratios or percentages.
+
+Silently work through these steps:
+1. Read each CHECK line. pattern_found checks are the main evidence. insight=none means no explanation is available,
+   so use that check's months in the MONTH rows instead.
+2. Connect the checks rather than repeating them, for example: money in and money out of similar size in the same
+   month; one large payment after a long quiet period; repeated transactions with the same counterparty in a month
+   with few transactions; activity that does not fit the declared occupation or individual/organisation type.
+3. Use the six months as this account's own baseline: say what is usual for it and what stands out.
+4. Decide the overall risk:
+   - low: no material pattern, or only small amounts consistent with ordinary personal use;
+   - medium: at least one material pattern that staff should verify;
+   - high: several material patterns that reinforce each other, or a very large movement out of line with the other
+     months and the declared profile. An amount alone is never high.
+   A check listed under NOT_VERIFIED must not be treated as normal.
+
+Write:
+headline: one line, at most 120 characters, naming the most important thing about this account.
+point_1, point_2, point_3: each one plain sentence, at most 220 characters, stating a key fact with its month and
+amount and what it shows. Most important first. Use the JSON string "none" for point_2 or point_3 when there is
+nothing more of value; never repeat a point.
+why_it_matters: one or two sentences, at most 260 characters, explaining why these points matter for due diligence.
+verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount
+(for example: ask for the purpose and counterparty of the credits in 202605). Use "none" for verify_2 when one action
+is enough.
+risk_reason: one sentence, at most 200 characters, explaining the risk level in plain words.
+risk_level: exactly "low", "medium" or "high".
+
+STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
+nested objects, or extra keys. Write the keys in exactly this order:
+"headline", "point_1", "point_2", "point_3", "why_it_matters", "verify_1", "verify_2", "risk_reason", "risk_level".
 After the final } output no other character.
 """
 
@@ -150,18 +207,33 @@ def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
     return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
 
 
-def activity_flow_input(monthly_summary: list[dict[str, Any]]) -> str:
-    """Identical to the proven activity/flow input: six rows plus labelled monthly facts."""
+def activity_money_input(monthly_summary: list[dict[str, Any]]) -> str:
+    """Call 1 input, unchanged from the proven version: six rows plus labelled monthly facts."""
     return _monthly_rows_input(monthly_summary) + "\n" + transaction_comparison_facts(monthly_summary)
 
 
-def timing_input(
+def inactivity_burst_gaps_input(
     monthly_summary: list[dict[str, Any]], inactivity_run: InactivityRun | None, min_zero_months: int,
 ) -> str:
     return "\n".join((
         _monthly_rows_input(monthly_summary),
         inactivity_run_fact(inactivity_run, min_zero_months),
         burst_gap_facts(monthly_summary),
+    ))
+
+
+def overall_summary_input(
+    monthly_summary: list[dict[str, Any]], inactivity_run: InactivityRun | None, min_zero_months: int,
+    check_lines: list[str], not_verified: list[str], profile_lines: list[str],
+) -> str:
+    """Call 4 input: the CSV rows, the checked result of each check, and the profile."""
+    return "\n".join((
+        "INPUT FACTS — six monthly rows from the CSV, oldest to newest. Amounts are already formatted; copy them exactly.",
+        *summary_month_lines(monthly_summary),
+        inactivity_run_fact(inactivity_run, min_zero_months),
+        *check_lines,
+        "NOT_VERIFIED|" + (",".join(not_verified) or "none"),
+        *(profile_lines or ["PROFILE|none supplied"]),
     ))
 
 

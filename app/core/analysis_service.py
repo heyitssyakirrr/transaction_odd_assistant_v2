@@ -5,70 +5,86 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Callable, ClassVar, Literal, TypeVar
-from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
     InactivityRun, activity_pair_context, activity_six_month_context, allowed_burst_gap_numbers,
-    burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context, dormancy_rationale,
-    find_inactivity_run, flow_pair_context, flow_six_month_context, has_burst, has_in_month_gap,
-    no_inactivity_rationale,
+    burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context, check_table,
+    dormancy_rationale, find_inactivity_run, flow_pair_context, flow_six_month_context, has_burst,
+    has_in_month_gap, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
+    unquotable_number,
 )
 from app.core.models import (
-    AccountAnalysisRequest, AccountAssessment, AccountFinding, AssessmentLimitation,
-    CustomerProfileContext, CustomerProfileRecord, EvidenceItem, LlmClient,
+    AccountAnalysisRequest, AccountAssessment, AssessmentLimitation, CustomerProfileContext,
+    CustomerProfileRecord, Decision, EvidenceItem, EvidenceTable, LlmClient, OverallSummary,
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
-    ACTIVITY_FLOW_SYSTEM_PROMPT, FORMAT_RETRY_SUFFIX, PROFILE_CONTEXT_SYSTEM_PROMPT, TIMING_SYSTEM_PROMPT,
-    activity_flow_input, profile_context_input, timing_input,
+    ACTIVITY_MONEY_SYSTEM_PROMPT, FORMAT_RETRY_SUFFIX, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
+    OVERALL_SUMMARY_SYSTEM_PROMPT, PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input,
+    inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
 )
 from app.core.reference_data import resolve_citizenship, resolve_occupation
 
 logger = logging.getLogger("TransactionSummary.analysis_service")
 ModelType = TypeVar("ModelType", bound=BaseModel)
-TransactionOutcome = Literal["observed", "not_observed"]
+Outcome = Literal["pattern_found", "no_pattern_found"]
+
+# --- The four review checks ------------------------------------------------------
 _CHECK_ORDER: tuple[ReviewCheckName, ...] = (
-    "dormancy_reactivation", "activity_value_change", "debit_credit_flow", "burst_and_gaps",
+    "activity_after_inactivity", "activity_and_amount_change", "money_in_and_out", "burst_and_gaps",
 )
-_FORBIDDEN_TRANSACTION_TEXT = ("n/a", "insufficient", "nothing happened", "please provide")
-# Wording that would turn neutral timing context into an allegation.
-_FORBIDDEN_INSIGHT_TEXT = _FORBIDDEN_TRANSACTION_TEXT + (
+_CHECK_TITLES: dict[ReviewCheckName, str] = {
+    "activity_after_inactivity": "Activity after inactivity",
+    "activity_and_amount_change": "Change in activity and amounts",
+    "money_in_and_out": "Money in and money out",
+    "burst_and_gaps": "Burst and gaps",
+}
+# The model's pattern names, shown to staff in plain words.
+_PATTERN_LABELS: dict[str, str] = {
+    "rose": "Rose", "fell": "Fell", "started": "Started after no activity", "stopped": "Stopped",
+    "money_in_only": "Money in only", "money_out_only": "Money out only",
+    "in_out_mix_changed": "Money in/out mix changed", "amounts_changed": "Amounts changed",
+    "burst_peak": "Burst peak", "burst_rising": "Burst rising",
+    "gap_changed": "Gap between transactions changed", "long_gap_before": "Long gap before transaction",
+}
+# CSV fields attached as evidence for the months the model selected.
+_EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
+    "activity_and_amount_change": ("txn_count_monthly", "total_amount"),
+    "money_in_and_out": ("debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit"),
+    "burst_and_gaps": ("txn_count_monthly", "pct_burst", "pct_trx_gap"),
+}
+# CSV fields whose values an insight may quote, for the months it is about.
+_INSIGHT_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
+    "activity_and_amount_change": ("txn_count_monthly", "total_amount", "max_amount"),
+    "money_in_and_out": ("debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit", "total_amount"),
+}
+
+_FORBIDDEN_TEXT = (
+    "n/a", "insufficient", "nothing happened", "please provide",
     "launder", "illicit", "illegal", "fraud", "criminal", "terroris", "smurf",
 )
 _FORBIDDEN_PROFILE_TEXT = (
     "n/a", "please provide", "named p",
 )
 _MONTH_TOKEN = re.compile(r"^M?(\d{6})$")
-_NUMBER_TOKEN = re.compile(r"\d[\d,]*(?:\.\d+)?")
-# Insight wording that contradicts the facts. The insight is then hidden and the
-# factual text shown instead; the response itself is kept (no error, no retry).
+_NO_MONTHS = "none"
 _SAYS_NO_BURST = re.compile(r"\b(?:no|without|zero|absence of)\s+(?:\w+\s+){0,2}bursts?\b")
 _SAYS_EVEN_SPACING = re.compile(r"\b(?:even(?:ly)?|regular(?:ly)?|consistent(?:ly)?)\s+(?:\w+\s+){0,1}(?:spaced|spread|spacing|timing|intervals?)\b")
-_NO_EVIDENCE_MONTHS = "none"
-_RISK_ORDER: dict[RiskLevel, int] = {"low": 0, "medium": 1, "high": 2}
-_RATIONALE_LIMIT = 360
+_OUTCOME_SYNONYMS = {
+    "pattern_found": "pattern_found", "found": "pattern_found", "observed": "pattern_found",
+    "no_pattern_found": "no_pattern_found", "not_found": "no_pattern_found",
+    "not_observed": "no_pattern_found", "no_pattern": "no_pattern_found",
+}
 
-# The model selects the relevant months. The application then attaches exact
-# CSV values, so no model-generated field ID or value reaches bank staff.
-_EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
-    "dormancy_reactivation": ("txn_count_monthly",),
-    "activity_value_change": ("txn_count_monthly", "total_amount"),
-    "debit_credit_flow": ("debit_count_monthly", "credit_count_monthly", "monthly_debit", "monthly_credit"),
-    "burst_and_gaps": ("txn_count_monthly", "pct_burst", "pct_trx_gap"),
-}
-_CHECK_LABELS: dict[ReviewCheckName, str] = {
-    "dormancy_reactivation": "activity after an inactive period",
-    "activity_value_change": "activity/value change",
-    "debit_credit_flow": "debit/credit flow",
-    "burst_and_gaps": "burst/gap pattern",
-}
+_FALLBACK_HEADLINE = "The overall summary could not be produced. Review each check below."
+_FALLBACK_RISK_REASON = "No LLM risk decision was available, so the account is treated as medium risk until reviewed."
 
 
 class ModelOutputError(ValueError):
@@ -76,36 +92,33 @@ class ModelOutputError(ValueError):
 
 
 @dataclass(frozen=True)
-class _FlatCheck:
-    outcome: TransactionOutcome
-    context: str
+class _Check:
+    outcome: Outcome
+    insight: str
+    pattern: str
     months_text: str
 
 
 @dataclass(frozen=True)
-class _TransactionCall:
-    """One focused LLM call covering a fixed group of review checks.
-
-    Adding a check group means adding one of these; groups never share a prompt,
-    so a prompt change in one group cannot alter another group's answers.
-    """
+class _LlmCall:
+    """One focused LLM call. Calls never share a prompt, so changing one cannot alter another."""
 
     stage: str
     checks: tuple[ReviewCheckName, ...]
     system_prompt: str
     prompt_input: str
-    model_type: type["_RawCheckGroup"]
+    model_type: type[BaseModel]
     validator: Callable[[Any], Any]
 
 
 class AnalysisService:
-    """Concurrent, focused LLM calls with strict validation.
+    """Four focused LLM calls with strict validation.
 
-    Three calls run in parallel through the shared queue: activity/flow, timing
-    (dormancy and burst/gaps) and the customer profile. The model interprets the
-    data and judges risk; the application prepares labelled facts, validates the
-    answers against the source rows, and renders exact evidence. A failed call
-    only affects its own checks.
+    Calls 1-3 run concurrently through the shared queue: change in activity and amounts
+    with money in and out, activity after inactivity with burst and gaps, and the customer
+    profile. Call 4 then reads their checked results with the CSV rows, writes the overall
+    summary and decides the risk level. The model interprets; the application prepares
+    labelled facts, checks the answers against the CSV, and lays out exact evidence.
     """
 
     def __init__(self, llm: LlmClient, settings: Settings, llm_queue: LlmWorkQueue) -> None:
@@ -118,7 +131,7 @@ class AnalysisService:
         catalog = self._evidence_catalog(request, profile)
         monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
         run = self._inactivity_run(monthly)
-        calls = self._transaction_calls(request.case_id, monthly, catalog, run)
+        calls = self._pattern_calls(request.case_id, monthly, catalog, run)
 
         call_tasks = [
             asyncio.create_task(self._complete_with_retry(
@@ -142,276 +155,208 @@ class AnalysisService:
                 logger.error("Transaction call failed: case=%s stage=%s error=%s", request.case_id, call.stage, result)
             else:
                 results[call.stage] = result
+
+        checks = self._build_checks(calls, results, monthly, catalog, run)
         if not results:
-            return self._manual_review_fallback(request, profile_context)
+            return self._assessment(request, checks, None, profile_context)
+        summary = await self._overall_summary_or_none(request.case_id, monthly, run, checks, profile, profile_context)
+        return self._assessment(request, checks, summary, profile_context)
 
-        try:
-            return self._hydrate_assessment(request, calls, results, profile_context, catalog, run)
-        except ModelOutputError as exc:
-            logger.error("Transaction context could not be rendered: case=%s error=%s", request.case_id, exc)
-            return self._manual_review_fallback(request, profile_context)
-
-    def _transaction_calls(
+    def _pattern_calls(
         self, case_id: str, monthly: list[dict[str, Any]], catalog: dict[str, EvidenceItem],
         run: InactivityRun | None,
-    ) -> list[_TransactionCall]:
-        timing_prompt_input = timing_input(monthly, run, self._settings.dormancy_min_zero_months)
-        # Numbers the burst/gap insight may quote: months, counts, burst shares and gaps.
-        # Amounts are deliberately excluded: "pct_trx_gap is 10000.00" (seen in a log)
-        # quotes a real amount against the wrong field.
-        quotable = allowed_burst_gap_numbers(monthly)
+    ) -> list[_LlmCall]:
         return [
-            _TransactionCall(
-                stage="activity-flow-context",
-                checks=("activity_value_change", "debit_credit_flow"),
-                system_prompt=ACTIVITY_FLOW_SYSTEM_PROMPT,
-                prompt_input=activity_flow_input(monthly),
-                model_type=_RawActivityFlowContext,
-                validator=lambda raw: self._validate_activity_flow(raw, catalog, monthly),
+            _LlmCall(
+                stage="activity-money-context",
+                checks=("activity_and_amount_change", "money_in_and_out"),
+                system_prompt=ACTIVITY_MONEY_SYSTEM_PROMPT,
+                prompt_input=activity_money_input(monthly),
+                model_type=_RawActivityMoney,
+                validator=lambda raw: self._validate_activity_money(raw, catalog, monthly, case_id),
             ),
-            _TransactionCall(
-                stage="timing-context",
-                checks=("dormancy_reactivation", "burst_and_gaps"),
-                system_prompt=TIMING_SYSTEM_PROMPT,
-                prompt_input=timing_prompt_input,
-                model_type=_RawTimingContext,
-                validator=lambda raw: self._validate_timing(raw, catalog, monthly, run, quotable, case_id),
+            _LlmCall(
+                stage="inactivity-burst-gaps-context",
+                checks=("activity_after_inactivity", "burst_and_gaps"),
+                system_prompt=INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
+                prompt_input=inactivity_burst_gaps_input(monthly, run, self._settings.dormancy_min_zero_months),
+                model_type=_RawInactivityBurstGaps,
+                validator=lambda raw: self._validate_inactivity_burst_gaps(raw, catalog, monthly, run, case_id),
             ),
         ]
 
-    # --- validation -----------------------------------------------------------
+    # --- validation: calls 1 and 2 -------------------------------------------------
+    # Wrong months cost one retry (as before). A sentence or pattern name that does not
+    # match the CSV never costs a retry: only that sentence is hidden and logged, while
+    # the outcome, months and evidence table are kept.
 
-    def _validate_activity_flow(
-        self, raw: "_RawActivityFlowContext", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
-    ) -> "_RawActivityFlowContext":
-        """Unchanged activity/flow checks: real, chronological months that show a change."""
+    def _validate_activity_money(
+        self, raw: "_RawActivityMoney", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]], case_id: str,
+    ) -> "_RawActivityMoney":
         known_months = self._known_months(catalog)
         by_month = {row["year_month"]: row for row in monthly}
-        for name, check in raw.checks().items():
-            if check.outcome == "observed" and not check.context.strip():
-                raise ModelOutputError(f"{name} is observed but has no context")
-            self._reject_forbidden_text(check.context, _FORBIDDEN_TRANSACTION_TEXT, f"{name} context")
-            months = self._months_for_check(check, f"{name} months")
-            self._validate_transaction_months(months, known_months, name)
-            if not months:
-                continue
-            if months != sorted(months):
-                raise ModelOutputError(f"{name} months must be chronological")
-            first, second = (by_month[month] for month in months)
-            fields = _EVIDENCE_FIELDS[name]
-            unchanged = all(Decimal(str(first[field])) == Decimal(str(second[field])) for field in fields)
-            persistent_one_sided = name == "debit_credit_flow" and (
-                (first["debit_count_monthly"] > 0 and second["debit_count_monthly"] > 0
-                 and first["credit_count_monthly"] == second["credit_count_monthly"] == 0)
-                or (first["credit_count_monthly"] > 0 and second["credit_count_monthly"] > 0
-                    and first["debit_count_monthly"] == second["debit_count_monthly"] == 0)
-            )
-            if unchanged and not persistent_one_sided:
-                raise ModelOutputError(f"{name} selected months show no change in the cited fields")
-        return self._unjudged_risk_to_medium(raw, "activity-flow")
-
-    @staticmethod
-    def _unjudged_risk_to_medium(raw: Any, group: str) -> Any:
-        """No valid risk_level even after the retry means the model made no risk judgement.
-
-        An unjudged account must never be closed, so this call counts as medium (logged).
-        Any valid risk_level from the model is always used as given.
-        """
-        if not raw.risk_was_missing:
-            return raw
-        logger.warning("risk_level still invalid after retry: group=%s counted as medium", group)
-        return raw.model_copy(update={"risk_level": "medium"})
-
-    def _validate_timing(
-        self, raw: "_RawTimingContext", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
-        run: InactivityRun | None, quotable: set[Decimal], case_id: str,
-    ) -> "_RawTimingContext":
-        """Check the timing answer; repair what can be repaired without the model.
-
-        - Dormancy is not asked of the model: the computed INACTIVITY_RUN is given to it
-          as a fact and shown to staff directly. The model uses it to judge risk.
-        - Burst/gap months must be real and chronological (a retry is worthwhile).
-        - The burst/gap insight may only quote months, counts, burst shares and gaps, and
-          must not contradict them. Otherwise only the insight is hidden and factual text
-          is shown instead: no error and no retry.
-        """
         updates: dict[str, Any] = {}
-        if raw.burst_gap_outcome == "observed":
-            months = self._split_months(raw.burst_gap_months, "burst_and_gaps months", min_count=1, max_count=2)
+        for name, prefix in (("activity_and_amount_change", "activity"), ("money_in_and_out", "money_flow")):
+            check = raw.checks()[name]
+            if check.outcome == "no_pattern_found":
+                updates[f"{prefix}_months"], updates[f"{prefix}_pattern"] = _NO_MONTHS, "none"
+                months: list[str] = []
+            else:
+                months = self._split_months(check.months_text, f"{name} months", min_count=2, max_count=2)
+                self._validate_transaction_months(months, known_months, name)
+                if months != sorted(months):
+                    raise ModelOutputError(f"{name} months must be chronological")
+                first, second = (by_month[month] for month in months)
+                fields = _EVIDENCE_FIELDS[name]
+                unchanged = all(Decimal(str(first[field])) == Decimal(str(second[field])) for field in fields)
+                persistent_one_sided = name == "money_in_and_out" and (
+                    (first["debit_count_monthly"] > 0 and second["debit_count_monthly"] > 0
+                     and first["credit_count_monthly"] == second["credit_count_monthly"] == 0)
+                    or (first["credit_count_monthly"] > 0 and second["credit_count_monthly"] > 0
+                        and first["debit_count_monthly"] == second["debit_count_monthly"] == 0)
+                )
+                if unchanged and not persistent_one_sided:
+                    raise ModelOutputError(f"{name} selected months show no change in the cited fields")
+                updates[f"{prefix}_months"] = ",".join(months)
+                problem = pattern_problem(name, check.pattern, monthly, months)
+                if problem:
+                    logger.warning("Insight hidden: case=%s check=%s reason=%s", case_id, name, problem)
+                    updates[f"{prefix}_pattern"], updates[f"{prefix}_insight"] = "none", ""
+                    continue
+            allowed = quotable_numbers(monthly, months, _INSIGHT_FIELDS[name])
+            problem = self._text_problem(check.insight, allowed)
+            if problem:
+                logger.warning("Insight hidden: case=%s check=%s reason=%s", case_id, name, problem)
+                updates[f"{prefix}_insight"] = ""
+        return raw.model_copy(update=updates)
+
+    def _validate_inactivity_burst_gaps(
+        self, raw: "_RawInactivityBurstGaps", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
+        run: InactivityRun | None, case_id: str,
+    ) -> "_RawInactivityBurstGaps":
+        updates: dict[str, Any] = {}
+        # Activity after inactivity is a computed fact; the model only explains it.
+        if run is None:
+            updates["inactivity_insight"] = ""
+        else:
+            problem = self._text_problem(raw.inactivity_insight, self._inactivity_numbers(run, monthly))
+            if problem:
+                logger.warning("Insight hidden: case=%s check=activity_after_inactivity reason=%s", case_id, problem)
+                updates["inactivity_insight"] = ""
+
+        months: list[str] = []
+        if raw.burst_gaps_outcome == "pattern_found":
+            months = self._split_months(raw.burst_gaps_months, "burst_and_gaps months", min_count=1, max_count=2)
             self._validate_transaction_months(months, self._known_months(catalog), "burst_and_gaps")
             if months != sorted(months):
                 raise ModelOutputError("burst_and_gaps months must be chronological")
-            updates["burst_gap_months"] = ",".join(months)
+            updates["burst_gaps_months"] = ",".join(months)
+            problem = pattern_problem("burst_and_gaps", raw.burst_gaps_pattern, monthly, months)
+            if problem:
+                logger.warning("Insight hidden: case=%s check=burst_and_gaps reason=%s", case_id, problem)
+                updates["burst_gaps_pattern"], updates["burst_gaps_insight"] = "none", ""
+                return raw.model_copy(update=updates)
         else:
-            updates["burst_gap_months"] = _NO_EVIDENCE_MONTHS
-
-        problem = self._insight_problem(raw.burst_gap_insight, quotable, monthly)
+            updates["burst_gaps_months"], updates["burst_gaps_pattern"] = _NO_MONTHS, "none"
+        problem = self._text_problem(raw.burst_gaps_insight, allowed_burst_gap_numbers(monthly))
+        lowered = raw.burst_gaps_insight.casefold()
+        if not problem and has_burst(monthly) and _SAYS_NO_BURST.search(lowered):
+            problem = "says no burst, but a month has burst share above 0%"
+        if not problem and not has_in_month_gap(monthly) and _SAYS_EVEN_SPACING.search(lowered):
+            problem = "describes spacing, but no month has 2 or more transactions"
         if problem:
-            logger.warning("Burst/gap insight replaced with factual text: case=%s reason=%s", case_id, problem)
-            updates["burst_gap_insight"] = ""
-        checked = raw.model_copy(update=updates)
-        checked.risk_was_missing = raw.risk_was_missing
-        return self._unjudged_risk_to_medium(checked, "timing")
+            logger.warning("Insight hidden: case=%s check=burst_and_gaps reason=%s", case_id, problem)
+            updates["burst_gaps_insight"] = ""
+        return raw.model_copy(update=updates)
+
+    def _inactivity_numbers(self, run: InactivityRun, monthly: list[dict[str, Any]]) -> set[Decimal]:
+        fields = ("txn_count_monthly", "debit_count_monthly", "credit_count_monthly", "total_amount",
+                  "max_amount", "monthly_debit", "monthly_credit", "pct_trx_gap")
+        allowed = quotable_numbers(monthly, [run.active_month], fields)
+        extra = {Decimal(run.zero_months), Decimal(run.later_transactions), run.later_total,
+                 Decimal(str(self._settings.dormancy_review_single_amount)),
+                 Decimal(str(self._settings.dormancy_review_month_total))}
+        return allowed | {value.normalize() for value in extra} | numbers_in_text(" ".join(map(str, extra)))
 
     @staticmethod
-    def _insight_problem(text: str, quotable: set[Decimal], monthly: list[dict[str, Any]]) -> str | None:
-        """Why an LLM insight cannot be shown, or None when it is grounded and neutral."""
+    def _text_problem(text: str, allowed: set[Decimal]) -> str | None:
+        """Why a model sentence cannot be shown, or None when it is grounded and neutral."""
         if not text.strip():
-            return "empty"
+            return None
         lowered = text.casefold()
-        if any(phrase in lowered for phrase in _FORBIDDEN_INSIGHT_TEXT):
+        if any(phrase in lowered for phrase in _FORBIDDEN_TEXT):
             return "prohibited wording"
-        if has_burst(monthly) and _SAYS_NO_BURST.search(lowered):
-            return "says no burst, but a month has burst share above 0%"
-        if not has_in_month_gap(monthly) and _SAYS_EVEN_SPACING.search(lowered):
-            return "describes spacing, but no month has 2 or more transactions"
-        for token in _NUMBER_TOKEN.findall(text):
-            try:
-                value = Decimal(token.replace(",", "")).normalize()
-            except InvalidOperation:
-                return f"unreadable number {token}"
-            if value not in quotable:
-                return f"number is not a month, count, burst share or gap: {token}"
-        return None
+        token = unquotable_number(text, allowed)
+        return f"number not in the figures for these months: {token}" if token else None
 
-    @staticmethod
-    def _known_months(catalog: dict[str, EvidenceItem]) -> set[str]:
-        return {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
+    # --- building the checks ---------------------------------------------------------
 
-    # --- rendering ------------------------------------------------------------
+    def _build_checks(
+        self, calls: list[_LlmCall], results: dict[str, Any], monthly: list[dict[str, Any]],
+        catalog: dict[str, EvidenceItem], run: InactivityRun | None,
+    ) -> list[ReviewCheck]:
+        stage_of = {name: call.stage for call in calls for name in call.checks}
+        return [self._build_check(name, results.get(stage_of[name]), monthly, catalog, run) for name in _CHECK_ORDER]
 
-    def _hydrate_assessment(
-        self, request: AccountAnalysisRequest, calls: list[_TransactionCall], results: dict[str, Any],
-        profile_context: CustomerProfileContext | None, catalog: dict[str, EvidenceItem],
-        run: InactivityRun | None,
-    ) -> AccountAssessment:
-        monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
-        group_of = {name: call for call in calls for name in call.checks}
-        review_checks: list[ReviewCheck] = []
-        findings: list[AccountFinding] = []
-        failed: list[ReviewCheckName] = []
-        for name in _CHECK_ORDER:
-            raw = results.get(group_of[name].stage)
-            if raw is None:
-                failed.append(name)
-                review_checks.append(ReviewCheck(
-                    check=name, outcome="insufficient_data",
-                    rationale="This check's LLM output could not be verified; review the monthly rows directly.",
-                ))
-                continue
-            outcome, rationale, evidence = self._render_check(name, raw, monthly, catalog, run)
-            review_checks.append(ReviewCheck(check=name, outcome=outcome, rationale=rationale, evidence=evidence))
-            # The model's own risk for this group decides whether an observed pattern is
-            # a finding: a low-risk group shows its patterns as review checks only.
-            if outcome == "observed" and raw.risk_level != "low" and evidence:
-                findings.append(AccountFinding(
-                    finding_id=str(uuid4()), category=name,
-                    severity="high" if raw.risk_level == "high" else "medium",
-                    rationale=rationale, evidence=evidence,
-                ))
-
-        # Overall risk is the highest group risk. A group that could not be verified
-        # counts as medium so the case is never closed on partial evidence.
-        risks = [results[call.stage].risk_level if call.stage in results else "medium" for call in calls]
-        risk_level = max(risks, key=_RISK_ORDER.__getitem__)
-        complete = not failed
-        limitations = self._static_limitations()
-        if failed:
-            limitations.append(AssessmentLimitation(limitation=(
-                "Not verified by the LLM: " + ", ".join(_CHECK_LABELS[name] for name in failed)
-                + ". An authorised reviewer must assess these checks from the supplied data."
-            )))
-        return AccountAssessment(
-            case_id=request.case_id, acct_num=request.acct_num,
-            status="completed" if complete else "needs_review",
-            decision="close_case" if complete and risk_level == "low" else "continue_due_diligence",
-            risk_level=risk_level, executive_summary=self._checked_executive_summary(review_checks),
-            review_checks=review_checks, findings=findings, reviewer_questions=[],
-            customer_profile_context=profile_context, limitations=limitations,
-            months_reviewed=len(request.monthly_summary), profile_records_matched=len(request.customer_profile),
-            generated_at=datetime.now(timezone.utc),
-        )
-
-    def _render_check(
+    def _build_check(
         self, name: ReviewCheckName, raw: Any, monthly: list[dict[str, Any]],
         catalog: dict[str, EvidenceItem], run: InactivityRun | None,
-    ) -> tuple[TransactionOutcome, str, list[EvidenceItem]]:
-        if name == "dormancy_reactivation":
-            if run is not None:
-                ids = [
-                    f"M{run.zero_start}.txn_count_monthly", f"M{run.zero_end}.txn_count_monthly",
-                    f"M{run.active_month}.txn_count_monthly", f"M{run.active_month}.total_amount",
-                    f"M{run.active_month}.max_amount", f"M{run.active_month}.monthly_debit",
-                    f"M{run.active_month}.monthly_credit",
-                ]
-                evidence = self._resolve(list(dict.fromkeys(ids)), catalog, name)
-                return "observed", dormancy_rationale(run), evidence
-            return "not_observed", no_inactivity_rationale(self._settings.dormancy_min_zero_months), []
-
-        if name == "burst_and_gaps":
-            months = [] if raw.burst_gap_outcome != "observed" else raw.burst_gap_months.split(",")
-            insight = raw.burst_gap_insight.strip()
-            facts = burst_gap_pair_facts(monthly, months) if months else burst_gap_six_month_context(monthly)
-            rationale = self._fit(insight, facts) if insight else (
-                facts if not months else self._fit("Timing pattern selected for staff review.", facts)
+    ) -> ReviewCheck:
+        if raw is None:
+            return ReviewCheck(
+                check=name, title=_CHECK_TITLES[name], outcome="not_verified",
+                facts="The LLM result for this check could not be verified. Review the figures below directly.",
+                table=self._table(name, monthly, []),
             )
-            # Evidence is always attached so staff can see the burst share and gap figures:
-            # the selected months, or else the peak burst month and the longest gap month.
+        if name == "activity_after_inactivity":
+            if run is None:
+                return ReviewCheck(
+                    check=name, title=_CHECK_TITLES[name], outcome="no_pattern_found",
+                    facts=no_inactivity_rationale(self._settings.dormancy_min_zero_months),
+                    table=self._table(name, monthly, []),
+                )
+            run_months = [row["year_month"] for row in monthly if run.zero_start <= row["year_month"] <= run.active_month]
+            ids = [
+                f"M{run.zero_start}.txn_count_monthly", f"M{run.zero_end}.txn_count_monthly",
+                f"M{run.active_month}.txn_count_monthly", f"M{run.active_month}.total_amount",
+                f"M{run.active_month}.max_amount", f"M{run.active_month}.monthly_debit",
+                f"M{run.active_month}.monthly_credit",
+            ]
+            return ReviewCheck(
+                check=name, title=_CHECK_TITLES[name], outcome="pattern_found",
+                insight=raw.inactivity_insight.strip() or None, months=[run.zero_start, run.active_month],
+                facts=dormancy_rationale(run), table=self._table(name, monthly, run_months),
+                evidence=self._resolve(list(dict.fromkeys(ids)), catalog, name),
+            )
+        if name == "burst_and_gaps":
+            months = [] if raw.burst_gaps_outcome != "pattern_found" else raw.burst_gaps_months.split(",")
+            facts = burst_gap_pair_facts(monthly, months) if months else burst_gap_six_month_context(monthly)
             evidence_months = months or burst_gap_evidence_months(monthly)
-            return raw.burst_gap_outcome, rationale, self._evidence_for_months(name, evidence_months, catalog)
-
+            return ReviewCheck(
+                check=name, title=_CHECK_TITLES[name], outcome=raw.burst_gaps_outcome,
+                pattern=_PATTERN_LABELS.get(raw.burst_gaps_pattern), months=months,
+                insight=raw.burst_gaps_insight.strip() or None, facts=facts,
+                table=self._table(name, monthly, months),
+                evidence=self._evidence_for_months(name, evidence_months, catalog),
+            )
         check = raw.checks()[name]
-        months = self._months_for_check(check, f"{name} months")
-        if name == "activity_value_change":
-            rationale = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
+        months = [] if check.outcome != "pattern_found" else check.months_text.split(",")
+        if name == "activity_and_amount_change":
+            facts = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
         else:
-            rationale = flow_pair_context(monthly, months) if months else flow_six_month_context(monthly)
-        return check.outcome, rationale, self._evidence_for_months(name, months, catalog)
-
-    @staticmethod
-    def _fit(lead: str, facts: str) -> str:
-        """Join an insight with its facts; keep the facts if the pair is too long."""
-        joined = f"{lead} {facts}"
-        return joined if len(joined) <= _RATIONALE_LIMIT else facts[:_RATIONALE_LIMIT]
-
-    @staticmethod
-    def _checked_executive_summary(review_checks: list[ReviewCheck]) -> str:
-        observed = [_CHECK_LABELS[item.check] for item in review_checks if item.outcome == "observed"]
-        unverified = [_CHECK_LABELS[item.check] for item in review_checks if item.outcome == "insufficient_data"]
-        summary = (
-            "Six-month review identified " + ", ".join(observed) + " for staff review."
-            if observed else "No material transaction pattern was selected from the six monthly rows."
+            facts = flow_pair_context(monthly, months) if months else flow_six_month_context(monthly)
+        return ReviewCheck(
+            check=name, title=_CHECK_TITLES[name], outcome=check.outcome,
+            pattern=_PATTERN_LABELS.get(check.pattern), months=months,
+            insight=check.insight.strip() or None, facts=facts,
+            table=self._table(name, monthly, months),
+            evidence=self._evidence_for_months(name, months, catalog),
         )
-        if unverified:
-            summary += " Not verified: " + ", ".join(unverified) + "."
-        return summary
 
     @staticmethod
-    def _split_months(value: str, label: str, min_count: int = 2, max_count: int | None = None) -> list[str]:
-        """Accept source months such as ``202607,202608`` or ``M202607_M202608``.
-
-        This fixes punctuation only; it never derives a month or invents a value.
-        """
-        months: list[str] = []
-        for token in re.split(r"[,_;\s]+", value.strip()):
-            if not token:
-                continue
-            match = _MONTH_TOKEN.fullmatch(token)
-            if match is None:
-                raise ModelOutputError(f"{label} contains an invalid month: {token}")
-            if match.group(1) not in months:
-                months.append(match.group(1))
-        if len(months) < min_count or (max_count is not None and len(months) > max_count):
-            expected = f"{min_count}" if max_count == min_count else f"{min_count}-{max_count or 'n'}"
-            raise ModelOutputError(f"{label} must contain {expected} distinct YYYYMM values")
-        return months
-
-    @classmethod
-    def _months_for_check(cls, check: _FlatCheck, label: str) -> list[str]:
-        """Permit no focused evidence only for a negative model conclusion."""
-        if check.outcome == "not_observed" and check.months_text.strip().casefold() == _NO_EVIDENCE_MONTHS:
-            return []
-        return cls._split_months(check.months_text, label, min_count=2, max_count=2)
+    def _table(name: ReviewCheckName, monthly: list[dict[str, Any]], highlight: list[str]) -> EvidenceTable:
+        columns, rows, highlighted = check_table(name, monthly, highlight)
+        return EvidenceTable(columns=columns, rows=rows, highlighted_rows=highlighted)
 
     def _evidence_for_months(
         self, name: ReviewCheckName, months: list[str], catalog: dict[str, EvidenceItem],
@@ -419,7 +364,170 @@ class AnalysisService:
         ids = [f"M{month}.{field}" for month in months for field in _EVIDENCE_FIELDS[name]]
         return self._resolve(ids, catalog, name)
 
-    # --- unchanged helpers (LLM plumbing, profile, evidence) -------------------
+    # --- call 4: overall summary and risk --------------------------------------------
+
+    async def _overall_summary_or_none(
+        self, case_id: str, monthly: list[dict[str, Any]], run: InactivityRun | None, checks: list[ReviewCheck],
+        profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None,
+    ) -> "tuple[OverallSummary, RiskLevel] | None":
+        prompt_input = overall_summary_input(
+            monthly, run, self._settings.dormancy_min_zero_months,
+            [self._check_line(check) for check in checks],
+            [check.check for check in checks if check.outcome == "not_verified"],
+            self._profile_lines(profile, profile_context),
+        )
+        quotable = numbers_in_text(prompt_input)
+        try:
+            raw = await self._complete_with_retry(
+                case_id, "overall-summary", OVERALL_SUMMARY_SYSTEM_PROMPT, prompt_input, _RawOverallSummary,
+                self._settings.llm_summary_max_response_tokens,
+                lambda value: self._validate_overall_summary(value, quotable, case_id),
+            )
+        except Exception as exc:  # the report must still be shown without the summary
+            logger.error("Overall summary failed: case=%s error=%s", case_id, exc)
+            return None
+        points = list(dict.fromkeys(point for point in (raw.point_1, raw.point_2, raw.point_3) if point))
+        summary = OverallSummary(
+            verified=True, headline=raw.headline, points=points, why_it_matters=raw.why_it_matters or None,
+            verify_first=[item for item in (raw.verify_1, raw.verify_2) if item], risk_reason=raw.risk_reason,
+        )
+        return summary, raw.risk_level
+
+    def _validate_overall_summary(
+        self, raw: "_RawOverallSummary", quotable: set[Decimal], case_id: str,
+    ) -> "_RawOverallSummary":
+        """Drop any line that quotes a figure not in the input or uses alleging wording.
+
+        A dropped headline is replaced by the first remaining point. Only a summary with
+        nothing usable left (or no risk reason / verify step) costs the one retry.
+        """
+        updates: dict[str, Any] = {}
+        for field in _RawOverallSummary.TEXT_FIELDS:
+            problem = self._text_problem(getattr(raw, field), quotable)
+            if problem:
+                logger.warning("Summary line dropped: case=%s field=%s reason=%s", case_id, field, problem)
+                updates[field] = ""
+        checked = raw.model_copy(update=updates)
+        points = [point for point in (checked.point_1, checked.point_2, checked.point_3) if point]
+        if not checked.headline and points:
+            checked = checked.model_copy(update={"headline": points[0]})
+            points = points[1:]
+        checked = checked.model_copy(update=dict(zip(("point_1", "point_2", "point_3"), points + ["", "", ""])))
+        missing = [field for field in ("headline", "verify_1", "risk_reason") if not getattr(checked, field)]
+        if not checked.verify_1 and checked.verify_2:
+            checked, missing = checked.model_copy(update={"verify_1": checked.verify_2, "verify_2": ""}), \
+                [field for field in missing if field != "verify_1"]
+        if missing:
+            raise ModelOutputError(f"overall summary has no usable {', '.join(missing)}")
+        return checked
+
+    @staticmethod
+    def _check_line(check: ReviewCheck) -> str:
+        months = ",".join(check.months) or "none"
+        return (
+            f"CHECK|{check.check}|{check.outcome}|pattern={check.pattern or 'none'}|months={months}|"
+            f"insight={check.insight or 'none'}|facts={check.facts}"
+        )
+
+    @staticmethod
+    def _profile_lines(
+        profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None,
+    ) -> list[str]:
+        if not profile:
+            return []
+        latest = profile[-1]
+        lines = [
+            f"PROFILE|occupation={latest.get('occupation') or 'unknown'}|citizenship={latest.get('citizenship') or 'unknown'}|"
+            f"individual_or_organisation={latest.get('indv_org_type') or 'unknown'}|"
+            f"effective_from={latest.get('valid_from_dttm') or 'unknown'}|versions={len(profile)}"
+        ]
+        if profile_context is not None:
+            lines.append(f"PROFILE_SUMMARY|{profile_context.summary}")
+        return lines
+
+    def _assessment(
+        self, request: AccountAnalysisRequest, checks: list[ReviewCheck],
+        summary: "tuple[OverallSummary, RiskLevel] | None", profile_context: CustomerProfileContext | None,
+    ) -> AccountAssessment:
+        all_checks_verified = all(check.outcome != "not_verified" for check in checks)
+        if summary is None:
+            overall, risk_level = OverallSummary(
+                verified=False, headline=_FALLBACK_HEADLINE, risk_reason=_FALLBACK_RISK_REASON,
+            ), "medium"
+        else:
+            overall, risk_level = summary
+        complete = overall.verified and all_checks_verified
+        decision: Decision = (
+            "no_further_review_suggested" if complete and risk_level == "low" else "further_review_suggested"
+        )
+        limitations = self._static_limitations()
+        unverified = [check.title for check in checks if check.outcome == "not_verified"]
+        if unverified:
+            limitations.append(AssessmentLimitation(limitation=(
+                "Not verified by the LLM: " + ", ".join(unverified)
+                + ". An authorised reviewer must assess these checks from the figures shown."
+            )))
+        if not overall.verified:
+            limitations.append(AssessmentLimitation(
+                limitation="The overall summary could not be produced, so no LLM risk decision is available.",
+            ))
+        return AccountAssessment(
+            case_id=request.case_id, acct_num=request.acct_num,
+            status="completed" if complete else "needs_review", decision=decision, risk_level=risk_level,
+            overall=overall, review_checks=checks, customer_profile_context=profile_context,
+            limitations=limitations, months_reviewed=len(request.monthly_summary),
+            profile_records_matched=len(request.customer_profile), generated_at=datetime.now(timezone.utc),
+        )
+
+    # --- profile -------------------------------------------------------------------------
+
+    def _hydrate_profile_context(
+        self, raw: "_RawProfileContext", catalog: dict[str, EvidenceItem],
+        profile: list[dict[str, str | None]], monthly: list[dict[str, Any]],
+    ) -> CustomerProfileContext:
+        latest = profile[-1]
+        peak = max(monthly, key=lambda row: Decimal(str(row["total_amount"])))
+        peak_single = max(monthly, key=lambda row: Decimal(str(row["max_amount"])))
+        party_type = {"I": "Individual", "O": "Organisation"}.get(latest.get("indv_org_type") or "", latest.get("indv_org_type") or "-")
+        rows = [
+            ["Occupation", latest.get("occupation") or "-"],
+            ["Citizenship", latest.get("citizenship") or "-"],
+            ["Individual / organisation", party_type],
+            ["Profile effective from", (latest.get("valid_from_dttm") or "-")[:10]],
+            ["Profile last maintained", (latest.get("last_maint_dt") or "-")[:10]],
+            ["Profile versions supplied", str(len(profile))],
+            ["Highest monthly total", f"{peak['year_month']}: {Decimal(str(peak['total_amount'])):,.2f}"],
+            ["Largest single amount", f"{peak_single['year_month']}: {Decimal(str(peak_single['max_amount'])):,.2f}"],
+        ]
+        return CustomerProfileContext(
+            summary=raw.profile_summary,
+            table=EvidenceTable(columns=["Field", "Value"], rows=rows),
+            evidence=self._canonical_profile_evidence(catalog, profile, monthly),
+        )
+
+    # --- LLM plumbing -------------------------------------------------------------------
+
+    async def _ask(
+        self, case_id: str, stage: str, system_prompt: str, prompt_input: str,
+        model_type: type[ModelType], max_response_tokens: int,
+    ) -> ModelType:
+        result = await self._llm_queue.submit(
+            name=f"case={case_id} stage={stage}",
+            operation=lambda: self._llm.complete_json(
+                system_prompt=system_prompt, user_payload=prompt_input,
+                response_schema=model_type.model_json_schema(), schema_name=stage.replace("-", "_"),
+                max_response_tokens=max_response_tokens,
+            ),
+        )
+        prepare = getattr(model_type, "prepare_payload", None)
+        if prepare is not None:
+            result = prepare(result)
+        try:
+            return model_type.model_validate(result)
+        except ValidationError as exc:
+            raise ModelOutputError(f"{stage} output did not meet the required schema: {exc}") from exc
+
+    # --- unchanged helpers (LLM retry, profile, evidence) ----------------------------
 
     async def _profile_context_or_none(
         self, case_id: str, profile: list[dict[str, str | None]], monthly: list[dict[str, Any]],
@@ -466,31 +574,6 @@ class AnalysisService:
                 logger.warning("Retry output rejected: case=%s stage=%s error=%s", case_id, stage, second_error)
                 raise ModelOutputError(f"{stage} did not produce a verifiable result after one format retry.") from second_error
 
-    async def _ask(
-        self, case_id: str, stage: str, system_prompt: str, prompt_input: str,
-        model_type: type[ModelType], max_response_tokens: int,
-    ) -> ModelType:
-        result = await self._llm_queue.submit(
-            name=f"case={case_id} stage={stage}",
-            operation=lambda: self._llm.complete_json(
-                system_prompt=system_prompt, user_payload=prompt_input,
-                response_schema=model_type.model_json_schema(), schema_name=stage.replace("-", "_"),
-                max_response_tokens=max_response_tokens,
-            ),
-        )
-        prepare = getattr(model_type, "prepare_payload", None)
-        final_attempt = stage.endswith("-format-retry") or not self._settings.llm_format_retry_enabled
-        risk_was_missing = False
-        if prepare is not None:
-            result, risk_was_missing = prepare(result, final_attempt=final_attempt)
-        try:
-            parsed = model_type.model_validate(result)
-        except ValidationError as exc:
-            raise ModelOutputError(f"{stage} output did not meet the required schema: {exc}") from exc
-        if risk_was_missing:
-            parsed.risk_was_missing = True
-        return parsed
-
     def _inactivity_run(self, monthly: list[dict[str, Any]]) -> InactivityRun | None:
         settings = self._settings
         return find_inactivity_run(
@@ -502,19 +585,36 @@ class AnalysisService:
     def _validate_profile_context(self, raw: "_RawProfileContext") -> None:
         self._reject_forbidden_text(raw.profile_summary, _FORBIDDEN_PROFILE_TEXT, "profile summary")
 
-    def _hydrate_profile_context(
-        self, raw: "_RawProfileContext", catalog: dict[str, EvidenceItem],
-        profile: list[dict[str, str | None]], monthly: list[dict[str, Any]],
-    ) -> CustomerProfileContext:
-        return CustomerProfileContext(
-            summary=raw.profile_summary,
-            evidence=self._canonical_profile_evidence(catalog, profile, monthly),
-        )
-
     @staticmethod
     def _reject_forbidden_text(value: str, phrases: tuple[str, ...], label: str) -> None:
         if any(phrase in value.casefold() for phrase in phrases):
             raise ModelOutputError(f"{label} contains a prohibited missing-data phrase")
+
+    @staticmethod
+    def _split_months(value: str, label: str, min_count: int = 2, max_count: int | None = None) -> list[str]:
+        """Accept source months such as ``202607,202608`` or ``M202607_M202608``.
+
+        This fixes punctuation only; it never derives a month or invents a value.
+        """
+        months: list[str] = []
+        for token in re.split(r"[,_;\s]+", value.strip()):
+            if not token:
+                continue
+            match = _MONTH_TOKEN.fullmatch(token)
+            if match is None:
+                raise ModelOutputError(f"{label} contains an invalid month: {token}")
+            if match.group(1) not in months:
+                months.append(match.group(1))
+        if len(months) < min_count or (max_count is not None and len(months) > max_count):
+            expected = f"{min_count}" if max_count == min_count else f"{min_count}-{max_count or 'n'}"
+            raise ModelOutputError(f"{label} must contain {expected} distinct YYYYMM values")
+        return months
+
+    @staticmethod
+    def _known_months(catalog: dict[str, EvidenceItem]) -> set[str]:
+        return {item_id[1:7] for item_id in catalog if item_id.startswith("M")}
+
+    # --- rendering ------------------------------------------------------------
 
     @staticmethod
     def _validate_transaction_months(months: list[str], known_months: set[str], name: ReviewCheckName) -> None:
@@ -573,20 +673,6 @@ class AnalysisService:
             AssessmentLimitation(limitation="LLM output is decision support and requires authorised human review."),
         ]
 
-    def _manual_review_fallback(
-        self, request: AccountAnalysisRequest, profile_context: CustomerProfileContext | None = None,
-    ) -> AccountAssessment:
-        checks = [ReviewCheck(check=name, outcome="insufficient_data", rationale="Transaction context could not be verified; no conclusion is shown.") for name in _CHECK_ORDER]
-        return AccountAssessment(
-            case_id=request.case_id, acct_num=request.acct_num, status="needs_review",
-            decision="continue_due_diligence", risk_level="medium",
-            executive_summary="The LLM did not produce a verifiable transaction summary. Do not close this case on the basis of this result.",
-            review_checks=checks, findings=[], reviewer_questions=[], customer_profile_context=profile_context,
-            limitations=self._static_limitations() + [AssessmentLimitation(limitation="Transaction-context LLM output verification failed; an authorised reviewer must assess the supplied data directly.")],
-            months_reviewed=len(request.monthly_summary), profile_records_matched=len(request.customer_profile),
-            generated_at=datetime.now(timezone.utc),
-        )
-
     def _profile_records_for_llm(self, records: list[CustomerProfileRecord]) -> list[dict[str, str | None]]:
         profile: list[dict[str, str | None]] = []
         resolved_labels = 0
@@ -632,88 +718,111 @@ class AnalysisService:
         return catalog
 
 
-class _RawCheckGroup(BaseModel):
-    """Shared behaviour for the flat JSON answer of one check-group call."""
+def _cap(text: str, limit: int) -> str:
+    """Shorten text to ``limit`` characters at a word boundary."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(",;: ")
+    return cut + "..."
+
+
+class _RawAnswer(BaseModel):
+    """Shared repairs for the flat JSON answer of one call. Repairs never change a decision."""
 
     model_config = ConfigDict(extra="forbid")
-    risk_level: RiskLevel
-    # Free-text keys that are capped rather than rejected when too long.
-    _TEXT_LIMITS: ClassVar[dict[str, int]] = {}
-    # Outcome keys whose spelling is normalised ("Not observed" -> "not_observed").
     _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ()
-    _risk_was_missing: bool = PrivateAttr(default=False)
-
-    @property
-    def risk_was_missing(self) -> bool:
-        """True when the model gave no valid risk_level even after the retry."""
-        return self._risk_was_missing
-
-    @risk_was_missing.setter
-    def risk_was_missing(self, value: bool) -> None:
-        self._risk_was_missing = value
+    _PATTERN_KEYS: ClassVar[tuple[str, ...]] = ()
+    _TEXT_LIMITS: ClassVar[dict[str, int]] = {}
 
     @classmethod
-    def prepare_payload(cls, payload: Any, *, final_attempt: bool) -> tuple[Any, bool]:
-        """Repair harmless formatting; return (payload, risk_was_missing).
+    def prepare_payload(cls, payload: Any) -> Any:
+        """Repair harmless formatting so it does not cost a retry.
 
-        - Unexpected keys are ignored (logged); outcome spelling is normalised; an
-          empty *_months value becomes "none"; text over its limit is cut (activity/flow
-          context is never displayed and the timing insight is re-checked).
-        - An invalid risk_level (e.g. ``not_observed``) usually means the model did not
-          read the facts, so the first time it costs one retry. If the retry also has no
-          valid risk_level, the call counts as medium so the case cannot be closed.
+        Unexpected keys are dropped (logged); outcome spelling such as "Pattern found" or
+        "observed" is normalised; pattern names are lower-cased; an empty *_months becomes
+        "none"; "none"/empty text becomes ""; text over its limit is shortened at a word.
         """
         if not isinstance(payload, dict):
-            return payload, False
+            return payload
         extra = sorted(set(payload) - set(cls.model_fields))
         if extra:
             logger.warning("Ignoring unexpected key(s) from the model: %s", ", ".join(extra))
         payload = {key: value for key, value in payload.items() if key in cls.model_fields}
         for key in cls._OUTCOME_KEYS:
             if isinstance(payload.get(key), str):
-                payload[key] = re.sub(r"[\s-]+", "_", payload[key].strip().lower())
+                spelled = re.sub(r"[\s-]+", "_", payload[key].strip().lower())
+                payload[key] = _OUTCOME_SYNONYMS.get(spelled, spelled)
+        for key in cls._PATTERN_KEYS:
+            if isinstance(payload.get(key), str):
+                payload[key] = re.sub(r"[\s-]+", "_", payload[key].strip().lower()) or "none"
         for key in cls.model_fields:
             if key.endswith("_months") and isinstance(payload.get(key), str) and not payload[key].strip():
-                payload[key] = _NO_EVIDENCE_MONTHS
+                payload[key] = _NO_MONTHS
         for key, limit in cls._TEXT_LIMITS.items():
             value = payload.get(key)
-            if isinstance(value, str) and len(value) > limit:
-                payload[key] = value[:limit].rstrip()
-        risk = str(payload.get("risk_level", "")).strip().lower()
-        if risk in _RISK_ORDER:
-            payload["risk_level"] = risk
-            return payload, False
-        if not final_attempt:
-            raise ModelOutputError(f"risk_level {risk!r} is not low, medium or high")
-        payload["risk_level"] = "medium"  # the model made no risk judgement; see the validators
-        return payload, True
+            if isinstance(value, str):
+                value = "" if value.strip().casefold() in {"none", "n/a", "null", "-"} else value.strip()
+                payload[key] = _cap(value, limit)
+        return payload
 
 
-class _RawActivityFlowContext(_RawCheckGroup):
-    _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ("activity_value_outcome", "debit_credit_outcome")
-    _TEXT_LIMITS: ClassVar[dict[str, int]] = {"activity_value_context": 140, "debit_credit_context": 140}
-    activity_value_context: str = Field(max_length=140)
-    activity_value_months: str = Field(min_length=1, max_length=32)
-    activity_value_outcome: TransactionOutcome
-    debit_credit_context: str = Field(max_length=140)
-    debit_credit_months: str = Field(min_length=1, max_length=32)
-    debit_credit_outcome: TransactionOutcome
+class _RawActivityMoney(_RawAnswer):
+    _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ("activity_outcome", "money_flow_outcome")
+    _PATTERN_KEYS: ClassVar[tuple[str, ...]] = ("activity_pattern", "money_flow_pattern")
+    _TEXT_LIMITS: ClassVar[dict[str, int]] = {"activity_insight": 300, "money_flow_insight": 300}
+    activity_insight: str = Field(default="", max_length=300)
+    activity_pattern: str = Field(default="none", max_length=40)
+    activity_months: str = Field(min_length=1, max_length=32)
+    activity_outcome: Outcome
+    money_flow_insight: str = Field(default="", max_length=300)
+    money_flow_pattern: str = Field(default="none", max_length=40)
+    money_flow_months: str = Field(min_length=1, max_length=32)
+    money_flow_outcome: Outcome
 
-    def checks(self) -> dict[ReviewCheckName, _FlatCheck]:
+    def checks(self) -> dict[ReviewCheckName, _Check]:
         return {
-            "activity_value_change": _FlatCheck(self.activity_value_outcome, self.activity_value_context, self.activity_value_months),
-            "debit_credit_flow": _FlatCheck(self.debit_credit_outcome, self.debit_credit_context, self.debit_credit_months),
+            "activity_and_amount_change": _Check(
+                self.activity_outcome, self.activity_insight, self.activity_pattern, self.activity_months),
+            "money_in_and_out": _Check(
+                self.money_flow_outcome, self.money_flow_insight, self.money_flow_pattern, self.money_flow_months),
         }
 
 
-class _RawTimingContext(_RawCheckGroup):
-    _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ("burst_gap_outcome",)
-    # A cut insight usually loses its last number or clause; the grounding check
-    # then decides whether it can still be shown.
-    _TEXT_LIMITS: ClassVar[dict[str, int]] = {"burst_gap_insight": 240}
-    burst_gap_insight: str = Field(default="", max_length=240)
-    burst_gap_months: str = Field(min_length=1, max_length=32)
-    burst_gap_outcome: TransactionOutcome
+class _RawInactivityBurstGaps(_RawAnswer):
+    _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ("burst_gaps_outcome",)
+    _PATTERN_KEYS: ClassVar[tuple[str, ...]] = ("burst_gaps_pattern",)
+    _TEXT_LIMITS: ClassVar[dict[str, int]] = {"inactivity_insight": 300, "burst_gaps_insight": 300}
+    inactivity_insight: str = Field(default="", max_length=300)
+    burst_gaps_insight: str = Field(default="", max_length=300)
+    burst_gaps_pattern: str = Field(default="none", max_length=40)
+    burst_gaps_months: str = Field(min_length=1, max_length=32)
+    burst_gaps_outcome: Outcome
+
+
+class _RawOverallSummary(_RawAnswer):
+    TEXT_FIELDS: ClassVar[tuple[str, ...]] = (
+        "headline", "point_1", "point_2", "point_3", "why_it_matters", "verify_1", "verify_2", "risk_reason",
+    )
+    _TEXT_LIMITS: ClassVar[dict[str, int]] = {
+        "headline": 160, "point_1": 300, "point_2": 300, "point_3": 300, "why_it_matters": 360,
+        "verify_1": 260, "verify_2": 260, "risk_reason": 260,
+    }
+    headline: str = Field(default="", max_length=160)
+    point_1: str = Field(default="", max_length=300)
+    point_2: str = Field(default="", max_length=300)
+    point_3: str = Field(default="", max_length=300)
+    why_it_matters: str = Field(default="", max_length=360)
+    verify_1: str = Field(default="", max_length=260)
+    verify_2: str = Field(default="", max_length=260)
+    risk_reason: str = Field(default="", max_length=260)
+    risk_level: RiskLevel
+
+    @classmethod
+    def prepare_payload(cls, payload: Any) -> Any:
+        payload = super().prepare_payload(payload)
+        if isinstance(payload, dict) and isinstance(payload.get("risk_level"), str):
+            payload["risk_level"] = payload["risk_level"].strip().lower()
+        return payload
 
 
 class _RawProfileContext(BaseModel):
