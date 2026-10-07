@@ -26,7 +26,7 @@ from app.core.models import (
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
-    ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, inactivity_note,
+    ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, account_notes,
     OVERALL_SUMMARY_SYSTEM_PROMPT, PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input, format_retry_suffix,
     inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
 )
@@ -221,8 +221,8 @@ class AnalysisService:
             _LlmCall(
                 stage="inactivity-burst-gaps-context",
                 checks=("activity_after_inactivity", "burst_and_gaps"),
-                system_prompt=INACTIVITY_BURST_GAPS_SYSTEM_PROMPT
-                + inactivity_note(run, self._settings.dormancy_min_zero_months),
+                system_prompt=INACTIVITY_BURST_GAPS_SYSTEM_PROMPT + account_notes(
+                    monthly, run, self._settings.dormancy_min_zero_months, self._long_gap_days()),
                 prompt_input=inactivity_burst_gaps_input(
                     monthly, run, self._settings.dormancy_min_zero_months, self._long_gap_days()),
                 model_type=_RawInactivityBurstGaps,

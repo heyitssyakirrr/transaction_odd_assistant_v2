@@ -380,11 +380,6 @@ def burst_gap_facts(rows: list[dict[str, Any]], long_gap_days: Decimal) -> str:
             f"BURST|{row['year_month']}|transactions={row['txn_count_monthly']}|"
             f"burst_share={_burst_share(row)}%|avg_gap_days={_gap_days(row)}|gap_basis={gap_basis(row)}"
         )
-    in_month = [row for row in rows if gap_basis(row) == "in_month"]
-    since_previous = [row for row in rows if gap_basis(row) == "since_previous"]
-    longest = max(in_month, key=_gap_days) if in_month else None
-    shortest = min(in_month, key=_gap_days) if in_month else None
-    longest_back = max(since_previous, key=_gap_days) if since_previous else None
     lines.append(
         "BURST_GUIDE|burst_months_with_burst_share_25%_or_more="
         + (",".join(f"{row['year_month']}:{_burst_share(row)}%" for row in burst_guide_months(rows)) or "no month")
@@ -395,13 +390,35 @@ def burst_gap_facts(rows: list[dict[str, Any]], long_gap_days: Decimal) -> str:
         + (",".join(f"{row['year_month']}:{_days(_gap_days(row))} days" for row in long_gap_months(rows, long_gap_days))
            or "no month")
     )
-    lines.append(
-        "BURST_CANDIDATES|longest_in_month_gap=" + (f"{longest['year_month']}:{_gap_days(longest)}" if longest else "none")
-        + "|shortest_in_month_gap=" + (f"{shortest['year_month']}:{_gap_days(shortest)}" if shortest else "none")
-        + "|longest_gap_to_previous=" + (
-            f"{longest_back['year_month']}:{_gap_days(longest_back)}" if longest_back else "none")
-    )
     return "\n".join(lines)
+
+
+def burst_gap_note(rows: list[dict[str, Any]], long_gap_days: Decimal) -> str:
+    """The burst and long-gap findings for this account, in plain words, for the end of the call 2 prompt.
+
+    Qwen 7B read five 0.0% rows as "no burst" and an average gap of 7.33 days as a long
+    gap, although BURST_GUIDE and GAP_GUIDE said otherwise (logged 2026-10-06). Stating
+    the two findings at the end, as the inactivity note does, keeps it on the facts.
+    """
+    burst = burst_guide_months(rows)
+    gaps = long_gap_months(rows, long_gap_days)
+    days = _days(long_gap_days)
+    burst_text = (
+        "This account HAS burst months (burst share 25.0% or more): "
+        + ", ".join(f"{row['year_month']} ({_burst_share(row)}%)" for row in burst) + "."
+        if burst else "This account has NO burst month: no month reaches a 25.0% burst share."
+    )
+    gap_text = (
+        f"Long gaps ({days} days or more since the previous transaction): "
+        + ", ".join(f"{row['year_month']} ({_days(_gap_days(row))} days)" for row in gaps) + "."
+        if gaps else f"No long gap: no transaction came {days} or more days after the previous one, so do not call "
+                     "any gap long."
+    )
+    outcome = "pattern_found" if burst or gaps else "no_pattern_found"
+    return (
+        f"\nBURST AND GAP NOTE: {burst_text} {gap_text} burst_gaps_insight must state this burst finding and this "
+        f"gap finding. burst_gaps_outcome is {outcome}.\n"
+    )
 
 
 def _burst_month_phrase(row: dict[str, Any]) -> str:
@@ -565,7 +582,7 @@ def debit_credit_mix_facts(rows: list[dict[str, Any]]) -> str:
 PATTERN_NAMES: dict[str, tuple[str, ...]] = {
     "activity_and_amount_change": ("large_transaction",),
     "money_in_and_out": ("debits", "credits", "debit_credit_mix_change"),
-    "burst_and_gaps": ("burst", "long_gap", "gap_change"),
+    "burst_and_gaps": ("burst", "long_gap"),
 }
 # How each pattern is shown to staff.
 PATTERN_LABELS: dict[str, str] = {
@@ -575,7 +592,6 @@ PATTERN_LABELS: dict[str, str] = {
     "debit_credit_mix_change": "Debit/credit mix changed",
     "burst": "Burst",
     "long_gap": "Long gap",
-    "gap_change": "Gap between transactions changed",
 }
 # Words in a name the model wrote, and the pattern they mean; the first match wins.
 _PATTERN_WORDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
@@ -590,7 +606,6 @@ _PATTERN_WORDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "burst_and_gaps": (
         ("burst", ("burst",)),
         ("long_gap", ("long", "before", "quiet", "inactiv", "dormant")),
-        ("gap_change", ("gap", "spacing", "interval")),
     ),
 }
 
@@ -657,7 +672,6 @@ def _pattern_fits(
         "credits": lambda: (_amount(after, "monthly_credit") != _amount(before, "monthly_credit")
                             or _structure(before) == _structure(after) == "credit_only"),
         "debit_credit_mix_change": lambda: _structure(after) != _structure(before),
-        "gap_change": lambda: _gap_days(after) != _gap_days(before),
     }
     return compare[pattern]()
 

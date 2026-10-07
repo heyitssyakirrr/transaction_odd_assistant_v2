@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.monthly_facts import (
-    InactivityRun, amount_facts, burst_gap_facts, debit_credit_mix_facts, inactivity_run_fact, risk_facts,
+    InactivityRun, amount_facts, burst_gap_facts, burst_gap_note, debit_credit_mix_facts, inactivity_run_fact, risk_facts,
     summary_month_lines, transaction_comparison_facts,
 )
 
@@ -101,18 +101,18 @@ Definitions:
   followed by activity in active_month; amount_vs_reference says whether that activity is above or below the bank's
   review reference amount.
 
-Silently read every BURST line, the BURST_GUIDE, GAP_GUIDE and BURST_CANDIDATES lines, and the INACTIVITY_RUN line,
+Silently read every BURST line, the BURST_GUIDE and GAP_GUIDE lines, the INACTIVITY_RUN line and the notes at the end,
 then write:
 
 burst_gaps_insight: one or two plain sentences in your own words, at most 220 characters; never "none". Tell staff
 whether there is a burst (only the BURST_GUIDE months count; name each with its burst_share) and what the gaps
 between transactions show, such as the longest gap and the month it came before, and why it matters for review.
-burst_gaps_pattern: "burst" (a month listed in BURST_GUIDE), "long_gap" (a month listed in GAP_GUIDE),
-"gap_change" (avg_gap_days changes sharply between two months), or "none" when no pattern is found.
+burst_gaps_pattern: "burst" (a month listed in BURST_GUIDE), "long_gap" (a month listed in GAP_GUIDE), or "none" when
+no pattern is found.
 burst_gaps_months: the supplied months that show the pattern, as YYYYMM or YYYYMM,YYYYMM with the earliest month
 first; the JSON string "none" when burst_gaps_outcome is no_pattern_found.
-burst_gaps_outcome: pattern_found when BURST_GUIDE or GAP_GUIDE lists a month, or when the in-month gap changes
-sharply; otherwise no_pattern_found. If you name a pattern, the outcome is pattern_found.
+burst_gaps_outcome: pattern_found when BURST_GUIDE or GAP_GUIDE lists a month; otherwise no_pattern_found. If you name a
+pattern, the outcome is pattern_found.
 inactivity_insight: follow the INACTIVITY NOTE at the end.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
@@ -204,6 +204,13 @@ FORMAT_RETRY_SUFFIX = """
 FORMAT RETRY: Redo the task using INPUT FACTS. Return only the required JSON object. Do not output explanation,
 questions, assistant, system, user, analysis, markdown, or text before or after the final }.
 """
+
+
+def account_notes(
+    monthly_summary: list[dict[str, Any]], run: InactivityRun | None, min_zero_months: int, long_gap_days: Decimal,
+) -> str:
+    """The account-specific notes that end the call 2 prompt: burst and gap first, inactivity last (its key is last)."""
+    return burst_gap_note(monthly_summary, long_gap_days) + inactivity_note(run, min_zero_months)
 
 
 def inactivity_note(run: InactivityRun | None, min_zero_months: int) -> str:
