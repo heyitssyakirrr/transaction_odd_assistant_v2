@@ -134,16 +134,16 @@ every month and amount exactly as written in INPUT FACTS; do not calculate diffe
 compare the amounts with what is typical for the declared occupation, as a question for staff to verify.
 
 Silently work through these steps:
-1. Read each CHECK line. pattern_found checks are the main evidence. insight=none means no explanation is available,
-   so use that check's months in the MONTH rows instead. insight_issues lists where that insight or its pattern does
-   not match the CSV; when it is not none, trust the MONTH rows over that insight.
+1. Read each CHECK line. pattern_found checks are the main points to write about. insight=none means no explanation
+   is available, so use that check's months in the MONTH rows instead. insight_issues lists where that insight or its
+   pattern does not match the CSV; when it is not none, trust the MONTH rows over that insight.
 2. Connect the checks rather than repeating them, for example: money in and money out of similar size in the same
    month; one large payment after a long quiet period; repeated transactions with the same counterparty in a month
    with few transactions; activity that does not fit the declared occupation or individual/organisation type.
 3. Use the six months as this account's own baseline: say what is usual for it and what stands out.
-4. Decide the overall risk with the RISK GUIDE at the end. Long gaps, quiet months, debits and credits, a check under
-   NOT_VERIFIED, or a comparison with the declared occupation never change the risk; mention them as points for staff
-   to verify.
+4. Decide the overall risk only with the RISK GUIDE at the end. A pattern_found check does not raise the risk by
+   itself. Long gaps, quiet months, debits and credits, a check under NOT_VERIFIED, or a comparison with the declared
+   occupation never change the risk; mention them as points for staff to verify.
 
 Write:
 headline: one line, at most 120 characters, naming the most important thing about this account; it must agree with
@@ -155,8 +155,9 @@ why_it_matters: one or two sentences, at most 260 characters, explaining why the
 verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount
 (for example: ask for the purpose and counterparty of the credits in 202605). Use "none" for verify_2 when one action
 is enough.
-risk_reason: one sentence, at most 200 characters, explaining the risk level in plain words: name the risk signal
-from the RISK_SIGNALS line, with the occupation as context when it helps.
+risk_reason: one sentence, at most 200 characters, explaining the risk level in plain words: say which signal from
+the RISK_SIGNALS line you used, with the occupation as context when it helps. When large_single_transactions=none, say
+that no single transaction reached the review reference.
 risk_level: exactly "low", "medium" or "high", decided as the RISK GUIDE at the end teaches.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
@@ -166,8 +167,9 @@ Write the object once; do not repeat it or explain your steps. After the final }
 
 RISK GUIDE: decide risk_level from the RISK_SIGNALS line. The review reference is for one single transaction, never
 for a month's total, credits or debits.
-- "low": large_single_transactions=none. Bursts, gaps, debits and credits, inactivity and the occupation alone do
-  not raise it.
+- "low": large_single_transactions=none. Then risk_level is "low" even when the checks found a debit/credit change,
+  credit-only or debit-only months, long gaps, a burst with small amounts, inactivity, or an occupation question.
+  Write those as points for staff to verify, not as risk.
 - "medium": there is a large single transaction, on its own or in the first month after inactivity, and
   large_single_in_burst_month=none.
 - "high": large_single_in_burst_month lists a month: a large single transaction in a month with repeated
