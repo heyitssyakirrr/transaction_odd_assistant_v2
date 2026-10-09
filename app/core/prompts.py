@@ -4,9 +4,9 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.monthly_facts import (
-    InactivityRun, amount_facts, burst_gap_facts, burst_gap_note, debit_credit_mix_facts, inactivity_run_fact,
-    RiskSignals, profile_activity_focus, risk_signals_line, summary_month_lines,
-    transaction_comparison_facts,
+    InactivityRun, RiskSignals, amount_facts, burst_gap_facts, burst_gap_note, inactivity_run_fact,
+    inactivity_summary_fact, layering_facts,
+    layering_note, profile_activity_focus, risk_signals_line, summary_month_lines,
 )
 
 
@@ -17,13 +17,13 @@ _TRANSACTION_FIELDS = (
 )
 
 # Four LLM calls per account. Calls 1-3 run concurrently; call 4 runs after them.
-#   1. ACTIVITY_MONEY: change in activity and amounts + money in and money out
+#   1. ACTIVITY_MONEY: largest single transaction + layering (money in and money out)
 #   2. INACTIVITY_BURST_GAPS: activity after inactivity + burst and gaps
 #   3. PROFILE_CONTEXT: customer profile vs activity
 #   4. OVERALL_SUMMARY: reads the checked results of 1-3 plus the CSV rows; decides risk
 # Calls 1 and 2 describe patterns only; the overall risk is decided once, in call 4.
-# In call 1, step 2 (debit/credit flow) is the proven instruction, unchanged; step 1
-# looks only at the largest single transaction against the review reference.
+# Call 1 has two checks: the largest single transaction against the review reference,
+# and layering (money in close to money out in the same month).
 
 ACTIVITY_MONEY_SYSTEM_PROMPT = """You are an AML transaction-context analyst assisting authorised bank staff.
 
@@ -37,32 +37,29 @@ Silently complete this review before writing the answer:
    pattern only when that transaction is at or above the review reference; then select that one month. A largest
    single transaction below the review reference is not a pattern: say how large it was and in which month. Monthly
    totals and transaction counts are context only.
-2. DEBIT/CREDIT FLOW: Read debit_count and credit_count separately from debits and credits. The former are numbers of
-   transactions; the latter are amounts. Look for a shift in direction, one-sided activity, or a material change in
-   debit or credit amounts. A month with zero credits has no credit inflow in these aggregates. Select two real months
-   that demonstrate the pattern. Do not say one month has a higher debit or credit count/amount unless that column's
-   value is actually higher. The MONTH_STRUCTURE line lists zero, debit-only, credit-only, and mixed months; repeated
-   one-sided flow or a switch between these states is useful context even if amounts are modest. If no meaningful
-   flow pattern is selected, state the observed six-month debit/credit mix.
+2. LAYERING: Read the LAYERING lines, the LAYERING_GUIDE line and the LAYERING NOTE at the end. Money in is credits
+   and money out is debits. A layering month is one where money in and money out are both large and nearly equal, as
+   the LAYERING_GUIDE line states: the money passed through the account instead of staying in it, which can be the
+   layering stage of money laundering. It is a pattern only for the months listed in LAYERING_GUIDE; select those
+   months. Debit-only, credit-only or mixed months, and rises or falls in debits or credits, are not patterns and are
+   not described.
 
 Each of the two checks is assessable from these rows. Use pattern_found only for a material pattern that warrants staff
-context; otherwise use no_pattern_found and still state the actual pattern. Do not output N/A, insufficient_data, a
+context; otherwise use no_pattern_found and still state the actual pattern. For layering, follow the LAYERING NOTE. Do not output N/A, insufficient_data, a
 generic "nothing happened" statement, or a request for more information.
 
 Insights are read by bank staff. For each check write one or two plain sentences in your own words, at most 220
 characters, even when no pattern is found. Each insight should tell staff:
 - activity_insight: the largest single transaction of the six months, its month and amount, whether it is at or
   above the review reference, and what staff should check about it.
-- money_flow_insight: how debits (money out) and credits (money in) changed or stayed one-sided, in which months and
-  by how much, and what staff should verify.
+- money_flow_insight: for layering months, the months, the money in and money out and their difference from the
+  LAYERING lines, and that staff should verify where the money came from and where it went; with no layering month, that no layering was seen.
 Amounts are in RM; never use $. Copy values exactly as they appear in the facts; do not calculate differences, ratios
-or percentages. A debit is money out and a credit is money in. DEBIT_CREDIT_BY_MONTH gives each month's type; a month
-marked mixed has both debits and credits.
+or percentages.
 
 Pattern names (use "none" only when the outcome is no_pattern_found):
 - activity_pattern: "large_transaction" (the largest single transaction is at or above the review reference).
-- money_flow_pattern: "debits" (debits changed, or only debits), "credits" (credits changed, or only credits) or
-  "debit_credit_mix_change" (the two months have different types in DEBIT_CREDIT_BY_MONTH).
+- money_flow_pattern: "layering" (the months listed in LAYERING_GUIDE).
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, prose,
 examples, placeholders, arrays, nested objects, task keys, or extra keys. Write the keys in exactly this order, so each
@@ -74,9 +71,8 @@ The *_insight values are sentences for staff; only the *_pattern values use the 
 Each outcome is exactly pattern_found or no_pattern_found. Use pattern_found when the selected pattern gives staff
 meaningful factual context; pattern_found is not an allegation. Do not default these checks to no_pattern_found just
 because no external income, counterparty, or account-purpose data is supplied. When its outcome is pattern_found,
-activity_months is the one month (YYYYMM) of that largest single transaction, and money_flow_months contains
-exactly two different supplied months
-as YYYYMM,YYYYMM with no spaces; it is a comparison pair, not an evidence identifier.
+activity_months is the one month (YYYYMM) of that largest single transaction, and money_flow_months lists every
+month in LAYERING_GUIDE, earliest first, comma-separated with no spaces (YYYYMM,YYYYMM,YYYYMM).
 When its outcome is no_pattern_found, set its *_months value to the JSON string "none". Never output N/A, M, field names,
 or an underscore in a *_months value. Put earlier month first. When a pattern is found, mention only values from the
 selected months. After the final } output no other character.
@@ -124,40 +120,52 @@ Write the object once. After the final } output no other character.
 
 
 OVERALL_SUMMARY_SYSTEM_PROMPT = """You are a senior AML due-diligence analyst writing the overall summary that bank
-staff read first. Staff use it to decide what to do next, so it must be specific, accurate and easy to read.
+staff read first. Staff use it to decide what to do next, so it must be specific, accurate, easy to read, and explain
+why each finding matters.
 
-Use only INPUT FACTS: the six monthly rows from the CSV, the checked result of each review check, and the customer
-profile. You support the reviewer, who makes the decision: you may state concerns and reasonable assumptions, for
-example whether the amounts fit the declared occupation, as long as they are framed as points for staff to verify. Do
-not invent counterparties, payment purposes, source of funds or anything outside INPUT FACTS. Amounts are in RM: write them as RM 1,234.56 and never use $. Copy
-every month and amount exactly as written in INPUT FACTS; do not calculate differences, ratios or percentages. You may
-compare the amounts with what is typical for the declared occupation, as a question for staff to verify.
+Use only INPUT FACTS: the six MONTH rows, the RISK_SIGNALS line, the checked result of each review check (CHECK lines)
+and the customer profile. You support the reviewer, who makes the decision: you may state concerns and reasonable
+assumptions, for example whether the amounts fit the declared occupation, as long as they are framed as points for
+staff to verify. Do not invent counterparties, payment purposes, source of funds or anything outside INPUT FACTS.
+Amounts are in RM: write them as RM 1,234.56 and never use $. Copy every month and amount exactly as written in INPUT
+FACTS; do not calculate differences, ratios or percentages.
+
+What each finding means, for your explanations:
+- Large single transaction (at or above the review reference): a big one-off movement; staff should confirm its
+  purpose and counterparty.
+- Layering (money in and money out of similar large size in the same month): the money passed through the account
+  instead of staying in it, which can be the layering stage of money laundering; staff should trace where the money
+  came from and where it went.
+- Burst (burst share 25% or more): repeated transactions with the same counterparty in one month; staff should
+  identify that counterparty and the reason.
+- Activity after inactivity: the account was quiet and then moved money; staff should confirm who used it and why.
+- Long gaps and the occupation comparison are context: they help staff ask the right questions.
 
 Silently work through these steps:
-1. Read each CHECK line. pattern_found checks are the main points to write about. insight=none means no explanation
-   is available, so use that check's months in the MONTH rows instead. insight_issues lists where that insight or its
-   pattern does not match the CSV; when it is not none, trust the MONTH rows over that insight.
-2. Connect the checks rather than repeating them, for example: money in and money out of similar size in the same
-   month; one large payment after a long quiet period; repeated transactions with the same counterparty in a month
-   with few transactions; activity that does not fit the declared occupation or individual/organisation type.
-3. Use the six months as this account's own baseline: say what is usual for it and what stands out.
-4. Decide the overall risk only with the RISK GUIDE at the end. A pattern_found check does not raise the risk by
-   itself. Long gaps, quiet months, debits and credits, a check under NOT_VERIFIED, or a comparison with the declared
-   occupation never change the risk; mention them as points for staff to verify.
+1. Read RISK_SIGNALS and each CHECK line. pattern_found checks are the points to write about. insight=none means no
+   explanation is available, so use that check's months in the MONTH rows instead. insight_issues lists where that
+   insight or its pattern does not match the CSV; when it is not none, trust the MONTH rows over that insight.
+2. Connect the findings rather than repeating them, for example a large single transaction together with layering
+   months, a burst month or a quiet period before it, and whether the amounts fit the declared occupation.
+3. Do not describe debit flow, credit flow, debit-only, credit-only or mixed months, or rises and falls in debits or
+   credits; they are not findings.
+4. Decide the risk only with the RISK GUIDE at the end.
 
 Write:
-headline: one line, at most 120 characters, naming the most important thing about this account; it must agree with
+headline: one line, at most 120 characters, naming the most important finding about this account; it must agree with
 point_1.
-point_1, point_2, point_3: each one plain sentence, at most 220 characters, stating a key fact with its month and
-amount and what it shows. Most important first. Use the JSON string "none" for point_2 or point_3 when there is
-nothing more of value; never repeat a point.
-why_it_matters: one or two sentences, at most 260 characters, explaining why these points matter for due diligence.
+point_1, point_2, point_3: each one plain sentence, at most 220 characters: a finding with its month and amount, and
+what it means. Most important first: layering and a large single transaction come before burst, inactivity, gaps or
+the occupation. Use the JSON string "none" for point_2 or point_3 when there is nothing more of value; never repeat a
+point.
+why_it_matters: one or two sentences, at most 260 characters, explaining in plain AML terms why these findings together
+matter for due diligence.
 verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount
-(for example: ask for the purpose and counterparty of the credits in 202605). Use "none" for verify_2 when one action
-is enough.
-risk_reason: one sentence, at most 200 characters, explaining the risk level in plain words: say which signal from
-the RISK_SIGNALS line you used, with the occupation as context when it helps. When large_single_transactions=none, say
-that no single transaction reached the review reference.
+(for example: ask where the money in a layering month came from and where it went). Use "none" for verify_2 when
+one action is enough.
+risk_reason: one sentence, at most 200 characters. Start with what RISK_SIGNALS shows: the large single transaction
+(or that no single transaction reached the review reference) and the layering months (or that there is no layering);
+then add the occupation as context when it helps.
 risk_level: exactly "low", "medium" or "high", decided as the RISK GUIDE at the end teaches.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
@@ -165,17 +173,15 @@ nested objects, or extra keys. Write the keys in exactly this order:
 "headline", "point_1", "point_2", "point_3", "why_it_matters", "verify_1", "verify_2", "risk_reason", "risk_level".
 Write the object once; do not repeat it or explain your steps. After the final } output no other character.
 
-RISK GUIDE: decide risk_level from the RISK_SIGNALS line. The review reference is for one single transaction, never
-for a month's total, credits or debits.
-- "low": large_single_transactions=none. Then risk_level is "low" even when the checks found a debit/credit change,
-  credit-only or debit-only months, long gaps, a burst with small amounts, inactivity, or an occupation question.
-  Write those as points for staff to verify, not as risk.
-- "medium": there is a large single transaction, on its own or in the first month after inactivity, and
-  large_single_in_burst_month=none.
-- "high": large_single_in_burst_month lists a month: a large single transaction in a month with repeated
-  transactions with the same counterparty, with or without inactivity.
-Gaps, debits and credits, quiet months, the occupation and NOT_VERIFIED never change risk_level; mention them only as
-points for staff to verify.
+RISK GUIDE: decide risk_level from the RISK_SIGNALS line only. Check in this order and use the first that applies:
+1. "high" when large_single_transactions lists a month and layering_months lists a month (they can be different
+   months).
+2. "medium" when large_single_transactions lists a month and layering_months=none. A burst month or activity after
+   inactivity keeps it "medium".
+3. "low" when large_single_transactions=none. It stays "low" even when layering_months lists a month, and with
+   bursts, long gaps, inactivity or an occupation question; write those as points for staff to verify.
+The review reference is for one single transaction, never for a month's total. Long gaps, quiet months, the occupation
+and NOT_VERIFIED never change risk_level.
 """
 
 
@@ -185,9 +191,8 @@ Use only INPUT FACTS: the customer's dated profile versions and six monthly tran
 profile-to-activity comparison, not a transaction risk score or an allegation. Identify the declared occupation and
 individual/organisation type when supplied. For material amounts, cite the largest single transaction and its month
 and recommend verifying the source of funds and whether the activity fits the customer's stated occupation and account
-purpose. A monthly total is transaction volume, not income or net funds received; use monthly_credit and monthly_debit
-to explain its direction when relevant. Occupation does not prove income, wealth, or that a transaction is unsuitable;
-do not label a job low-income.
+purpose. A monthly total is transaction volume, not income or net funds received. Occupation does not prove income,
+wealth, or that a transaction is unsuitable; do not label a job low-income.
 An individual may legitimately transact large amounts, and an organisation may transact small amounts.
 
 State the supplied citizenship as a profile fact. The six monthly rows contain no transaction-country, residency,
@@ -270,13 +275,22 @@ def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
     return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
 
 
-def activity_money_input(monthly_summary: list[dict[str, Any]], single_reference: Decimal) -> str:
-    """Call 1 input: six rows, the proven labelled monthly facts, the debit/credit mix, then the amounts."""
+def activity_money_prompt(
+    monthly_summary: list[dict[str, Any]], layering_min_amount: Decimal, layering_max_difference_pct: Decimal,
+) -> str:
+    """Call 1 instructions: the fixed prompt, then this account's LAYERING NOTE last."""
+    return ACTIVITY_MONEY_SYSTEM_PROMPT + layering_note(monthly_summary, layering_min_amount, layering_max_difference_pct)
+
+
+def activity_money_input(
+    monthly_summary: list[dict[str, Any]], single_reference: Decimal, layering_min_amount: Decimal,
+    layering_max_difference_pct: Decimal,
+) -> str:
+    """Call 1 input: six rows, the amounts for the largest single transaction, then the layering facts."""
     return "\n".join((
         _monthly_rows_input(monthly_summary),
-        transaction_comparison_facts(monthly_summary),
-        debit_credit_mix_facts(monthly_summary),
         amount_facts(monthly_summary, single_reference),
+        layering_facts(monthly_summary, layering_min_amount, layering_max_difference_pct),
     ))
 
 
@@ -301,7 +315,7 @@ def overall_summary_input(
         "INPUT FACTS — six monthly rows from the CSV, oldest to newest. Amounts are already formatted; copy them exactly.",
         *summary_month_lines(monthly_summary),
         risk_signals_line(signals, single_reference),
-        inactivity_run_fact(inactivity_run, min_zero_months),
+        inactivity_summary_fact(inactivity_run, min_zero_months),
         *check_lines,
         "NOT_VERIFIED|" + (",".join(not_verified) or "none"),
         *(profile_lines or ["PROFILE|none supplied"]),

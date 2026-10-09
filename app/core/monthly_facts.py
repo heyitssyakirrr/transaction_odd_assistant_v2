@@ -31,61 +31,6 @@ def _count_label(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
-def _direction(first: Decimal, second: Decimal) -> str:
-    return "rose" if second > first else "fell" if second < first else "held steady"
-
-
-def _directional_pair(rows: list[dict[str, Any]], field: str, increase: bool) -> str:
-    changes = []
-    for first, second in zip(rows, rows[1:]):
-        difference = _amount(second, field) - _amount(first, field)
-        if difference != 0 and (difference > 0) == increase:
-            changes.append((first, second))
-    if not changes:
-        return "none"
-    first, second = max(changes, key=lambda pair: abs(_amount(pair[1], field) - _amount(pair[0], field)))
-    display = (lambda row: str(row[field])) if field.endswith("count_monthly") else (lambda row: _money(_amount(row, field)))
-    return (
-        f"{first['year_month']},{second['year_month']}:"
-        f"{display(first)}->{display(second)}"
-    )
-
-
-def month_fact_line(row: dict[str, Any]) -> str:
-    """One month as labelled fields, shared by call 1 and the summary.
-
-    Labelled ``key=value`` fields, not bare columns: Qwen 7B miscounts unlabelled
-    ``|`` columns (logged 2026-10-05: a month total was reported as credits).
-    """
-    return (
-        f"MONTH|{row['year_month']}|transactions={row['txn_count_monthly']}|"
-        f"total={_money(_amount(row, 'total_amount'))}|"
-        f"debit_count={row['debit_count_monthly']}|credit_count={row['credit_count_monthly']}|"
-        f"debits={_money(_amount(row, 'monthly_debit'))}|credits={_money(_amount(row, 'monthly_credit'))}"
-    )
-
-
-def transaction_comparison_facts(rows: list[dict[str, Any]]) -> str:
-    """Repeat the two checks as labelled facts so a small model need not do arithmetic."""
-    lines = ["CHECKED MONTH FACTS — copy values from these lines when choosing activity/value or debit/credit months."]
-    lines.extend(month_fact_line(row) for row in rows)
-    zero_months = [row["year_month"] for row in rows if row["txn_count_monthly"] == 0]
-    debit_only = [row["year_month"] for row in rows if row["debit_count_monthly"] > 0 and row["credit_count_monthly"] == 0]
-    credit_only = [row["year_month"] for row in rows if row["credit_count_monthly"] > 0 and row["debit_count_monthly"] == 0]
-    mixed = [row["year_month"] for row in rows if row["debit_count_monthly"] > 0 and row["credit_count_monthly"] > 0]
-    lines.extend((
-        "MONTH_STRUCTURE|zero_activity=" + (",".join(zero_months) or "none")
-        + "|debit_only=" + (",".join(debit_only) or "none")
-        + "|credit_only=" + (",".join(credit_only) or "none")
-        + "|mixed_flow=" + (",".join(mixed) or "none"),
-        "FLOW_CANDIDATES|debit_increase=" + _directional_pair(rows, "monthly_debit", True)
-        + "|debit_decrease=" + _directional_pair(rows, "monthly_debit", False)
-        + "|credit_increase=" + _directional_pair(rows, "monthly_credit", True)
-        + "|credit_decrease=" + _directional_pair(rows, "monthly_credit", False),
-    ))
-    return "\n".join(lines)
-
-
 def _amount_phrase(row: dict[str, Any]) -> str:
     return (
         f"{_count_label(row['txn_count_monthly'], 'transaction')}, total {_rm(_amount(row, 'total_amount'))}, "
@@ -133,34 +78,12 @@ def activity_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
     )
 
 
-def flow_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
-    """Debits and credits of the selected months; one month is shown after the month before it."""
-    index = {row["year_month"]: position for position, row in enumerate(rows)}
-    shown = [rows[index[months[0]] - 1]["year_month"], *months] if len(months) == 1 and index[months[0]] > 0 else months
-    return "; ".join(
-        f"{row['year_month']}: {_count_label(row['debit_count_monthly'], 'debit')} {_rm(_amount(row, 'monthly_debit'))}, "
-        f"{_count_label(row['credit_count_monthly'], 'credit')} {_rm(_amount(row, 'monthly_credit'))}"
-        for row in (rows[index[month]] for month in shown)
-    ) + "."
-
-
 def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
     totals = [_amount(row, "total_amount") for row in rows]
     largest = max(rows, key=lambda row: _amount(row, "max_amount"))
     return (
         f"Six-month totals range {_rm(min(totals))} to {_rm(max(totals))}; largest single transaction "
         f"{_rm(_amount(largest, 'max_amount'))} in {largest['year_month']}."
-    )
-
-
-def flow_six_month_context(rows: list[dict[str, Any]]) -> str:
-    debit_count = sum(row["debit_count_monthly"] for row in rows)
-    credit_count = sum(row["credit_count_monthly"] for row in rows)
-    debits = sum((_amount(row, "monthly_debit") for row in rows), Decimal(0))
-    credits = sum((_amount(row, "monthly_credit") for row in rows), Decimal(0))
-    return (
-        f"Six-month flow: {_count_label(debit_count, 'debit')} totalling {_rm(debits)}; "
-        f"{_count_label(credit_count, 'credit')} totalling {_rm(credits)}."
     )
 
 
@@ -259,6 +182,21 @@ def inactivity_run_fact(run: InactivityRun | None, min_zero_months: int) -> str:
     )
 
 
+def inactivity_summary_fact(run: InactivityRun | None, min_zero_months: int) -> str:
+    """The inactive period for the summary: when, and the largest single transaction after it.
+
+    No debit/credit direction and no amount band: the summary does not describe flows, and
+    its risk guide compares only single transactions with the review reference.
+    """
+    if run is None:
+        return f"INACTIVITY_RUN|status=none|rule={min_zero_months}_or_more_zero_months_then_activity"
+    return (
+        f"INACTIVITY_RUN|status=present|zero_months={run.zero_months}|zero_start={run.zero_start}|"
+        f"zero_end={run.zero_end}|active_month={run.active_month}|transactions={run.transactions}|"
+        f"largest_single_in_active_month={_money(run.largest_single)}"
+    )
+
+
 def _flow_phrase(run: InactivityRun) -> str:
     debits = f"{_count_label(run.debit_count, 'debit')} of {_rm(run.debit)}"
     credits = f"{_count_label(run.credit_count, 'credit')} of {_rm(run.credit)}"
@@ -275,7 +213,8 @@ def _staff_check(run: InactivityRun) -> str:
     if run.amount_band == "below":
         return "Amount is below the review reference: looks like renewed use with limited movement."
     scope = "Largest single transaction" if run.trigger == "single" else "Monthly total"
-    reached = f"{scope} is at or above the {_rm(run.trigger_reference or Decimal(0))} review reference."
+    reference = "review reference" if run.trigger == "single" else "monthly-total reference"
+    reached = f"{scope} is at or above the {_rm(run.trigger_reference or Decimal(0))} {reference}."
     ask = {
         "debit": "Suggested check: confirm the payment purpose and how the account was funded.",
         "credit": "Suggested check: confirm the source and purpose of the incoming funds.",
@@ -360,35 +299,141 @@ def burst_guide_months(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if _burst_share(row) >= BURST_GUIDE_SHARE]
 
 
+# --- Layering: money in close to money out -----------------------------------
+# Money passing through: in the same month, money in (credits) and money out (debits)
+# are both large and nearly equal. The code lists the months; the model explains them.
+
+def _layering_difference(row: dict[str, Any]) -> Decimal:
+    """How far apart money in and money out are, as a share of the larger (0 = equal)."""
+    money_in, money_out = _amount(row, "monthly_credit"), _amount(row, "monthly_debit")
+    larger = max(money_in, money_out)
+    if not larger:
+        return Decimal(100)
+    # Rounded once, so the rule and the figure staff see always agree (10.04% shows as 10.0% and counts as 10.0%).
+    return ((larger - min(money_in, money_out)) / larger * 100).quantize(Decimal("0.1"))
+
+
+def _pct(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.1'))}%"
+
+
+def _difference_cell(row: dict[str, Any]) -> str:
+    """The difference for display; "-" for a month with no money in or out."""
+    has_money = _amount(row, "monthly_credit") or _amount(row, "monthly_debit")
+    return _pct(_layering_difference(row)) if has_money else "-"
+
+
+def layering_months(
+    rows: list[dict[str, Any]], min_amount: Decimal, max_difference_pct: Decimal,
+) -> list[dict[str, Any]]:
+    """Months whose money in and money out are both ``min_amount`` or more and within ``max_difference_pct``."""
+    return [
+        row for row in rows
+        if min(_amount(row, "monthly_credit"), _amount(row, "monthly_debit")) >= min_amount
+        and _layering_difference(row) <= max_difference_pct
+    ]
+
+
+def _layering_phrase(row: dict[str, Any]) -> str:
+    return (
+        f"{row['year_month']}: money in {_rm(_amount(row, 'monthly_credit'))}, "
+        f"money out {_rm(_amount(row, 'monthly_debit'))}, difference {_pct(_layering_difference(row))}"
+    )
+
+
+def _layering_rule(min_amount: Decimal, max_difference_pct: Decimal) -> str:
+    return (f"money in and money out both {_rm(min_amount)} or more and within "
+            f"{_pct(max_difference_pct)} of each other")
+
+
+def layering_facts(rows: list[dict[str, Any]], min_amount: Decimal, max_difference_pct: Decimal) -> str:
+    """Call 1 facts: money in and out per month, their difference, and the layering months."""
+    lines = ["LAYERING_FACTS — money in = credits, money out = debits; difference = how far apart money in and "
+             "money out are, as a share of the larger."]
+    lines.extend(
+        f"LAYERING|{row['year_month']}|money_in={_money(_amount(row, 'monthly_credit'))}|"
+        f"money_out={_money(_amount(row, 'monthly_debit'))}|difference={_difference_cell(row)}"
+        for row in rows
+    )
+    found = ",".join(f"{row['year_month']}:{_pct(_layering_difference(row))}"
+                     for row in layering_months(rows, min_amount, max_difference_pct))
+    lines.append(f"LAYERING_GUIDE|layering_months_with_{_layering_rule(min_amount, max_difference_pct).replace(' ', '_')}="
+                 + (found or "no month"))
+    return "\n".join(lines)
+
+
+def layering_note(rows: list[dict[str, Any]], min_amount: Decimal, max_difference_pct: Decimal) -> str:
+    """The layering finding for this account, in plain words, for the end of the call 1 prompt.
+
+    The same method as the burst note in call 2: the end of the prompt is where Qwen 7B
+    pays most attention.
+    """
+    rule = _layering_rule(min_amount, max_difference_pct)
+    months = layering_months(rows, min_amount, max_difference_pct)
+    if not months:
+        return (
+            f"\nLAYERING NOTE: This account has NO layering month: no month has {rule}. money_flow_insight must say "
+            "in one sentence that no layering was seen; do not describe debit or credit changes. money_flow_pattern "
+            'is "none", money_flow_months is "none" and money_flow_outcome is no_pattern_found.\n'
+        )
+    listed = "; ".join(_layering_phrase(row) for row in months)
+    selected = ",".join(row["year_month"] for row in months)
+    largest = max(months, key=lambda row: _amount(row, "monthly_credit"))
+    return (
+        f"\nLAYERING NOTE: This account HAS layering months ({rule}, so the money passed through the account): "
+        f"{listed}. money_flow_insight must explain this in one or two sentences: name every layering month, give "
+        f"the money in and money out for {largest['year_month']} (the largest), and say that staff should verify "
+        "where the money came from and where it went. Do not describe debit or credit changes. "
+        f'money_flow_pattern is "layering", money_flow_months is "{selected}" and money_flow_outcome is '
+        "pattern_found.\n"
+    )
+
+
+def layering_context(
+    rows: list[dict[str, Any]], months: list[str], min_amount: Decimal, max_difference_pct: Decimal,
+) -> str:
+    """Key figures for the layering check, from the rows (not from the AI's answer).
+
+    Full figures for one or two selected months; month and difference only for more, so
+    the text stays short. Layering months the AI did not select are named.
+    """
+    layered = layering_months(rows, min_amount, max_difference_pct)
+    if not layered:
+        return f"No layering month: no month had {_layering_rule(min_amount, max_difference_pct)}."
+    by_month = {row["year_month"]: row for row in rows}
+    selected = [by_month[month] for month in months if month in by_month]
+    if not selected:
+        return f"Layering months in the rows (not selected by the AI): {_short_layering_list(layered)}."
+    text = ("; ".join(_layering_phrase(row) for row in selected) + "." if len(selected) <= 2
+            else f"Layering months: {_short_layering_list(selected)}.")
+    missed = [row["year_month"] for row in layered if row not in selected]
+    return text + (f" Also layering, not selected: {', '.join(missed)}." if missed else "")
+
+
+def _short_layering_list(rows: list[dict[str, Any]]) -> str:
+    return ", ".join(f"{row['year_month']} (difference {_pct(_layering_difference(row))})" for row in rows)
+
+
 @dataclass(frozen=True)
 class RiskSignals:
-    """The facts the summary's risk guide refers to: large single transactions, and whether one
-    falls in a burst month or right after inactivity. Facts only; the AI decides the risk level.
-
-    Each entry is staff-readable, e.g. "202607: RM 6,000.00 (burst 33.3%)".
-    """
+    """The two facts the summary's risk guide uses: large single transactions and layering months.
+    Facts only; the AI decides the risk level. Each entry is staff-readable."""
 
     large_singles: tuple[str, ...]
-    large_in_burst_month: tuple[str, ...]
-    large_after_inactivity: str | None
+    layering: tuple[str, ...]
 
 
 def risk_signals(
-    rows: list[dict[str, Any]], run: "InactivityRun | None", single_reference: Decimal,
+    rows: list[dict[str, Any]], single_reference: Decimal, layering_min_amount: Decimal,
+    layering_max_difference_pct: Decimal,
 ) -> RiskSignals:
-    """Large single transactions, and whether one falls in a burst month or right after inactivity."""
-    large = [row for row in rows if _amount(row, "max_amount") >= single_reference]
-    bursts = {row["year_month"] for row in burst_guide_months(rows)}
-    after = None
-    if run is not None and run.largest_single >= single_reference:
-        after = f"{run.active_month}: {_rm(run.largest_single)} after {run.zero_months} months with no transactions"
     return RiskSignals(
-        large_singles=tuple(f"{row['year_month']}: {_rm(_amount(row, 'max_amount'))}" for row in large),
-        large_in_burst_month=tuple(
-            f"{row['year_month']}: {_rm(_amount(row, 'max_amount'))} (burst {_burst_share(row)}%)"
-            for row in large if row["year_month"] in bursts
+        large_singles=tuple(
+            f"{row['year_month']}: {_rm(_amount(row, 'max_amount'))}"
+            for row in rows if _amount(row, "max_amount") >= single_reference
         ),
-        large_after_inactivity=after,
+        layering=tuple(_layering_phrase(row) for row in layering_months(rows, layering_min_amount,
+                                                                       layering_max_difference_pct)),
     )
 
 
@@ -396,9 +441,8 @@ def risk_signals_line(signals: RiskSignals, single_reference: Decimal) -> str:
     """The summary's data line for the risk guide; it lists facts, never a level."""
     return (
         f"RISK_SIGNALS|{_single_reference_field(single_reference)}|"
-        f"large_single_transactions={', '.join(signals.large_singles) or 'none'}|"
-        f"large_single_in_burst_month={', '.join(signals.large_in_burst_month) or 'none'}|"
-        f"large_single_in_first_month_after_inactivity={signals.large_after_inactivity or 'none'}"
+        f"large_single_transactions={'; '.join(signals.large_singles) or 'none'}|"
+        f"layering_months={'; '.join(signals.layering) or 'none'}"
     )
 
 
@@ -572,10 +616,9 @@ _TABLE_COLUMNS: dict[str, tuple[tuple[str, Any], ...]] = {
     "activity_and_amount_change": _AMOUNT_COLUMNS,
     "money_in_and_out": (
         ("Month", lambda r: r["year_month"]),
-        ("No. of debits (money out)", lambda r: _count(r, "debit_count_monthly")),
-        ("Debit amount (RM)", lambda r: _money(_amount(r, "monthly_debit"))),
-        ("No. of credits (money in)", lambda r: _count(r, "credit_count_monthly")),
-        ("Credit amount (RM)", lambda r: _money(_amount(r, "monthly_credit"))),
+        ("Money in, credits (RM)", lambda r: _money(_amount(r, "monthly_credit"))),
+        ("Money out, debits (RM)", lambda r: _money(_amount(r, "monthly_debit"))),
+        ("Difference between money in and out", _difference_cell),
     ),
     "burst_and_gaps": (
         ("Month", lambda r: r["year_month"]),
@@ -594,51 +637,21 @@ def check_table(check: str, rows: list[dict[str, Any]], highlight_months: list[s
     return [label for label, _ in spec], body, highlighted
 
 
-# --- Debit/credit type of each month -----------------------------------------------
-
-def _structure(row: dict[str, Any]) -> str:
-    debit, credit = row["debit_count_monthly"] > 0, row["credit_count_monthly"] > 0
-    return "mixed" if debit and credit else "debit_only" if debit else "credit_only" if credit else "zero"
-
-
-_STRUCTURE_WORDS = {
-    "mixed": "debits and credits", "debit_only": "debits only", "credit_only": "credits only", "zero": "no transactions",
-}
-
-
-def debit_credit_mix_facts(rows: list[dict[str, Any]]) -> str:
-    """Each month's debit/credit type in order, and every change between neighbouring months.
-
-    Qwen 7B misreads the grouped MONTH_STRUCTURE line; the same facts laid out month by
-    month, with the changes already listed, let it pick a correct pair. It still decides.
-    """
-    changes = [
-        f"{before['year_month']} {_structure(before)} -> {after['year_month']} {_structure(after)}"
-        for before, after in zip(rows, rows[1:]) if _structure(before) != _structure(after)
-    ]
-    return "\n".join((
-        "DEBIT_CREDIT_BY_MONTH|" + "|".join(f"{row['year_month']}={_structure(row)}" for row in rows),
-        "MIX_CHANGES|" + ("|".join(changes) or "none"),
-    ))
-
-
 # --- Pattern checks -----------------------------------------------------------
-# The model names the kind of change it saw, from three broad labels per check (Qwen 7B
-# invents or misuses names when given many). Whatever it writes is grouped into one of
-# these by the words it uses, then confirmed against the rows. A mismatch is listed for
+# The model names the pattern it saw, from one or two labels per check (Qwen 7B invents
+# or misuses names when given many). Whatever it writes is grouped into one of these by
+# the words it uses, then confirmed against the rows. A mismatch is listed for
 # staff under the model's sentence; nothing the model wrote is hidden.
 
 PATTERN_NAMES: dict[str, tuple[str, ...]] = {
     "activity_and_amount_change": ("large_transaction",),
-    "money_in_and_out": ("debits", "credits", "debit_credit_mix_change"),
+    "money_in_and_out": ("layering",),
     "burst_and_gaps": ("burst", "long_gap"),
 }
 # How each pattern is shown to staff.
 PATTERN_LABELS: dict[str, str] = {
     "large_transaction": "Large transaction",
-    "debits": "Debits (money out)",
-    "credits": "Credits (money in)",
-    "debit_credit_mix_change": "Debit/credit mix changed",
+    "layering": "Layering (money in close to money out)",
     "burst": "Burst",
     "long_gap": "Long gap",
 }
@@ -648,9 +661,7 @@ _PATTERN_WORDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("large_transaction", ("large", "single", "big")),
     ),
     "money_in_and_out": (
-        ("debit_credit_mix_change", ("mix", "shift", "switch", "direction")),
-        ("debits", ("debit", "money_out", "outflow")),
-        ("credits", ("credit", "money_in", "inflow")),
+        ("layering", ("layer", "pass", "through", "equal", "similar", "match", "close")),
     ),
     "burst_and_gaps": (
         ("burst", ("burst",)),
@@ -667,8 +678,6 @@ def canonical_pattern(check: str, name: str) -> str:
     words = re.sub(r"[^a-z]+", "_", name.lower()).strip("_")
     if words in ("", "none"):
         return "none"
-    if check == "money_in_and_out" and "debit" in words and "credit" in words:
-        return "debit_credit_mix_change"  # e.g. "debit_only -> credit_only"
     for pattern, keys in _PATTERN_WORDS.get(check, ()):
         if any(key in words for key in keys):
             return pattern
@@ -677,7 +686,8 @@ def canonical_pattern(check: str, name: str) -> str:
 
 def pattern_problem(
     check: str, pattern: str, rows: list[dict[str, Any]], months: list[str], *,
-    long_gap_days: Decimal, single_reference: Decimal,
+    long_gap_days: Decimal, single_reference: Decimal, layering_min_amount: Decimal,
+    layering_max_difference_pct: Decimal,
 ) -> str | None:
     """Why the pattern name does not fit the selected months, in plain words; None when it fits."""
     by_month = {row["year_month"]: row for row in rows}
@@ -686,49 +696,26 @@ def pattern_problem(
         return "No pattern label was given for a found pattern."
     if pattern not in PATTERN_NAMES.get(check, ()):
         return f'"{pattern}" is not one of the pattern labels for this check.'
-    fits = _pattern_fits(pattern, rows, selected, long_gap_days, single_reference)
+    if pattern == "layering":
+        # Every selected month must be a layering month; the others are named with the rule.
+        layered = layering_months(selected, layering_min_amount, layering_max_difference_pct)
+        other = [row for row in selected if row not in layered]
+        return None if not other else (
+            f'"{PATTERN_LABELS[pattern]}" does not fit {"; ".join(_layering_phrase(row) for row in other)} '
+            f"(layering needs {_layering_rule(layering_min_amount, layering_max_difference_pct)})."
+        )
+    fits = {
+        "large_transaction": lambda: any(_amount(row, "max_amount") >= single_reference for row in selected),
+        "burst": lambda: bool(burst_guide_months(selected)),
+        "long_gap": lambda: bool(long_gap_months(selected, long_gap_days)),
+    }[pattern]()
     return None if fits else (
         f'"{PATTERN_LABELS[pattern]}" does not fit the selected months: {_selected_facts(check, rows, selected)}.'
     )
 
 
-def _before_after(rows: list[dict[str, Any]], selected: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """The two months being compared: the first and last selected, or one month and the month before it."""
-    if len(selected) >= 2:
-        return selected[0], selected[-1]
-    index = rows.index(selected[0])
-    return (rows[index - 1], selected[0]) if index > 0 else None
-
-
-def _pattern_fits(
-    pattern: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]], long_gap_days: Decimal,
-    single_reference: Decimal,
-) -> bool:
-    if pattern == "large_transaction":
-        return any(_amount(row, "max_amount") >= single_reference for row in selected)
-    if pattern == "burst":
-        return bool(burst_guide_months(selected))
-    if pattern == "long_gap":
-        return bool(long_gap_months(selected, long_gap_days))
-    pair = _before_after(rows, selected)
-    if pair is None:
-        return False
-    before, after = pair
-    compare = {
-        # Debits/credits: that side changed, or both months had only that side.
-        "debits": lambda: (_amount(after, "monthly_debit") != _amount(before, "monthly_debit")
-                           or _structure(before) == _structure(after) == "debit_only"),
-        "credits": lambda: (_amount(after, "monthly_credit") != _amount(before, "monthly_credit")
-                            or _structure(before) == _structure(after) == "credit_only"),
-        "debit_credit_mix_change": lambda: _structure(after) != _structure(before),
-    }
-    return compare[pattern]()
-
-
 def _selected_facts(check: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]]) -> str:
     """What the rows actually show for the selected months, for a mismatch message."""
-    if check == "money_in_and_out":
-        return "; ".join(f"{row['year_month']} has {_STRUCTURE_WORDS[_structure(row)]}" for row in selected)
     if check == "burst_and_gaps":
         return "; ".join(_burst_month_phrase(row) for row in selected)
     largest = max(rows, key=lambda row: _amount(row, "max_amount"))
@@ -808,16 +795,17 @@ def unquotable_number(text: str, allowed: set[Decimal]) -> str | None:
 # --- Rows for the summary call ------------------------------------------------------
 
 def summary_month_lines(rows: list[dict[str, Any]]) -> list[str]:
-    """The summary's MONTH rows: call 1's labelled fields plus the largest single, burst share and gap."""
-    lines = []
-    for row in rows:
-        extra = (
-            f"|largest_single={_money(_amount(row, 'max_amount'))}"
-            f"|burst_share={_burst_share(row)}%"
-            f"|avg_days_between={_avg_days_cell(row)}"
-        )
-        lines.append(month_fact_line(row) + extra)
-    return lines
+    """The summary's MONTH rows as labelled fields (Qwen 7B miscounts bare ``|`` columns).
+
+    No debit or credit fields: money in and money out reach the summary only through
+    the layering months, so the summary does not describe debit or credit flows.
+    """
+    return [
+        f"MONTH|{row['year_month']}|transactions={row['txn_count_monthly']}|"
+        f"total={_money(_amount(row, 'total_amount'))}|largest_single={_money(_amount(row, 'max_amount'))}|"
+        f"burst_share={_burst_share(row)}%|avg_days_between={_avg_days_cell(row)}"
+        for row in rows
+    ]
 
 
 def profile_activity_focus(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
