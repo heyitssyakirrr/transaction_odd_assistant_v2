@@ -5,7 +5,8 @@ from typing import Any
 
 from app.core.monthly_facts import (
     InactivityRun, amount_facts, burst_gap_facts, burst_gap_note, debit_credit_mix_facts, inactivity_run_fact,
-    profile_activity_focus, risk_facts, summary_month_lines, transaction_comparison_facts,
+    RiskSignals, profile_activity_focus, risk_signals_line, summary_month_lines,
+    transaction_comparison_facts,
 )
 
 
@@ -140,8 +141,8 @@ Silently work through these steps:
    month; one large payment after a long quiet period; repeated transactions with the same counterparty in a month
    with few transactions; activity that does not fit the declared occupation or individual/organisation type.
 3. Use the six months as this account's own baseline: say what is usual for it and what stands out.
-4. Decide the overall risk as described for risk_level below. Long gaps, quiet months, a check under NOT_VERIFIED,
-   or a comparison with the declared occupation never raise the risk by themselves; mention them as points for staff
+4. Decide the overall risk with the RISK GUIDE at the end. Long gaps, quiet months, debits and credits, a check under
+   NOT_VERIFIED, or a comparison with the declared occupation never change the risk; mention them as points for staff
    to verify.
 
 Write:
@@ -154,17 +155,25 @@ why_it_matters: one or two sentences, at most 260 characters, explaining why the
 verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount
 (for example: ask for the purpose and counterparty of the credits in 202605). Use "none" for verify_2 when one action
 is enough.
-risk_reason: one sentence, at most 200 characters, explaining the risk level in plain words.
-risk_level: exactly "low", "medium" or "high", read from the RISK_FACTS line:
-- "low" when largest_single_below_reference=yes and burst_guide_months=none (small amounts with no burst are low,
-  even after a quiet period or with long gaps);
-- "high" only when several material patterns reinforce each other with amounts at or above the review reference;
-- "medium" otherwise.
+risk_reason: one sentence, at most 200 characters, explaining the risk level in plain words: name the risk signal
+from the RISK_SIGNALS line, with the occupation as context when it helps.
+risk_level: exactly "low", "medium" or "high", decided as the RISK GUIDE at the end teaches.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
 nested objects, or extra keys. Write the keys in exactly this order:
 "headline", "point_1", "point_2", "point_3", "why_it_matters", "verify_1", "verify_2", "risk_reason", "risk_level".
 Write the object once; do not repeat it or explain your steps. After the final } output no other character.
+
+RISK GUIDE: decide risk_level from the RISK_SIGNALS line. The review reference is for one single transaction, never
+for a month's total, credits or debits.
+- "low": large_single_transactions=none. Bursts, gaps, debits and credits, inactivity and the occupation alone do
+  not raise it.
+- "medium": there is a large single transaction, on its own or in the first month after inactivity, and
+  large_single_in_burst_month=none.
+- "high": large_single_in_burst_month lists a month: a large single transaction in a month with repeated
+  transactions with the same counterparty, with or without inactivity.
+Gaps, debits and credits, quiet months, the occupation and NOT_VERIFIED never change risk_level; mention them only as
+points for staff to verify.
 """
 
 
@@ -172,9 +181,9 @@ PROFILE_CONTEXT_SYSTEM_PROMPT = """You assist authorised bank staff with custome
 
 Use only INPUT FACTS: the customer's dated profile versions and six monthly transaction aggregates. Write a concise
 profile-to-activity comparison, not a transaction risk score or an allegation. Identify the declared occupation and
-individual/organisation type when supplied. For material amounts, cite a real month and its credits, debits or largest
-single amount and recommend verifying the source of funds and whether the activity fits the customer's stated
-occupation and account purpose. A monthly total is transaction volume, not income or net funds received; use monthly_credit and monthly_debit
+individual/organisation type when supplied. For material amounts, cite the largest single transaction and its month
+and recommend verifying the source of funds and whether the activity fits the customer's stated occupation and account
+purpose. A monthly total is transaction volume, not income or net funds received; use monthly_credit and monthly_debit
 to explain its direction when relevant. Occupation does not prove income, wealth, or that a transaction is unsuitable;
 do not label a job low-income.
 An individual may legitimately transact large amounts, and an organisation may transact small amounts.
@@ -282,13 +291,14 @@ def inactivity_burst_gaps_input(
 
 def overall_summary_input(
     monthly_summary: list[dict[str, Any]], inactivity_run: InactivityRun | None, min_zero_months: int,
-    check_lines: list[str], not_verified: list[str], profile_lines: list[str], single_reference: Decimal,
+    check_lines: list[str], not_verified: list[str], profile_lines: list[str], signals: RiskSignals,
+    single_reference: Decimal,
 ) -> str:
-    """Call 4 input: the CSV rows, the checked result of each check, and the profile."""
+    """Call 4 input: the CSV rows, the risk signals, the checked result of each check, and the profile."""
     return "\n".join((
         "INPUT FACTS — six monthly rows from the CSV, oldest to newest. Amounts are already formatted; copy them exactly.",
         *summary_month_lines(monthly_summary),
-        risk_facts(monthly_summary, single_reference),
+        risk_signals_line(signals, single_reference),
         inactivity_run_fact(inactivity_run, min_zero_months),
         *check_lines,
         "NOT_VERIFIED|" + (",".join(not_verified) or "none"),
@@ -296,7 +306,9 @@ def overall_summary_input(
     ))
 
 
-def profile_context_input(customer_profile: list[dict[str, str | None]], monthly_summary: list[dict[str, Any]]) -> str:
+def profile_context_input(
+    customer_profile: list[dict[str, str | None]], monthly_summary: list[dict[str, Any]], single_reference: Decimal,
+) -> str:
     """Give the profile stage the same six source rows used by transaction review."""
     lines = ["INPUT FACTS — supplied customer-profile records. Do not copy labels or invent values."]
     field_labels = (
@@ -317,4 +329,4 @@ def profile_context_input(customer_profile: list[dict[str, str | None]], monthly
             if record.get(field) is not None
         )
         lines.append("PROFILE_RECORD|" + "|".join(values))
-    return "\n".join((*lines, profile_activity_focus(monthly_summary), _monthly_rows_input(monthly_summary)))
+    return "\n".join((*lines, profile_activity_focus(monthly_summary, single_reference), _monthly_rows_input(monthly_summary)))

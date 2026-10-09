@@ -18,7 +18,7 @@ from app.core.monthly_facts import (
     burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context, calendar_numbers,
     canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, flow_pair_context,
     flow_six_month_context, burst_guide_months, has_in_month_gap, no_inactivity_rationale, numbers_in_text,
-    pattern_problem, quotable_numbers, unmatched_month_name, unquotable_number,
+    pattern_problem, quotable_numbers, risk_signals, unmatched_month_name, unquotable_number,
 )
 from app.core.models import (
     AccountAnalysisRequest, AccountAssessment, AssessmentLimitation, CustomerProfileContext,
@@ -27,8 +27,8 @@ from app.core.models import (
 )
 from app.core.prompts import (
     ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, account_notes,
-    OVERALL_SUMMARY_SYSTEM_PROMPT, PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input, format_retry_suffix,
-    inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
+    PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input, format_retry_suffix,
+    OVERALL_SUMMARY_SYSTEM_PROMPT, inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
 )
 from app.core.reference_data import resolve_citizenship, resolve_occupation
 
@@ -519,17 +519,18 @@ class AnalysisService:
         self, case_id: str, monthly: list[dict[str, Any]], run: InactivityRun | None, checks: list[ReviewCheck],
         profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None,
     ) -> "tuple[OverallSummary, RiskLevel] | None":
+        reference = self._single_reference()
         prompt_input = overall_summary_input(
             monthly, run, self._settings.dormancy_min_zero_months,
             [self._check_line(check) for check in checks],
             [check.check for check in checks if check.outcome == "not_verified"],
-            self._profile_lines(profile, profile_context), self._single_reference(),
+            self._profile_lines(profile, profile_context), risk_signals(monthly, run, reference), reference,
         )
         quotable = numbers_in_text(prompt_input) | calendar_numbers(monthly)
         try:
             raw = await self._complete_with_retry(
-                case_id, "overall-summary", OVERALL_SUMMARY_SYSTEM_PROMPT, prompt_input, _RawOverallSummary,
-                self._settings.llm_summary_max_response_tokens,
+                case_id, "overall-summary", OVERALL_SUMMARY_SYSTEM_PROMPT, prompt_input,
+                _RawOverallSummary, self._settings.llm_summary_max_response_tokens,
                 lambda value, final: self._validate_overall_summary(
                     value, quotable, [row["year_month"] for row in monthly], case_id, final),
             )
@@ -551,9 +552,9 @@ class AnalysisService:
 
         A line that is not a sentence (e.g. point_2 "No", logged 2026-10-05) is left out and
         listed as an issue; the headline and risk reason are kept with the issue, because
-        the summary cannot be shown without them. A summary without a headline or risk
-        reason costs the one retry. A missing verify step costs the retry only on the
-        first attempt; on the final attempt it is kept without.
+        the summary cannot be shown without them. A summary without a headline
+        or risk reason costs the one retry. A missing verify step costs the retry only on
+        the first attempt; on the final attempt it is kept without.
         """
         checked, not_sentences = self._without_non_sentences(raw)
         if not checked.verify_1 and checked.verify_2:
@@ -701,7 +702,7 @@ class AnalysisService:
             return None
         return await self._complete_with_retry(
             case_id, "profile-context", PROFILE_CONTEXT_SYSTEM_PROMPT,
-            profile_context_input(profile, monthly), _RawProfileContext,
+            profile_context_input(profile, monthly, self._single_reference()), _RawProfileContext,
             self._settings.llm_profile_context_max_response_tokens,
             lambda value, final: self._validate_profile_context(value),
         )

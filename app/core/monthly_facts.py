@@ -327,7 +327,7 @@ def no_inactivity_rationale(min_zero_months: int) -> str:
 
 GapBasis = Literal["in_month", "since_previous", "no_activity"]
 # A month is a burst month when its burst share is this or more (any number of transactions).
-# The prompt, the pattern check, the "says no burst" check and RISK_FACTS all use it.
+# The prompt, the pattern check, the "says no burst" check and RISK_SIGNALS all use it.
 BURST_GUIDE_SHARE = Decimal("25.0")
 
 
@@ -360,15 +360,56 @@ def burst_guide_months(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if _burst_share(row) >= BURST_GUIDE_SHARE]
 
 
-def risk_facts(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
-    """The two facts the summary's low-risk rule reads: amount size and notable bursts."""
-    largest = max(rows, key=lambda row: _amount(row, "max_amount"))
-    below = "yes" if _amount(largest, "max_amount") < single_reference else "no"
-    guide = ",".join(f"{row['year_month']}:{_burst_share(row)}%" for row in burst_guide_months(rows)) or "none"
-    return (
-        f"RISK_FACTS|largest_single=RM {_money(_amount(largest, 'max_amount'))} in {largest['year_month']}|"
-        f"review_reference=RM {_money(single_reference)}|largest_single_below_reference={below}|burst_guide_months={guide}"
+@dataclass(frozen=True)
+class RiskSignals:
+    """The facts the summary's risk guide refers to: large single transactions, and whether one
+    falls in a burst month or right after inactivity. Facts only; the AI decides the risk level.
+
+    Each entry is staff-readable, e.g. "202607: RM 6,000.00 (burst 33.3%)".
+    """
+
+    large_singles: tuple[str, ...]
+    large_in_burst_month: tuple[str, ...]
+    large_after_inactivity: str | None
+
+
+def risk_signals(
+    rows: list[dict[str, Any]], run: "InactivityRun | None", single_reference: Decimal,
+) -> RiskSignals:
+    """Large single transactions, and whether one falls in a burst month or right after inactivity."""
+    large = [row for row in rows if _amount(row, "max_amount") >= single_reference]
+    bursts = {row["year_month"] for row in burst_guide_months(rows)}
+    after = None
+    if run is not None and run.largest_single >= single_reference:
+        after = f"{run.active_month}: {_rm(run.largest_single)} after {run.zero_months} months with no transactions"
+    return RiskSignals(
+        large_singles=tuple(f"{row['year_month']}: {_rm(_amount(row, 'max_amount'))}" for row in large),
+        large_in_burst_month=tuple(
+            f"{row['year_month']}: {_rm(_amount(row, 'max_amount'))} (burst {_burst_share(row)}%)"
+            for row in large if row["year_month"] in bursts
+        ),
+        large_after_inactivity=after,
     )
+
+
+def risk_signals_line(signals: RiskSignals, single_reference: Decimal) -> str:
+    """The summary's data line for the risk guide; it lists facts, never a level."""
+    return (
+        f"RISK_SIGNALS|{_single_reference_field(single_reference)}|"
+        f"large_single_transactions={', '.join(signals.large_singles) or 'none'}|"
+        f"large_single_in_burst_month={', '.join(signals.large_in_burst_month) or 'none'}|"
+        f"large_single_in_first_month_after_inactivity={signals.large_after_inactivity or 'none'}"
+    )
+
+
+def _largest_single(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The month with the largest single transaction of the six (the earliest on a tie)."""
+    return max(rows, key=lambda row: _amount(row, "max_amount"))
+
+
+def _single_reference_field(single_reference: Decimal) -> str:
+    """The reference applies to one transaction, never to a month's total, credits or debits; the label says so."""
+    return f"review_reference_for_single_transactions={_rm(single_reference)}"
 
 
 def long_gap_months(rows: list[dict[str, Any]], long_gap_days: Decimal) -> list[dict[str, Any]]:
@@ -779,22 +820,17 @@ def summary_month_lines(rows: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def profile_activity_focus(rows: list[dict[str, Any]]) -> str:
-    """The profile call's focus line: the biggest money in, money out and single transaction.
+def profile_activity_focus(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
+    """The profile call's focus line: the largest single transaction and how it compares with the reference.
 
-    No monthly total on purpose: Qwen reported the busiest month's total as credits
-    (logged 2026-10-05, RM 7,234.04 called "credit transactions"). A total is not
-    income; credits are what the declared occupation is compared with.
+    Only the largest single transaction, on purpose. Given a month total, Qwen called it
+    credits (logged 2026-10-05, RM 7,234.04); given monthly credits, it compared them with
+    the single-transaction reference (logged 2026-10-08, RM 6,404.50 from 3 credits).
     """
-    def peak(amount_field: str, count_field: str, noun: str) -> str:
-        row = max(rows, key=lambda item: _amount(item, amount_field))
-        if _amount(row, amount_field) == 0:
-            return "none"
-        return f"{row['year_month']}:{_rm(_amount(row, amount_field))} from {_count_label(row[count_field], noun)}"
-
-    largest = max(rows, key=lambda item: _amount(item, "max_amount"))
+    largest = _largest_single(rows)
+    amount = _amount(largest, "max_amount")
     return (
-        f"PROFILE_ACTIVITY_FOCUS|highest_credits={peak('monthly_credit', 'credit_count_monthly', 'credit')}|"
-        f"highest_debits={peak('monthly_debit', 'debit_count_monthly', 'debit')}|"
-        f"largest_single={largest['year_month']}:{_rm(_amount(largest, 'max_amount'))}"
+        f"PROFILE_ACTIVITY_FOCUS|largest_single_transaction={_rm(amount)} in {largest['year_month']}|"
+        f"{_single_reference_field(single_reference)}|"
+        f"largest_single_vs_reference={'below' if amount < single_reference else 'above'}"
     )
