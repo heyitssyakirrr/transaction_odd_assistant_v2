@@ -4,8 +4,8 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.monthly_facts import (
-    InactivityRun, amount_facts, burst_gap_facts, burst_gap_note, debit_credit_mix_facts, inactivity_run_fact, risk_facts,
-    summary_month_lines, transaction_comparison_facts,
+    InactivityRun, amount_facts, burst_gap_facts, burst_gap_note, debit_credit_mix_facts, inactivity_run_fact,
+    profile_activity_focus, risk_facts, summary_month_lines, transaction_comparison_facts,
 )
 
 
@@ -172,9 +172,9 @@ PROFILE_CONTEXT_SYSTEM_PROMPT = """You assist authorised bank staff with custome
 
 Use only INPUT FACTS: the customer's dated profile versions and six monthly transaction aggregates. Write a concise
 profile-to-activity comparison, not a transaction risk score or an allegation. Identify the declared occupation and
-individual/organisation type when supplied. For material amounts, cite a real month and its total_amount or max_amount
-and recommend verifying the source of funds and whether the activity fits the customer's stated occupation and account
-purpose. A monthly total is transaction volume, not income or net funds received; use monthly_credit and monthly_debit
+individual/organisation type when supplied. For material amounts, cite a real month and its credits, debits or largest
+single amount and recommend verifying the source of funds and whether the activity fits the customer's stated
+occupation and account purpose. A monthly total is transaction volume, not income or net funds received; use monthly_credit and monthly_debit
 to explain its direction when relevant. Occupation does not prove income, wealth, or that a transaction is unsuitable;
 do not label a job low-income.
 An individual may legitimately transact large amounts, and an organisation may transact small amounts.
@@ -317,13 +317,4 @@ def profile_context_input(customer_profile: list[dict[str, str | None]], monthly
             if record.get(field) is not None
         )
         lines.append("PROFILE_RECORD|" + "|".join(values))
-    peak_total = max(monthly_summary, key=lambda row: Decimal(str(row["total_amount"])))
-    peak_single = max(monthly_summary, key=lambda row: Decimal(str(row["max_amount"])))
-    focus = (
-        "PROFILE_ACTIVITY_FOCUS|"
-        f"highest_monthly_total={peak_total['year_month']}:{Decimal(str(peak_total['total_amount'])):.2f}|"
-        f"same_month_debit={Decimal(str(peak_total['monthly_debit'])):.2f}|"
-        f"same_month_credit={Decimal(str(peak_total['monthly_credit'])):.2f}|"
-        f"largest_reported_single_amount={peak_single['year_month']}:{Decimal(str(peak_single['max_amount'])):.2f}"
-    )
-    return "\n".join(lines) + "\n" + focus + "\n" + _monthly_rows_input(monthly_summary)
+    return "\n".join((*lines, profile_activity_focus(monthly_summary), _monthly_rows_input(monthly_summary)))

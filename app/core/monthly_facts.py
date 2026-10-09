@@ -51,16 +51,24 @@ def _directional_pair(rows: list[dict[str, Any]], field: str, increase: bool) ->
     )
 
 
+def month_fact_line(row: dict[str, Any]) -> str:
+    """One month as labelled fields, shared by call 1 and the summary.
+
+    Labelled ``key=value`` fields, not bare columns: Qwen 7B miscounts unlabelled
+    ``|`` columns (logged 2026-10-05: a month total was reported as credits).
+    """
+    return (
+        f"MONTH|{row['year_month']}|transactions={row['txn_count_monthly']}|"
+        f"total={_money(_amount(row, 'total_amount'))}|"
+        f"debit_count={row['debit_count_monthly']}|credit_count={row['credit_count_monthly']}|"
+        f"debits={_money(_amount(row, 'monthly_debit'))}|credits={_money(_amount(row, 'monthly_credit'))}"
+    )
+
+
 def transaction_comparison_facts(rows: list[dict[str, Any]]) -> str:
     """Repeat the two checks as labelled facts so a small model need not do arithmetic."""
     lines = ["CHECKED MONTH FACTS — copy values from these lines when choosing activity/value or debit/credit months."]
-    for row in rows:
-        lines.append(
-            f"MONTH|{row['year_month']}|transactions={row['txn_count_monthly']}|"
-            f"total={_money(_amount(row, 'total_amount'))}|"
-            f"debit_count={row['debit_count_monthly']}|credit_count={row['credit_count_monthly']}|"
-            f"debits={_money(_amount(row, 'monthly_debit'))}|credits={_money(_amount(row, 'monthly_credit'))}"
-        )
+    lines.extend(month_fact_line(row) for row in rows)
     zero_months = [row["year_month"] for row in rows if row["txn_count_monthly"] == 0]
     debit_only = [row["year_month"] for row in rows if row["debit_count_monthly"] > 0 and row["credit_count_monthly"] == 0]
     credit_only = [row["year_month"] for row in rows if row["credit_count_monthly"] > 0 and row["debit_count_monthly"] == 0]
@@ -759,15 +767,34 @@ def unquotable_number(text: str, allowed: set[Decimal]) -> str | None:
 # --- Rows for the summary call ------------------------------------------------------
 
 def summary_month_lines(rows: list[dict[str, Any]]) -> list[str]:
-    lines = [
-        "MONTH|month|transactions|total_RM|average_RM|std_RM|largest_single_RM|debit_count|debit_RM|"
-        "credit_count|credit_RM|burst_%|avg_days_between_transactions"
-    ]
+    """The summary's MONTH rows: call 1's labelled fields plus the largest single, burst share and gap."""
+    lines = []
     for row in rows:
-        lines.append(
-            f"MONTH|{row['year_month']}|{row['txn_count_monthly']}|{_money(_amount(row, 'total_amount'))}|"
-            f"{_money(_amount(row, 'avg_amount'))}|{_money(_amount(row, 'std_amount'))}|"
-            f"{_money(_amount(row, 'max_amount'))}|{row['debit_count_monthly']}|{_money(_amount(row, 'monthly_debit'))}|"
-            f"{row['credit_count_monthly']}|{_money(_amount(row, 'monthly_credit'))}|{_burst_share(row)}%|{_avg_days_cell(row)}"
+        extra = (
+            f"|largest_single={_money(_amount(row, 'max_amount'))}"
+            f"|burst_share={_burst_share(row)}%"
+            f"|avg_days_between={_avg_days_cell(row)}"
         )
+        lines.append(month_fact_line(row) + extra)
     return lines
+
+
+def profile_activity_focus(rows: list[dict[str, Any]]) -> str:
+    """The profile call's focus line: the biggest money in, money out and single transaction.
+
+    No monthly total on purpose: Qwen reported the busiest month's total as credits
+    (logged 2026-10-05, RM 7,234.04 called "credit transactions"). A total is not
+    income; credits are what the declared occupation is compared with.
+    """
+    def peak(amount_field: str, count_field: str, noun: str) -> str:
+        row = max(rows, key=lambda item: _amount(item, amount_field))
+        if _amount(row, amount_field) == 0:
+            return "none"
+        return f"{row['year_month']}:{_rm(_amount(row, amount_field))} from {_count_label(row[count_field], noun)}"
+
+    largest = max(rows, key=lambda item: _amount(item, "max_amount"))
+    return (
+        f"PROFILE_ACTIVITY_FOCUS|highest_credits={peak('monthly_credit', 'credit_count_monthly', 'credit')}|"
+        f"highest_debits={peak('monthly_debit', 'debit_count_monthly', 'debit')}|"
+        f"largest_single={largest['year_month']}:{_rm(_amount(largest, 'max_amount'))}"
+    )

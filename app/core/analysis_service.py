@@ -68,6 +68,8 @@ _SUMMARY_FIELD_NAMES = {
     "headline": "Headline", "point_1": "Point 1", "point_2": "Point 2", "point_3": "Point 3",
     "why_it_matters": "Why it matters", "verify_1": "Verify 1", "verify_2": "Verify 2", "risk_reason": "Risk reason",
 }
+# Summary lines kept even when they are not a sentence: the summary cannot be shown without them.
+_SUMMARY_REQUIRED_FIELDS = ("headline", "risk_reason")
 # Burst and gaps may select any of the six months (Qwen often lists every quiet month).
 _MAX_BURST_MONTHS = 6
 
@@ -100,6 +102,11 @@ def _pattern_label(name: str) -> str | None:
     return None if name == "none" else PATTERN_LABELS.get(name, name)
 
 
+def _is_sentence(text: str) -> bool:
+    """Three or more words. "No", "None given" or "debit_only" is a label, not an explanation."""
+    return len(text.split()) >= 3
+
+
 def _sentence_issues(key: str, text: str, retry_allowed: bool) -> list[str]:
     """Check one explanation: retry when it is missing or only a label.
 
@@ -107,7 +114,7 @@ def _sentence_issues(key: str, text: str, retry_allowed: bool) -> list[str]:
     retry when ``retry_allowed``, and is shown with that issue after it. Any real
     sentence is accepted as written; its figures are checked separately.
     """
-    if len(text.split()) >= 3:
+    if _is_sentence(text):
         return []
     if retry_allowed:
         raise _sentence_error(key)
@@ -542,22 +549,41 @@ class AnalysisService:
     ) -> "_RawOverallSummary":
         """Keep every line as written and list any that quote a figure or month not in the input.
 
-        A summary without a headline or risk reason costs the one retry. A missing verify
-        step costs the retry only on the first attempt; on the final attempt it is kept without.
+        A line that is not a sentence (e.g. point_2 "No", logged 2026-10-05) is left out and
+        listed as an issue; the headline and risk reason are kept with the issue, because
+        the summary cannot be shown without them. A summary without a headline or risk
+        reason costs the one retry. A missing verify step costs the retry only on the
+        first attempt; on the final attempt it is kept without.
         """
-        checked = raw
-        if not raw.verify_1 and raw.verify_2:
-            checked = raw.model_copy(update={"verify_1": raw.verify_2, "verify_2": ""})
-        required = ("headline", "risk_reason") if final_attempt else ("headline", "verify_1", "risk_reason")
+        checked, not_sentences = self._without_non_sentences(raw)
+        if not checked.verify_1 and checked.verify_2:
+            checked = checked.model_copy(update={"verify_1": checked.verify_2, "verify_2": ""})
+        required = _SUMMARY_REQUIRED_FIELDS if final_attempt else (*_SUMMARY_REQUIRED_FIELDS, "verify_1")
         missing = [field for field in required if not getattr(checked, field)]
         if missing:
             raise ModelOutputError(f"overall summary has no {', '.join(missing)}")
-        issues = [
+        issues = not_sentences + [
             f"{_SUMMARY_FIELD_NAMES[field]}: {issue}"
             for field in _RawOverallSummary.TEXT_FIELDS
             for issue in self._text_issues(getattr(checked, field), quotable, months)
         ]
         return self._with_issues(checked, {"overall_summary": self._log_issues(case_id, "overall_summary", issues)})
+
+    @staticmethod
+    def _without_non_sentences(raw: "_RawOverallSummary") -> "tuple[_RawOverallSummary, list[str]]":
+        """Blank the lines that are not sentences, except the two the summary needs; say which, as issues."""
+        blank, issues = {}, []
+        for field in _RawOverallSummary.TEXT_FIELDS:
+            text = getattr(raw, field)
+            if not text or _is_sentence(text):
+                continue
+            issue = f'{_SUMMARY_FIELD_NAMES[field]}: the AI wrote "{text}" instead of a sentence'
+            if field in _SUMMARY_REQUIRED_FIELDS:
+                issues.append(issue + ".")
+            else:
+                blank[field] = ""
+                issues.append(issue + ", so it is not shown.")
+        return (raw.model_copy(update=blank) if blank else raw), issues
 
     @staticmethod
     def _check_line(check: ReviewCheck) -> str:
