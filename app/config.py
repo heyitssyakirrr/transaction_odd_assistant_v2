@@ -77,8 +77,20 @@ class Settings:
     # Burst and gaps: a one-transaction month this many days or more after the previous
     # transaction is listed to the LLM as a long gap. Context only, never a risk level.
     review_long_gap_days: int = int(os.getenv("REVIEW_LONG_GAP_DAYS", "60"))
-    # Large transactions and layering have no configured amount: the AI decides them
-    # against each account's own usual level (see app/core/monthly_facts.py).
+    # Screening for call 1: the code finds unusual transactions and layering months against
+    # each account's OWN usual level (see app/core/monthly_facts.py); the AI describes the
+    # evidence, and the summary judges it against the occupation and decides the risk.
+    # Owned by compliance: change them here, never in code.
+    # Unusual transaction: at least this many times the account's usual largest single transaction.
+    review_unusual_times_usual: float = float(os.getenv("REVIEW_UNUSUAL_TIMES_USUAL", "2"))
+    # The smallest amount worth reviewing: a single transaction (or the money that passed
+    # through a month) below it is never a signal. Accounts with too little history to have a
+    # usual level are screened on this amount alone.
+    review_min_amount: float = float(os.getenv("REVIEW_MIN_AMOUNT", "2000"))
+    # Layering: money in and money out within this percentage of each other (of the larger
+    # side), in a month at least REVIEW_LAYERING_TIMES_USUAL_MONTH times the usual month.
+    review_layering_max_difference_pct: float = float(os.getenv("REVIEW_LAYERING_MAX_DIFFERENCE_PCT", "15"))
+    review_layering_times_usual_month: float = float(os.getenv("REVIEW_LAYERING_TIMES_USUAL_MONTH", "2"))
     # Retained for backwards-compatible .env files; no longer used by the
     # account-context workflow.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
@@ -133,6 +145,10 @@ class Settings:
             "LLM_SUMMARY_MAX_RESPONSE_TOKENS": self.llm_summary_max_response_tokens,
             "DORMANCY_MIN_ZERO_MONTHS": self.dormancy_min_zero_months,
             "REVIEW_LONG_GAP_DAYS": self.review_long_gap_days,
+            "REVIEW_UNUSUAL_TIMES_USUAL": self.review_unusual_times_usual,
+            "REVIEW_MIN_AMOUNT": self.review_min_amount,
+            "REVIEW_LAYERING_MAX_DIFFERENCE_PCT": self.review_layering_max_difference_pct,
+            "REVIEW_LAYERING_TIMES_USUAL_MONTH": self.review_layering_times_usual_month,
             "LLM_TIMELINE_MAX_RESPONSE_TOKENS": self.llm_timeline_max_response_tokens,
             "LLM_FLOW_MAX_RESPONSE_TOKENS": self.llm_flow_max_response_tokens,
             "LLM_PROFILE_MAX_RESPONSE_TOKENS": self.llm_profile_max_response_tokens,
@@ -151,6 +167,8 @@ class Settings:
             raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
         if not 0 < self.llm_top_p <= 1:
             raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1")
+        if not 0 < self.review_layering_max_difference_pct < 100:
+            raise ValueError("REVIEW_LAYERING_MAX_DIFFERENCE_PCT must be between 0 and 100")
         if self.llm_repetition_penalty < 0:
             raise ValueError("LLM_REPETITION_PENALTY must not be negative")
         if self.llm_structured_output_protocol not in {"json_schema", "guided_json", "json_object", "off"}:

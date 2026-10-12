@@ -14,11 +14,11 @@ from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedErro
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
-    PATTERN_LABELS, InactivityRun, RiskSignals, activity_pair_context, activity_six_month_context,
+    PATTERN_LABELS, InactivityRun, Screening, activity_months_context, activity_six_month_context,
     allowed_burst_gap_numbers, burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context,
     calendar_numbers, canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, burst_guide_months,
     has_in_month_gap, layering_context, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
-    risk_signals, unmatched_month_name, unquotable_number,
+    layering_months, risk_signals, unmatched_month_name, unquotable_number, unusual_transaction_months,
 )
 from app.core.models import (
     AccountAnalysisRequest, AccountAssessment, AssessmentLimitation, CustomerProfileContext,
@@ -26,8 +26,8 @@ from app.core.models import (
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
-    ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, OVERALL_SUMMARY_SYSTEM_PROMPT,
-    PROFILE_CONTEXT_SYSTEM_PROMPT, account_notes, activity_money_input, format_retry_suffix,
+    INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, OVERALL_SUMMARY_SYSTEM_PROMPT,
+    PROFILE_CONTEXT_SYSTEM_PROMPT, account_notes, activity_money_input, activity_money_prompt, format_retry_suffix,
     inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
 )
 from app.core.reference_data import resolve_citizenship, resolve_occupation
@@ -52,8 +52,10 @@ _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "money_in_and_out": ("monthly_credit", "monthly_debit"),
     "burst_and_gaps": ("txn_count_monthly", "pct_burst", "pct_trx_gap"),
 }
-# Months a found pattern may select: one largest-transaction month (or two compared), up to six layering months.
-_MAX_MONTHS: dict[ReviewCheckName, int] = {"activity_and_amount_change": 2, "money_in_and_out": 6}
+# The two checks the code screens (call 1 only describes them), with the pattern each one finds.
+_SCREENED_PATTERNS: dict[ReviewCheckName, str] = {
+    "activity_and_amount_change": "large_transaction", "money_in_and_out": "layering",
+}
 def _sentence_issue(text: str) -> str:
     """Why an explanation does not count as one, in plain words for staff."""
     return "Is a label, not a sentence: the AI wrote a pattern name or a few words instead of an explanation."
@@ -63,7 +65,7 @@ _SAYS_NO_ACTIVITY = re.compile(
     r"\bno (?:activity|transactions?|debit or credit flow|flow)\b[^.]{0,30}\bsix months\b", re.IGNORECASE)
 _SUMMARY_FIELD_NAMES = {
     "headline": "Headline", "point_1": "Point 1", "point_2": "Point 2", "point_3": "Point 3",
-    "why_it_matters": "Why it matters", "verify_1": "Verify 1", "verify_2": "Verify 2", "risk_reason": "Risk reason",
+    "why_it_matters": "Why it matters", "occupation_fit": "Fit with occupation", "verify_1": "Verify 1", "verify_2": "Verify 2", "risk_reason": "Risk reason",
 }
 # Summary lines kept even when they are not a sentence: the summary cannot be shown without them.
 _SUMMARY_REQUIRED_FIELDS = ("headline", "risk_reason")
@@ -132,20 +134,6 @@ def _sentence_error(key: str) -> ModelOutputError:
 
 
 @dataclass(frozen=True)
-class _Check:
-    """One check's part of a flat answer; keys are ``{prefix}_insight``, ``{prefix}_months`` and so on."""
-    prefix: str
-    outcome: Outcome | None
-    insight: str
-    pattern: str
-    months_text: str | None
-
-    @property
-    def insight_key(self) -> str:
-        return f"{self.prefix}_insight"
-
-
-@dataclass(frozen=True)
 class _LlmCall:
     """One focused LLM call. Calls never share a prompt, so changing one cannot alter another."""
 
@@ -178,7 +166,16 @@ class AnalysisService:
         catalog = self._evidence_catalog(request, profile)
         monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
         run = self._inactivity_run(monthly)
-        calls = self._pattern_calls(request.case_id, monthly, catalog, run)
+        screening = self._screening()
+        screened: dict[ReviewCheckName, list[str]] = {
+            "activity_and_amount_change": unusual_transaction_months(monthly, screening),
+            "money_in_and_out": layering_months(monthly, screening),
+        }
+        logger.info(
+            "Screening: case=%s unusual_transaction=%s layering=%s", request.case_id,
+            ",".join(screened["activity_and_amount_change"]) or "none", ",".join(screened["money_in_and_out"]) or "none",
+        )
+        calls = self._pattern_calls(request.case_id, monthly, catalog, run, screening)
 
         call_tasks = [
             asyncio.create_task(self._complete_with_retry(
@@ -203,29 +200,28 @@ class AnalysisService:
             else:
                 results[call.stage] = result
 
-        checks = self._build_checks(calls, results, monthly, catalog, run)
+        checks = self._build_checks(calls, results, monthly, catalog, run, screened)
         if not results:
             return self._assessment(request, checks, None, profile_context)
-        summary = await self._overall_summary_or_none(request.case_id, monthly, run, checks, profile, profile_context)
+        summary = await self._overall_summary_or_none(
+            request.case_id, monthly, run, checks, profile, profile_context, screening)
         return self._assessment(request, checks, summary, profile_context)
 
     def _pattern_calls(
         self, case_id: str, monthly: list[dict[str, Any]], catalog: dict[str, EvidenceItem],
-        run: InactivityRun | None,
+        run: InactivityRun | None, screening: Screening,
     ) -> list[_LlmCall]:
-        activity_input = activity_money_input(monthly)
-        # The insights compare months with each other and with the usual level, so they may
-        # quote any figure the AI was given, and only those.
-        activity_numbers = numbers_in_text(activity_input) | calendar_numbers(monthly)
+        activity_prompt, activity_input = activity_money_prompt(monthly, screening), activity_money_input(monthly)
+        # The descriptions may quote any figure the AI was given (facts and notes), and only those.
+        activity_numbers = numbers_in_text(activity_prompt + activity_input) | calendar_numbers(monthly)
         return [
             _LlmCall(
                 stage="activity-money-context",
                 checks=("activity_and_amount_change", "money_in_and_out"),
-                system_prompt=ACTIVITY_MONEY_SYSTEM_PROMPT,
+                system_prompt=activity_prompt,
                 prompt_input=activity_input,
                 model_type=_RawActivityMoney,
-                validator=lambda raw, final: self._validate_activity_money(
-                    raw, catalog, monthly, activity_numbers, case_id, final),
+                validator=lambda raw, final: self._validate_activity_money(raw, monthly, activity_numbers, case_id, final),
             ),
             _LlmCall(
                 stage="inactivity-burst-gaps-context",
@@ -249,64 +245,24 @@ class AnalysisService:
     # match the CSV is shown as written, with the problem listed under it for staff.
 
     def _validate_activity_money(
-        self, raw: "_RawActivityMoney", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
-        allowed_numbers: set[Decimal], case_id: str, final_attempt: bool,
+        self, raw: "_RawActivityMoney", monthly: list[dict[str, Any]], allowed_numbers: set[Decimal],
+        case_id: str, final_attempt: bool,
     ) -> "_RawActivityMoney":
-        known_months = self._known_months(catalog)
-        updates: dict[str, Any] = {}
-        issues: dict[str, list[str]] = {}
-        problems: dict[str, str] = {}
-        for name, check in raw.checks().items():
-            try:
-                updates.update(self._checked_amount_or_flow(
-                    name, check, monthly, known_months, allowed_numbers, case_id, final_attempt, issues))
-            except ModelOutputError as exc:
-                problems[name] = str(exc)
-        return self._accepted(raw, updates, issues, problems, case_id, final_attempt, tuple(raw.checks()))
-
-    def _checked_amount_or_flow(
-        self, name: ReviewCheckName, check: _Check, monthly: list[dict[str, Any]], known_months: set[str],
-        allowed_numbers: set[Decimal], case_id: str, final_attempt: bool, issues: dict[str, list[str]],
-    ) -> dict[str, Any]:
-        """Validate one check of call 1; returns its corrected fields and records its issues.
-
-        The decision (large or not, layering or not) is the AI's and is never changed. Only
-        what the rows make impossible is listed as an issue: months that are not in the data,
-        a figure the AI was not given, a pattern that cannot fit the selected months.
-        """
-        prefix = check.prefix
-        if check.outcome is None:
-            raise ModelOutputError(f"{prefix}_outcome is missing; it must be pattern_found or no_pattern_found")
-        found: list[str] = []
-        months: list[str] = []
-        updates: dict[str, Any] = {f"{prefix}_pattern": "none", f"{prefix}_months": _NO_MONTHS}
-        if check.outcome == "pattern_found":
-            found += _sentence_issues(check.insight_key, check.insight, retry_allowed=not final_attempt)
-            months = self._split_months(
-                check.months_text or "", f"{prefix}_months", min_count=1, max_count=_MAX_MONTHS[name])
-            self._validate_transaction_months(months, known_months, name)
-            if name == "activity_and_amount_change" and len(months) == 2 and self._unchanged(name, monthly, months):
-                raise ModelOutputError(f"{prefix}_months {months[0]} and {months[1]} show no change in this check's figures")
-            pattern = canonical_pattern(name, check.pattern)
-            updates = {f"{prefix}_pattern": pattern, f"{prefix}_months": ",".join(months)}
-            if problem := pattern_problem(name, pattern, monthly, months, long_gap_days=self._long_gap_days()):
-                found.append(f"Pattern label: {problem}")
-        # The insight compares months, so it may name any month with transactions. A month with
-        # none cannot hold a transaction, so naming it is still caught (logged 2026-10-05: "RM
-        # 10,000.00 in June 2025" for a 202511 transaction, June 2025 being a quiet month).
+        """Call 1 only describes the screening's findings. A missing or label-only description costs
+        the one retry; anything else (a figure it was not given, a wrong month) is listed for staff."""
+        # A description may name any month with transactions. A month with none cannot hold a
+        # transaction, so naming it is still caught (logged 2026-10-05: "RM 10,000.00 in June
+        # 2025" for a 202511 transaction, June 2025 being a quiet month).
         active_months = [row["year_month"] for row in monthly if row["txn_count_monthly"] > 0]
-        found += self._text_issues(check.insight, allowed_numbers, active_months, figures="the AI was given")
-        if any(row["txn_count_monthly"] for row in monthly) and _SAYS_NO_ACTIVITY.search(check.insight):
-            found.append("Says there was no activity in the six months, but transactions were recorded.")
-        issues[name] = self._log_issues(case_id, name, found)
-        return updates
-
-    @staticmethod
-    def _unchanged(name: ReviewCheckName, monthly: list[dict[str, Any]], months: list[str]) -> bool:
-        """True when two selected months show the same figures for this check (not a comparison)."""
-        by_month = {row["year_month"]: row for row in monthly}
-        first, second = (by_month[month] for month in months)
-        return all(Decimal(str(first[field])) == Decimal(str(second[field])) for field in _EVIDENCE_FIELDS[name])
+        issues: dict[str, list[str]] = {}
+        for name, key in _RawActivityMoney.INSIGHT_KEYS.items():
+            text = getattr(raw, key)
+            found = _sentence_issues(key, text, retry_allowed=not final_attempt)
+            found += self._text_issues(text, allowed_numbers, active_months, figures="the AI was given")
+            if active_months and _SAYS_NO_ACTIVITY.search(text):
+                found.append("Says there was no activity in the six months, but transactions were recorded.")
+            issues[name] = self._log_issues(case_id, name, found)
+        return self._with_issues(raw, issues)
 
     def _validate_inactivity_burst_gaps(
         self, raw: "_RawInactivityBurstGaps", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
@@ -397,6 +353,16 @@ class AnalysisService:
         raw.issues = issues
         return raw
 
+    def _screening(self) -> Screening:
+        """The compliance-owned screening settings (see app/config.py)."""
+        settings = self._settings
+        return Screening(
+            unusual_times_usual=Decimal(str(settings.review_unusual_times_usual)),
+            min_amount=Decimal(str(settings.review_min_amount)),
+            layering_max_difference_pct=Decimal(str(settings.review_layering_max_difference_pct)),
+            layering_times_usual_month=Decimal(str(settings.review_layering_times_usual_month)),
+        )
+
     def _long_gap_days(self) -> Decimal:
         return Decimal(self._settings.review_long_gap_days)
 
@@ -435,10 +401,35 @@ class AnalysisService:
 
     def _build_checks(
         self, calls: list[_LlmCall], results: dict[str, Any], monthly: list[dict[str, Any]],
-        catalog: dict[str, EvidenceItem], run: InactivityRun | None,
+        catalog: dict[str, EvidenceItem], run: InactivityRun | None, screened: dict[ReviewCheckName, list[str]],
     ) -> list[ReviewCheck]:
         stage_of = {name: call.stage for call in calls for name in call.checks}
-        return [self._build_check(name, results.get(stage_of[name]), monthly, catalog, run) for name in _CHECK_ORDER]
+        return [
+            self._screened_check(name, results.get(stage_of[name]), monthly, catalog, screened[name])
+            if name in screened else self._build_check(name, results.get(stage_of[name]), monthly, catalog, run)
+            for name in _CHECK_ORDER
+        ]
+
+    def _screened_check(
+        self, name: ReviewCheckName, raw: "_RawActivityMoney | None", monthly: list[dict[str, Any]],
+        catalog: dict[str, EvidenceItem], months: list[str],
+    ) -> ReviewCheck:
+        """A check the code screened: its outcome and months are the screening's, its explanation
+        the AI's. If call 1 failed, the finding still stands with its figures."""
+        insight = getattr(raw, _RawActivityMoney.INSIGHT_KEYS[name], "").strip() if raw is not None else ""
+        issues = raw.issues.get(name, []) if raw is not None else []
+        if not insight:
+            issues = [*issues, "No AI description was produced; the finding and figures below are from the CSV."]
+        if name == "activity_and_amount_change":
+            facts = activity_months_context(monthly, months) if months else activity_six_month_context(monthly)
+        else:
+            facts = layering_context(monthly, months)
+        return ReviewCheck(
+            check=name, title=_CHECK_TITLES[name], outcome="pattern_found" if months else "no_pattern_found",
+            pattern=_pattern_label(_SCREENED_PATTERNS[name]) if months else None, months=months,
+            insight=insight or None, issues=issues, facts=facts, table=self._table(name, monthly, months),
+            evidence=self._evidence_for_months(name, months, catalog),
+        )
 
     def _build_check(
         self, name: ReviewCheckName, raw: Any, monthly: list[dict[str, Any]],
@@ -483,19 +474,7 @@ class AnalysisService:
                 table=self._table(name, monthly, months),
                 evidence=self._evidence_for_months(name, evidence_months, catalog),
             )
-        check = raw.checks()[name]
-        months = [] if check.outcome != "pattern_found" else check.months_text.split(",")
-        if name == "activity_and_amount_change":
-            facts = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
-        else:
-            facts = layering_context(monthly, months)
-        return ReviewCheck(
-            check=name, title=_CHECK_TITLES[name], outcome=check.outcome,
-            pattern=_pattern_label(check.pattern), months=months,
-            insight=check.insight.strip() or None, issues=raw.issues.get(name, []), facts=facts,
-            table=self._table(name, monthly, months),
-            evidence=self._evidence_for_months(name, months, catalog),
-        )
+        raise ValueError(f"{name} is a screened check; build it with _screened_check")
 
     @staticmethod
     def _table(name: ReviewCheckName, monthly: list[dict[str, Any]], highlight: list[str]) -> EvidenceTable:
@@ -512,14 +491,14 @@ class AnalysisService:
 
     async def _overall_summary_or_none(
         self, case_id: str, monthly: list[dict[str, Any]], run: InactivityRun | None, checks: list[ReviewCheck],
-        profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None,
+        profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None, screening: Screening,
     ) -> "tuple[OverallSummary, RiskLevel] | None":
         prompt_input = overall_summary_input(
             monthly, run, self._settings.dormancy_min_zero_months,
             [self._check_line(check) for check in checks],
             [check.check for check in checks if check.outcome == "not_verified"],
             self._profile_lines(profile, profile_context),
-            self._risk_signals(monthly, checks),
+            risk_signals(monthly, screening),
         )
         quotable = numbers_in_text(prompt_input) | calendar_numbers(monthly)
         try:
@@ -535,6 +514,7 @@ class AnalysisService:
         points = list(dict.fromkeys(point for point in (raw.point_1, raw.point_2, raw.point_3) if point))
         summary = OverallSummary(
             verified=True, headline=raw.headline, points=points, why_it_matters=raw.why_it_matters or None,
+            occupation_fit=raw.occupation_fit or None,
             verify_first=[item for item in (raw.verify_1, raw.verify_2) if item], risk_reason=raw.risk_reason,
             issues=raw.issues.get("overall_summary", []),
         )
@@ -582,13 +562,6 @@ class AnalysisService:
         return (raw.model_copy(update=blank) if blank else raw), issues
 
     @staticmethod
-    def _risk_signals(monthly: list[dict[str, Any]], checks: list[ReviewCheck]) -> RiskSignals:
-        """The risk guide reads what call 1's AI decided: its large-transaction and layering months.
-        A check that could not be verified is passed as not checked, never guessed."""
-        decided = {check.check: None if check.outcome == "not_verified" else check.months for check in checks}
-        return risk_signals(monthly, decided["activity_and_amount_change"], decided["money_in_and_out"])
-
-    @staticmethod
     def _check_line(check: ReviewCheck) -> str:
         months = ",".join(check.months) or "none"
         return (
@@ -616,7 +589,12 @@ class AnalysisService:
         self, request: AccountAnalysisRequest, checks: list[ReviewCheck],
         summary: "tuple[OverallSummary, RiskLevel] | None", profile_context: CustomerProfileContext | None,
     ) -> AccountAssessment:
-        all_checks_verified = all(check.outcome != "not_verified" for check in checks)
+        # A screened check without its AI description still holds a real finding, but the case
+        # must not be closed from it: staff read the figures themselves.
+        all_checks_verified = all(
+            check.outcome != "not_verified" and (check.check not in _SCREENED_PATTERNS or check.insight)
+            for check in checks
+        )
         if summary is None:
             overall, risk_level = OverallSummary(
                 verified=False, headline=_FALLBACK_HEADLINE, risk_reason=_FALLBACK_RISK_REASON,
@@ -893,7 +871,9 @@ def _cap(text: str, limit: int) -> str:
     """Shorten text to ``limit`` characters at a word boundary."""
     if len(text) <= limit:
         return text
-    cut = text[:limit].rsplit(" ", 1)[0].rstrip(",;: ")
+    # Leave room for "...": a cut of exactly ``limit`` plus "..." failed its own limit
+    # (logged 2026-10-12: 603 characters rejected, so the whole call failed twice).
+    cut = text[:limit - 3].rsplit(" ", 1)[0].rstrip(",;: ")
     return cut + "..."
 
 
@@ -966,28 +946,13 @@ class _RawAnswer(BaseModel):
 
 
 class _RawActivityMoney(_RawAnswer):
-    _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ("activity_outcome", "money_flow_outcome")
-    _PATTERN_KEYS: ClassVar[tuple[str, ...]] = ("activity_pattern", "money_flow_pattern")
+    """Call 1: two descriptions of the screening's findings, nothing to decide."""
+    INSIGHT_KEYS: ClassVar[dict[ReviewCheckName, str]] = {
+        "activity_and_amount_change": "activity_insight", "money_in_and_out": "money_flow_insight"}
     _TEXT_LIMITS: ClassVar[dict[str, int]] = {
         "activity_insight": _INSIGHT_TEXT_LIMIT, "money_flow_insight": _INSIGHT_TEXT_LIMIT}
     activity_insight: str = Field(default="", max_length=_INSIGHT_TEXT_LIMIT)
-    activity_pattern: str = Field(default="none", max_length=40)
-    # Outcome and months may be missing; the validator then retries or marks only that check.
-    activity_months: str | None = Field(default=None, max_length=200)
-    activity_outcome: Outcome | None = None
     money_flow_insight: str = Field(default="", max_length=_INSIGHT_TEXT_LIMIT)
-    money_flow_pattern: str = Field(default="none", max_length=40)
-    money_flow_months: str | None = Field(default=None, max_length=200)
-    money_flow_outcome: Outcome | None = None
-
-    def checks(self) -> dict[ReviewCheckName, _Check]:
-        return {
-            "activity_and_amount_change": _Check(
-                "activity", self.activity_outcome, self.activity_insight, self.activity_pattern, self.activity_months),
-            "money_in_and_out": _Check(
-                "money_flow", self.money_flow_outcome, self.money_flow_insight, self.money_flow_pattern,
-                self.money_flow_months),
-        }
 
 
 class _RawInactivityBurstGaps(_RawAnswer):
@@ -1005,7 +970,8 @@ class _RawInactivityBurstGaps(_RawAnswer):
 
 class _RawOverallSummary(_RawAnswer):
     TEXT_FIELDS: ClassVar[tuple[str, ...]] = (
-        "headline", "point_1", "point_2", "point_3", "why_it_matters", "verify_1", "verify_2", "risk_reason",
+        "headline", "point_1", "point_2", "point_3", "why_it_matters", "occupation_fit", "verify_1", "verify_2",
+        "risk_reason",
     )
     _TEXT_LIMITS: ClassVar[dict[str, int]] = {
         field: _HEADLINE_TEXT_LIMIT if field == "headline" else _SUMMARY_TEXT_LIMIT for field in TEXT_FIELDS
@@ -1015,6 +981,7 @@ class _RawOverallSummary(_RawAnswer):
     point_2: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     point_3: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     why_it_matters: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
+    occupation_fit: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     verify_1: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     verify_2: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     risk_reason: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)

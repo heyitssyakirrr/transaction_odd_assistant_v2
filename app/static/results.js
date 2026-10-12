@@ -38,6 +38,8 @@ const els = {
   summaryPoints: document.querySelector("#summary-points"),
   whyBlock: document.querySelector("#why-block"),
   whyItMatters: document.querySelector("#why-it-matters"),
+  occupationBlock: document.querySelector("#occupation-block"),
+  occupationFit: document.querySelector("#occupation-fit"),
   verifyBlock: document.querySelector("#verify-block"),
   verifyFirst: document.querySelector("#verify-first"),
   riskReason: document.querySelector("#risk-reason"),
@@ -226,6 +228,9 @@ function renderSummary(overall, riskLevel) {
 
   toggle(els.whyBlock, Boolean(overall.why_it_matters));
   els.whyItMatters.textContent = overall.why_it_matters || "";
+
+  toggle(els.occupationBlock, Boolean(overall.occupation_fit));
+  els.occupationFit.textContent = overall.occupation_fit || "";
 
   const verify = overall.verify_first || [];
   toggle(els.verifyBlock, verify.length > 0);

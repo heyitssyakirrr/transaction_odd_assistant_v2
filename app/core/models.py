@@ -126,6 +126,9 @@ class OverallSummary(BaseModel):
     headline: str = Field(min_length=1, max_length=300)
     points: list[str] = Field(default_factory=list, max_length=3)
     why_it_matters: str | None = None
+    # The summary's judgement of whether the evidence fits the declared occupation. Shown to
+    # staff; it does not change the risk level.
+    occupation_fit: str | None = None
     verify_first: list[str] = Field(default_factory=list, max_length=2)
     risk_reason: str | None = None
     # Summary lines that quote a figure or month not in the input, e.g. "Point 2: Quotes 999.00 ...".

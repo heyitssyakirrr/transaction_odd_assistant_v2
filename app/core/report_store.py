@@ -137,6 +137,8 @@ class ReportStore:
         points = "".join(f"<li>{html.escape(point)}</li>" for point in overall.points) or \
             "<li class='muted'>No summary points are available. Review each check below.</li>"
         why = f"<div class='block'><h4>Why it matters</h4><p>{html.escape(overall.why_it_matters)}</p></div>" if overall.why_it_matters else ""
+        fit = (f"<div class='block wide'><h4>Fit with occupation</h4><p>{html.escape(overall.occupation_fit)}</p></div>"
+               if overall.occupation_fit else "")
         verify = (
             "<div class='block'><h4>What to verify first</h4><ol>"
             + "".join(f"<li>{html.escape(item)}</li>" for item in overall.verify_first) + "</ol></div>"
@@ -185,6 +187,7 @@ ul.points li {{ margin: 6px 0; }}
 .block {{ background: #fff; border: 1px solid #e3e5e9; border-radius: 6px; padding: 12px 16px; }}
 .block h4 {{ margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .4px; color: #6b7280; }}
 .block p, .block ol {{ margin: 0; }}
+.block.wide {{ grid-column: 1 / -1; }}
 .reason {{ background: #fff; border-radius: 6px; padding: 10px 14px; border: 1px solid #e3e5e9; }}
 .card {{ background: #fff; border: 1px solid #e3e5e9; border-left: 4px solid #d3d6db; border-radius: 6px; margin: 14px 0; padding: 16px 18px; }}
 .card-head {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }}
@@ -219,10 +222,10 @@ table.kv td:first-child {{ width: 38%; color: #6b7280; }}
 </section>
 <h2>Summary</h2>
 <ul class="points">{points}</ul>
-<div class="blocks">{why}{verify}</div>
+<div class="blocks">{why}{verify}{fit}</div>
 {reason}
 <h2>Review checks</h2>
-<p class="muted">Explanations are written by the AI; every figure in the tables comes from the uploaded CSV. Months the AI selected are in bold.
+<p class="muted">Explanations are written by the AI; every figure in the tables comes from the uploaded CSV. The months each check found are in bold.
 {result.months_reviewed} month(s) reviewed; {result.profile_records_matched} linked profile record(s) available.</p>
 {checks}
 {profile}

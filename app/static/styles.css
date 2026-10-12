@@ -607,6 +607,7 @@ button:disabled { cursor: wait; opacity: .65; }
 }
 
 .summary-block p { margin: 0; font-size: 14px; }
+.summary-block-wide { grid-column: 1 / -1; }
 .summary-block ol { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 14px; }
 
 .risk-reason {

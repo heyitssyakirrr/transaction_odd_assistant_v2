@@ -99,6 +99,102 @@ def account_usual_line(usual: AccountUsual) -> str:
     )
 
 
+# --- Screening: the code finds the signals, the AI describes them ---------------------
+# A 7B model cannot reliably judge where a figure crosses a line (logged 2026-10-12: RM 8.00,
+# and 1.2 and 1.7 times the usual, called large; every month called layering). So the code
+# screens each account against its OWN usual level with compliance-owned settings; call 1
+# describes the evidence and the summary judges it against the occupation and decides risk.
+
+@dataclass(frozen=True)
+class Screening:
+    unusual_times_usual: Decimal      # unusual: this many times the usual largest single transaction
+    min_amount: Decimal               # never a signal below this amount
+    layering_max_difference_pct: Decimal
+    layering_times_usual_month: Decimal
+
+
+def _number(value: Decimal) -> str:
+    """2 rather than 2.00; 1.5 stays 1.5."""
+    return f"{value.normalize():f}"
+
+
+def unusual_transaction_months(rows: list[dict[str, Any]], screening: Screening) -> list[str]:
+    """Months whose largest single transaction is at least ``min_amount`` and, when the account has
+    a usual level, at least ``unusual_times_usual`` times it. Too little history: the amount alone."""
+    usual = account_usual(rows).largest_single
+    return [
+        row["year_month"] for row in rows
+        if row["txn_count_monthly"] and _amount(row, "max_amount") >= screening.min_amount
+        and (usual is None or _amount(row, "max_amount") >= screening.unusual_times_usual * usual)
+    ]
+
+
+def layering_months(rows: list[dict[str, Any]], screening: Screening) -> list[str]:
+    """Months where money in and money out are both present, within ``layering_max_difference_pct``
+    of each other, with at least ``min_amount`` passing through, in a month at least
+    ``layering_times_usual_month`` times the usual month (too little history: the amount alone)."""
+    usual = account_usual(rows).month_total
+    return [
+        row["year_month"] for row in rows
+        if _has_money_in_and_out(row)
+        and _layering_difference(row) <= screening.layering_max_difference_pct
+        and min(_amount(row, "monthly_credit"), _amount(row, "monthly_debit")) >= screening.min_amount
+        and (usual is None or _amount(row, "total_amount") >= screening.layering_times_usual_month * usual)
+    ]
+
+
+def unusual_transaction_note(rows: list[dict[str, Any]], screening: Screening) -> str:
+    """What call 1 must describe for the unusual-transaction check: the screening's finding, in words."""
+    usual = account_usual(rows).largest_single
+    months = unusual_transaction_months(rows, screening)
+    if months:
+        by_month = {row["year_month"]: row for row in rows}
+        found = "; ".join(
+            f"RM {_money(_amount(by_month[month], 'max_amount'))} in {month}"
+            + (f" ({_times(_amount(by_month[month], 'max_amount'), usual)} times the usual largest of RM {_money(usual)})"
+               if usual else "") for month in months)
+        found_text = "an unusual transaction" if len(months) == 1 else "unusual transactions"
+        compare = ("how it compares with the account's usual largest and its other months" if usual else
+                   "that the account has too little history for a usual level, so the amount itself was screened")
+        return (f"\nUNUSUAL TRANSACTION NOTE: The screening found {found_text}: {found}. activity_insight describes "
+                f"this evidence: the amount, the month and {compare}.\n")
+    top = _amount(_largest_single(rows), "max_amount")
+    if not top:
+        return ("\nUNUSUAL TRANSACTION NOTE: The screening found no unusual transaction: there were no transactions. "
+                "activity_insight says so.\n")
+    reason = (f"below the RM {_money(screening.min_amount)} minimum the screening reviews" if top < screening.min_amount
+              else f"{_times(top, usual)} times the usual largest of RM {_money(usual)}, under "
+                   f"{_number(screening.unusual_times_usual)} times")
+    return (f"\nUNUSUAL TRANSACTION NOTE: The screening found no unusual transaction. The largest single transaction was "
+            f"RM {_money(top)} in {', '.join(_months_with(rows, top))}, {reason}. activity_insight describes this: the "
+            "largest amount, every month it occurred, and why it is not unusual for this account.\n")
+
+
+def layering_note(rows: list[dict[str, Any]], screening: Screening) -> str:
+    """What call 1 must describe for the layering check: the screening's finding, in words."""
+    usual = account_usual(rows).month_total
+    months = layering_months(rows, screening)
+    by_month = {row["year_month"]: row for row in rows}
+
+    def phrase(month: str) -> str:
+        row = by_month[month]
+        size = f", {_times(_amount(row, 'total_amount'), usual)} times the usual month" if usual else ""
+        return f"{_layering_phrase(row)}{size}"
+
+    if months:
+        return (f"\nLAYERING NOTE: The screening found money passing through: {'; '.join(phrase(m) for m in months)}. "
+                "money_flow_insight describes this evidence: for each month the money in, money out and difference, and "
+                "that almost all the money that came in went out again in a month far bigger than usual.\n")
+    closest = closest_money_in_and_out(rows)
+    if closest is None:
+        return ("\nLAYERING NOTE: The screening found no layering: no month had both money in and money out. "
+                "money_flow_insight says so in plain words.\n")
+    return (f"\nLAYERING NOTE: The screening found no layering: no month had money in and money out within "
+            f"{_number(screening.layering_max_difference_pct)}% of each other at {_number(screening.layering_times_usual_month)} "
+            f"times the usual month or more. The closest month was {phrase(closest['year_month'])}. money_flow_insight "
+            "describes this in plain words.\n")
+
+
 def _largest_single(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """The month with the largest single transaction of the six (the earliest on a tie)."""
     return max(rows, key=lambda row: _amount(row, "max_amount"))
@@ -122,12 +218,18 @@ def amount_facts(rows: list[dict[str, Any]], usual: AccountUsual) -> str:
             f"month_total={_money(_amount(row, 'total_amount'))}|"
             f"share_of_month_total={_share(largest, _amount(row, 'total_amount'))}"
         )
-    top = _largest_single(rows)
+    top_amount = _amount(_largest_single(rows), "max_amount")
     lines.append(
-        f"LARGEST_IN_SIX_MONTHS|{top['year_month']}|largest_single={_money(_amount(top, 'max_amount'))}|"
-        f"times_usual_largest={_times(_amount(top, 'max_amount'), usual.largest_single)}"
+        f"LARGEST_IN_SIX_MONTHS|largest_single={_money(top_amount)}|months_with_this_amount={','.join(_months_with(rows, top_amount))}|"
+        f"times_usual_largest={_times(top_amount, usual.largest_single)}"
     )
     return "\n".join(lines)
+
+
+def _months_with(rows: list[dict[str, Any]], amount: Decimal) -> list[str]:
+    """Every month whose largest single transaction is ``amount``. Naming only the first let Qwen
+    miss a tied month (logged 2026-10-12: "April and May" when August had the same RM 1,500.00)."""
+    return [row["year_month"] for row in rows if row["txn_count_monthly"] and _amount(row, "max_amount") == amount]
 
 
 def _vs_usual_largest(row: dict[str, Any], usual: AccountUsual) -> str:
@@ -138,18 +240,16 @@ def _vs_usual_largest(row: dict[str, Any], usual: AccountUsual) -> str:
             f"({_rm(usual.largest_single)})")
 
 
-def activity_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
-    """Key figures for one or two selected months, led by the amounts."""
+def activity_months_context(rows: list[dict[str, Any]], months: list[str]) -> str:
+    """Key figures for the unusual-transaction months: full figures for one or two, the amount
+    per month for more, so the text stays short."""
     by_month = {row["year_month"]: row for row in rows}
-    if len(months) == 1:
-        row = by_month[months[0]]
-        return f"{months[0]}: {_amount_phrase(row)}{_vs_usual_largest(row, account_usual(rows))}."
-    first, second = (by_month[month] for month in months)
-    return (
-        f"{months[0]} to {months[1]}: total {_rm(_amount(first, 'total_amount'))} to {_rm(_amount(second, 'total_amount'))}; "
-        f"largest single {_rm(_amount(first, 'max_amount'))} to {_rm(_amount(second, 'max_amount'))}; "
-        f"transactions {first['txn_count_monthly']} to {second['txn_count_monthly']}."
-    )
+    usual = account_usual(rows)
+    selected = [by_month[month] for month in months]
+    if len(selected) > 2:
+        return "; ".join(f"{row['year_month']}: largest single {_rm(_amount(row, 'max_amount'))}" for row in selected) + (
+            f" (usual largest {_rm(usual.largest_single)})." if usual.largest_single else ".")
+    return "; ".join(f"{row['year_month']}: {_amount_phrase(row)}{_vs_usual_largest(row, usual)}" for row in selected) + "."
 
 
 def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
@@ -418,10 +518,6 @@ def layering_facts(rows: list[dict[str, Any]], usual: AccountUsual) -> str:
             f"month_total={_money(_amount(row, 'total_amount'))}|"
             f"times_usual_month={_times(_amount(row, 'total_amount'), usual.month_total)}"
         )
-    closest = closest_money_in_and_out(rows)
-    lines.append("CLOSEST_MONEY_IN_AND_OUT|" + (
-        f"{closest['year_month']}|difference={_difference_fact(closest)}" if closest
-        else "no month has both money in and money out"))
     return "\n".join(lines)
 
 
@@ -452,32 +548,27 @@ def _short_layering_list(rows: list[dict[str, Any]]) -> str:
 
 @dataclass(frozen=True)
 class RiskSignals:
-    """What call 1's AI decided: its large single transactions and its layering months.
-    None means that check could not be verified. Facts only; the AI decides the risk level."""
+    """The screening's signals for the summary's risk guide: unusual transactions and layering
+    months, each with its figures. Facts only; the AI decides the risk level."""
 
-    large_singles: tuple[str, ...] | None
-    layering: tuple[str, ...] | None
+    unusual: tuple[str, ...]
+    layering: tuple[str, ...]
 
 
-def risk_signals(
-    rows: list[dict[str, Any]], large_months: list[str] | None, layering_months: list[str] | None,
-) -> RiskSignals:
-    """The AI's decided months, each with its figures from the rows (None = not checked)."""
+def risk_signals(rows: list[dict[str, Any]], screening: Screening) -> RiskSignals:
     by_month = {row["year_month"]: row for row in rows}
     return RiskSignals(
-        large_singles=None if large_months is None else tuple(
-            f"{month}: {_rm(_amount(by_month[month], 'max_amount'))}" for month in large_months),
-        layering=None if layering_months is None else tuple(
-            _layering_phrase(by_month[month]) for month in layering_months),
+        unusual=tuple(f"{month}: {_rm(_amount(by_month[month], 'max_amount'))}"
+                      for month in unusual_transaction_months(rows, screening)),
+        layering=tuple(_layering_phrase(by_month[month]) for month in layering_months(rows, screening)),
     )
 
 
 def risk_signals_line(signals: RiskSignals) -> str:
-    """The summary's data line for the risk guide; it lists the checks' decisions, never a level."""
-    def listed(values: tuple[str, ...] | None) -> str:
-        return "not_checked" if values is None else "; ".join(values) or "none"
-    return (f"RISK_SIGNALS|large_single_transactions={listed(signals.large_singles)}|"
-            f"layering_months={listed(signals.layering)}")
+    """The summary's data line for the risk guide. "unusual_transaction", not "large_single_...":
+    Qwen confused it with the "largest single" transaction every account has (logged 2026-10-12)."""
+    return (f"RISK_SIGNALS|unusual_transaction={'; '.join(signals.unusual) or 'none'}|"
+            f"layering_months={'; '.join(signals.layering) or 'none'}")
 
 
 def long_gap_months(rows: list[dict[str, Any]], long_gap_days: Decimal) -> list[dict[str, Any]]:
