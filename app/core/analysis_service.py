@@ -18,7 +18,8 @@ from app.core.monthly_facts import (
     allowed_burst_gap_numbers, burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context,
     calendar_numbers, canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, burst_guide_months,
     has_in_month_gap, layering_context, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
-    layering_months, risk_signals, unmatched_month_name, unquotable_number, unusual_transaction_months,
+    RiskSignals, layering_months, risk_because, risk_signals, screening_risk, unmatched_month_name, unquotable_number,
+    unusual_transaction_months,
 )
 from app.core.models import (
     AccountAnalysisRequest, AccountAssessment, AssessmentLimitation, CustomerProfileContext,
@@ -26,9 +27,9 @@ from app.core.models import (
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
-    INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, OVERALL_SUMMARY_SYSTEM_PROMPT,
+    INACTIVITY_BURST_GAPS_SYSTEM_PROMPT,
     PROFILE_CONTEXT_SYSTEM_PROMPT, account_notes, activity_money_input, activity_money_prompt, format_retry_suffix,
-    inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
+    inactivity_burst_gaps_input, overall_summary_input, overall_summary_prompt, profile_context_input,
 )
 from app.core.reference_data import resolve_citizenship, resolve_occupation
 
@@ -74,7 +75,7 @@ _MAX_BURST_MONTHS = 6
 
 # Phrases that mean the model gave no real answer. Judgement words are allowed: the
 # output supports the reviewer, who makes the decision.
-_NON_ANSWER_TEXT = ("n/a", "insufficient", "nothing happened", "please provide")
+_NON_ANSWER_TEXT = ("n/a", "insufficient data", "insufficient information", "nothing happened", "please provide")
 _FORBIDDEN_PROFILE_TEXT = (
     "n/a", "please provide", "named p",
 )
@@ -89,7 +90,9 @@ _OUTCOME_SYNONYMS = {
 }
 
 _FALLBACK_HEADLINE = "The overall summary could not be produced. Review each check below."
-_FALLBACK_RISK_REASON = "No AI risk decision was available, so the risk was not assessed. Review each check below."
+# occupation_fit when there is nothing for the AI to judge (it is not asked; see occupation_note).
+_NOTHING_TO_COMPARE = "No unusual transaction or layering was found, so there is nothing to compare with the occupation."
+_NO_OCCUPATION = "The declared occupation is not available, so the findings could not be compared with it."
 
 
 class ModelOutputError(ValueError):
@@ -201,11 +204,10 @@ class AnalysisService:
                 results[call.stage] = result
 
         checks = self._build_checks(calls, results, monthly, catalog, run, screened)
-        if not results:
-            return self._assessment(request, checks, None, profile_context)
-        summary = await self._overall_summary_or_none(
-            request.case_id, monthly, run, checks, profile, profile_context, screening)
-        return self._assessment(request, checks, summary, profile_context)
+        signals = risk_signals(monthly, screening)
+        summary = None if not results else await self._overall_summary_or_none(
+            request.case_id, monthly, run, checks, profile, profile_context, signals)
+        return self._assessment(request, checks, summary, signals, profile_context)
 
     def _pattern_calls(
         self, case_id: str, monthly: list[dict[str, Any]], catalog: dict[str, EvidenceItem],
@@ -491,19 +493,22 @@ class AnalysisService:
 
     async def _overall_summary_or_none(
         self, case_id: str, monthly: list[dict[str, Any]], run: InactivityRun | None, checks: list[ReviewCheck],
-        profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None, screening: Screening,
-    ) -> "tuple[OverallSummary, RiskLevel] | None":
+        profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None, signals: RiskSignals,
+    ) -> OverallSummary | None:
+        """Call 4 explains the screening's findings and risk, and judges whether the evidence fits the
+        occupation. The risk level itself is the screening's (see screening_risk)."""
+        occupation = self._declared_occupation(profile)
+        system_prompt = overall_summary_prompt(signals, occupation)
         prompt_input = overall_summary_input(
             monthly, run, self._settings.dormancy_min_zero_months,
             [self._check_line(check) for check in checks],
             [check.check for check in checks if check.outcome == "not_verified"],
-            self._profile_lines(profile, profile_context),
-            risk_signals(monthly, screening),
+            self._profile_lines(profile, profile_context), signals,
         )
-        quotable = numbers_in_text(prompt_input) | calendar_numbers(monthly)
+        quotable = numbers_in_text(system_prompt + prompt_input) | calendar_numbers(monthly)
         try:
             raw = await self._complete_with_retry(
-                case_id, "overall-summary", OVERALL_SUMMARY_SYSTEM_PROMPT, prompt_input,
+                case_id, "overall-summary", system_prompt, prompt_input,
                 _RawOverallSummary, self._settings.llm_summary_max_response_tokens,
                 lambda value, final: self._validate_overall_summary(
                     value, quotable, [row["year_month"] for row in monthly], case_id, final),
@@ -512,13 +517,34 @@ class AnalysisService:
             logger.error("Overall summary failed: case=%s error=%s", case_id, exc)
             return None
         points = list(dict.fromkeys(point for point in (raw.point_1, raw.point_2, raw.point_3) if point))
-        summary = OverallSummary(
+        return OverallSummary(
             verified=True, headline=raw.headline, points=points, why_it_matters=raw.why_it_matters or None,
-            occupation_fit=raw.occupation_fit or None,
+            occupation_fit=self._occupation_fit(raw.occupation_fit, signals, occupation, case_id),
             verify_first=[item for item in (raw.verify_1, raw.verify_2) if item], risk_reason=raw.risk_reason,
             issues=raw.issues.get("overall_summary", []),
         )
-        return summary, raw.risk_level
+
+    @staticmethod
+    def _declared_occupation(profile: list[dict[str, str | None]]) -> str | None:
+        """The latest declared occupation and type, e.g. "Housewife, individual"; None when not available."""
+        if not profile:
+            return None
+        latest = profile[-1]
+        occupation = latest.get("occupation") or ""
+        if not occupation or occupation.startswith("Unmapped occupation code"):
+            return None
+        party = {"I": "individual", "O": "organisation"}.get(latest.get("indv_org_type") or "")
+        return f"{occupation}, {party}" if party else occupation
+
+    @staticmethod
+    def _occupation_fit(text: str, signals: RiskSignals, occupation: str | None, case_id: str) -> str | None:
+        """The AI's fit judgement when there was evidence to judge; otherwise the reason there is none.
+        The AI is told to write "none" then; anything it writes instead is logged, not shown."""
+        if (signals.unusual or signals.layering) and occupation:
+            return text or None
+        if text:
+            logger.warning("Occupation fit written with nothing to judge; not shown: case=%s text=%s", case_id, text)
+        return _NOTHING_TO_COMPARE if not (signals.unusual or signals.layering) else _NO_OCCUPATION
 
     def _validate_overall_summary(
         self, raw: "_RawOverallSummary", quotable: set[Decimal], months: list[str], case_id: str, final_attempt: bool,
@@ -586,8 +612,8 @@ class AnalysisService:
         return lines
 
     def _assessment(
-        self, request: AccountAnalysisRequest, checks: list[ReviewCheck],
-        summary: "tuple[OverallSummary, RiskLevel] | None", profile_context: CustomerProfileContext | None,
+        self, request: AccountAnalysisRequest, checks: list[ReviewCheck], overall: OverallSummary | None,
+        signals: RiskSignals, profile_context: CustomerProfileContext | None,
     ) -> AccountAssessment:
         # A screened check without its AI description still holds a real finding, but the case
         # must not be closed from it: staff read the figures themselves.
@@ -595,12 +621,13 @@ class AnalysisService:
             check.outcome != "not_verified" and (check.check not in _SCREENED_PATTERNS or check.insight)
             for check in checks
         )
-        if summary is None:
-            overall, risk_level = OverallSummary(
-                verified=False, headline=_FALLBACK_HEADLINE, risk_reason=_FALLBACK_RISK_REASON,
-            ), "not_assessed"
-        else:
-            overall, risk_level = summary
+        risk_level: RiskLevel = screening_risk(signals)
+        if overall is None:
+            overall = OverallSummary(
+                verified=False, headline=_FALLBACK_HEADLINE,
+                risk_reason=f"The overall summary could not be produced; the risk is {risk_level} because "
+                            f"{risk_because(signals)}.",
+            )
         complete = overall.verified and all_checks_verified
         decision: Decision = (
             "no_further_review_suggested" if complete and risk_level == "low" else "further_review_suggested"
@@ -614,7 +641,7 @@ class AnalysisService:
             )))
         if not overall.verified:
             limitations.append(AssessmentLimitation(
-                limitation="The overall summary could not be produced, so no LLM risk decision is available.",
+                limitation="The overall summary could not be produced; the risk level shown comes from the screening.",
             ))
         return AccountAssessment(
             case_id=request.case_id, acct_num=request.acct_num,
@@ -985,14 +1012,6 @@ class _RawOverallSummary(_RawAnswer):
     verify_1: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     verify_2: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     risk_reason: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
-    risk_level: RiskLevel
-
-    @classmethod
-    def prepare_payload(cls, payload: Any) -> Any:
-        payload = super().prepare_payload(payload)
-        if isinstance(payload, dict) and isinstance(payload.get("risk_level"), str):
-            payload["risk_level"] = payload["risk_level"].strip().lower()
-        return payload
 
 
 class _RawProfileContext(BaseModel):

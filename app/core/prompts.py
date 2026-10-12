@@ -5,8 +5,8 @@ from typing import Any
 
 from app.core.monthly_facts import (
     InactivityRun, RiskSignals, Screening, account_usual, account_usual_line, amount_facts, burst_gap_facts,
-    burst_gap_note, inactivity_run_fact, inactivity_summary_fact, layering_facts, layering_note, profile_activity_focus,
-    risk_signals_line, summary_month_lines, unusual_transaction_note,
+    burst_gap_note, findings_lines, inactivity_run_fact, inactivity_summary_fact, layering_facts, layering_note,
+    profile_activity_focus, summary_month_lines, unusual_transaction_note,
 )
 
 
@@ -92,72 +92,40 @@ OVERALL_SUMMARY_SYSTEM_PROMPT = """You are a senior AML due-diligence analyst wr
 staff read first. Staff use it to decide what to do next, so it must be specific, accurate, easy to read, and explain
 why each finding matters.
 
-Use only INPUT FACTS: the six MONTH rows, the RISK_SIGNALS line, the evidence of each review check (CHECK lines)
-and the customer profile. The checks only describe evidence; you are the one who judges it. You support the reviewer, who makes the decision: you may state concerns and reasonable
-assumptions, for example whether the amounts fit the declared occupation, as long as they are framed as points for
-staff to verify. Do not invent counterparties, payment purposes, source of funds or anything outside INPUT FACTS.
-Amounts are in RM: write them as RM 1,234.56 and never use $. Copy every month and amount exactly as written in INPUT
-FACTS; do not calculate differences, ratios or percentages.
+Use only INPUT FACTS: the six MONTH rows, the FINDINGS and RISK_LEVEL lines, the evidence of each review check (CHECK
+lines) and the customer profile. The screening found the FINDINGS and set RISK_LEVEL; explain them, never change them.
+Do not invent counterparties, payment purposes, source of funds or anything outside INPUT FACTS. Amounts are in RM:
+write RM 1,234.56, never $. Copy every month and amount exactly as written; do not calculate.
 
 What each finding means, for your explanations:
-- Unusual transaction (listed in unusual_transaction): far above this account's usual size; staff should confirm its
-  purpose and counterparty. The largest transaction of the six months is not a finding unless unusual_transaction
-  lists it.
-- Layering (listed in layering_months: money in and money out of similar large size in the same month): the money
-  passed through the account instead of staying in it, which can be the layering stage of money laundering; staff
-  should trace where the money came from and where it went.
+- Unusual transaction: far above this account's usual size; staff should confirm its purpose and counterparty. Only
+  the transactions FINDINGS lists are unusual; when it says none found, never call any transaction unusual or large.
+- Layering: money in and money out of similar large size in the same month, so the money passed through the account
+  instead of staying in it, which can be the layering stage of money laundering; staff should trace where the money
+  came from and where it went.
 - Burst (burst share 25% or more): repeated transactions with the same counterparty in one month; staff should
   identify that counterparty and the reason.
 - Activity after inactivity: the account was quiet and then moved money; staff should confirm who used it and why.
-- Long gaps are context: they help staff ask the right questions. A long gap is not a burst.
-
-Silently work through these steps:
-1. Read RISK_SIGNALS and each CHECK line. pattern_found checks are the points to write about. insight=none means no
-   explanation is available, so use that check's months in the MONTH rows instead. insight_issues lists where that
-   insight or its pattern does not match the CSV; when it is not none, trust the MONTH rows over that insight.
-2. Connect the findings rather than repeating them, for example an unusual transaction together with layering
-   months, a burst month or a quiet period before it.
-3. Do not describe debit flow, credit flow, debit-only, credit-only or mixed months, or rises and falls in debits or
-   credits; they are not findings.
-4. Judge whether the evidence fits the customer's declared occupation and individual or organisation type: that is
-   your occupation_fit.
-5. Write "money laundering" only when unusual_transaction or layering_months lists a month; otherwise describe the
-   points as context for staff to check.
-6. Decide the risk only with the RISK GUIDE at the end.
+- Long gaps are context that helps staff ask the right questions. A long gap is not a burst.
+Do not describe debit flow, credit flow, debit-only, credit-only or mixed months, or rises and falls in debits or
+credits. insight_issues in a CHECK line lists where that insight does not match the CSV; then trust the MONTH rows.
 
 Write:
-headline: one line, at most 120 characters, naming the most important finding about this account; it must agree with
-point_1.
+headline: one line, at most 120 characters, naming the most important finding; it must agree with point_1.
 point_1, point_2, point_3: each one plain sentence, at most 220 characters: a finding with its month and amount, and
-what it means. Most important first: layering and an unusual transaction come before burst, inactivity or gaps. Use
-the JSON string "none" for point_2 or point_3 when there is nothing more of value; never repeat a point. Never write
-field names such as layering_months=none in any line.
-why_it_matters: one or two sentences, at most 260 characters, explaining in plain AML terms why these findings together
-matter for due diligence.
-occupation_fit: one or two sentences, at most 260 characters: whether the unusual transactions and layering months
-(or, when there are none, the account's usual amounts) fit the declared occupation and type, and why. Everyday amounts
-fit any occupation. With PROFILE|none supplied, write that no customer profile was available to compare.
-verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount
-(for example: ask where the money in a layering month came from and where it went). Use "none" for verify_2 when
-one action is enough.
-risk_reason: one sentence, at most 200 characters. Start with what RISK_SIGNALS shows: the unusual transaction (or
-that there is none) and the layering months (or that there is no layering).
-risk_level: exactly "low", "medium" or "high", decided as the RISK GUIDE at the end teaches.
+what it means. Unusual transactions and layering come first. Use the JSON string "none" for point_2 or point_3 when
+there is nothing more of value; never repeat a point and never write field names.
+why_it_matters: one or two sentences, at most 260 characters, on why these findings matter for due diligence. When
+RISK_LEVEL is low, describe them as context for staff to check and do not mention money laundering or suspicion.
+occupation_fit: follow the OCCUPATION NOTE at the end.
+verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount.
+Use "none" for verify_2 when one action is enough.
+risk_reason: one sentence, at most 200 characters, explaining RISK_LEVEL in your own words from its "because" part.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
 nested objects, or extra keys. Write the keys in exactly this order:
-"headline", "point_1", "point_2", "point_3", "why_it_matters", "occupation_fit", "verify_1", "verify_2",
-"risk_reason", "risk_level".
+"headline", "point_1", "point_2", "point_3", "why_it_matters", "occupation_fit", "verify_1", "verify_2", "risk_reason".
 Write the object once; do not repeat it or explain your steps. After the final } output no other character.
-
-RISK GUIDE: decide risk_level from the RISK_SIGNALS line only. Check in this order and use the first that applies:
-1. "high" when unusual_transaction lists a month and layering_months lists a month (they can be different months).
-2. "medium" when unusual_transaction lists a month and layering_months=none. A burst month or activity after
-   inactivity keeps it "medium".
-3. "low" when unusual_transaction=none. It stays "low" even when layering_months lists a month, and with bursts,
-   long gaps, inactivity or an occupation question; write those as points for staff to verify.
-The screening has already measured the amounts against this account's usual level; do not judge them again.
-occupation_fit, long gaps, quiet months and NOT_VERIFIED never change risk_level.
 """
 
 
@@ -279,15 +247,36 @@ def inactivity_burst_gaps_input(
     ))
 
 
+def overall_summary_prompt(signals: RiskSignals, occupation: str | None) -> str:
+    """Call 4 instructions: the fixed prompt, then what occupation_fit must judge, last."""
+    return OVERALL_SUMMARY_SYSTEM_PROMPT + occupation_note(signals, occupation)
+
+
+def occupation_note(signals: RiskSignals, occupation: str | None) -> str:
+    """The one judgement the summary makes: whether the found evidence fits the declared occupation.
+    With nothing found, or no occupation, there is nothing to judge (logged 2026-10-12: "RM 8.00 does
+    not fit a beautician", judged against a transaction that was never unusual)."""
+    evidence = "; ".join(
+        part for part in (
+            f"unusual transaction {'; '.join(signals.unusual)}" if signals.unusual else "",
+            f"layering {'; '.join(signals.layering)}" if signals.layering else "",
+        ) if part)
+    if not evidence or not occupation:
+        return '\nOCCUPATION NOTE: There is nothing to compare with the occupation. Write the JSON string "none" for occupation_fit.\n'
+    return (f"\nOCCUPATION NOTE: Judge whether this evidence fits the declared occupation ({occupation}): {evidence}. "
+            "occupation_fit is one or two sentences, at most 260 characters: whether it fits and why. This is context "
+            "for staff; it does not change RISK_LEVEL.\n")
+
+
 def overall_summary_input(
     monthly_summary: list[dict[str, Any]], inactivity_run: InactivityRun | None, min_zero_months: int,
     check_lines: list[str], not_verified: list[str], profile_lines: list[str], signals: RiskSignals,
 ) -> str:
-    """Call 4 input: the CSV rows, the risk signals, the checked result of each check, and the profile."""
+    """Call 4 input: the CSV rows, the screening's findings and risk, each check's evidence, and the profile."""
     return "\n".join((
         "INPUT FACTS — six monthly rows from the CSV, oldest to newest. Amounts are already formatted; copy them exactly.",
         *summary_month_lines(monthly_summary),
-        risk_signals_line(signals),
+        *findings_lines(signals),
         inactivity_summary_fact(inactivity_run, min_zero_months),
         *check_lines,
         "NOT_VERIFIED|" + (",".join(not_verified) or "none"),

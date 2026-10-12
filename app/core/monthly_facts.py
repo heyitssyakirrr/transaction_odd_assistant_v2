@@ -160,14 +160,13 @@ def unusual_transaction_note(rows: list[dict[str, Any]], screening: Screening) -
                 f"this evidence: the amount, the month and {compare}.\n")
     top = _amount(_largest_single(rows), "max_amount")
     if not top:
-        return ("\nUNUSUAL TRANSACTION NOTE: The screening found no unusual transaction: there were no transactions. "
-                "activity_insight says so.\n")
+        return ("\nUNUSUAL TRANSACTION NOTE: There were no transactions in the six months. activity_insight says so.\n")
     reason = (f"below the RM {_money(screening.min_amount)} minimum the screening reviews" if top < screening.min_amount
               else f"{_times(top, usual)} times the usual largest of RM {_money(usual)}, under "
                    f"{_number(screening.unusual_times_usual)} times")
     return (f"\nUNUSUAL TRANSACTION NOTE: The screening found no unusual transaction. The largest single transaction was "
             f"RM {_money(top)} in {', '.join(_months_with(rows, top))}, {reason}. activity_insight describes this: the "
-            "largest amount, every month it occurred, and why it is not unusual for this account.\n")
+            "largest amount, every month it occurred, and that it is within the account's normal range.\n")
 
 
 def layering_note(rows: list[dict[str, Any]], screening: Screening) -> str:
@@ -564,11 +563,39 @@ def risk_signals(rows: list[dict[str, Any]], screening: Screening) -> RiskSignal
     )
 
 
-def risk_signals_line(signals: RiskSignals) -> str:
-    """The summary's data line for the risk guide. "unusual_transaction", not "large_single_...":
-    Qwen confused it with the "largest single" transaction every account has (logged 2026-10-12)."""
-    return (f"RISK_SIGNALS|unusual_transaction={'; '.join(signals.unusual) or 'none'}|"
-            f"layering_months={'; '.join(signals.layering) or 'none'}")
+RiskLevelName = Literal["low", "medium", "high"]
+
+
+def screening_risk(signals: RiskSignals) -> RiskLevelName:
+    """The agreed risk guide, applied to the screening: unusual transaction and layering -> high,
+    unusual transaction only -> medium, otherwise low. Code applies it because the 7B summary,
+    given the guide, misapplied it in 3 of 8 accounts (logged 2026-10-12 16:21)."""
+    if signals.unusual:
+        return "high" if signals.layering else "medium"
+    return "low"
+
+
+_RISK_BECAUSE: dict[tuple[bool, bool], str] = {
+    (True, True): "an unusual transaction and layering were both found",
+    (True, False): "an unusual transaction was found and no layering was found",
+    (False, True): "no unusual transaction was found; the layering months are points for staff to check",
+    (False, False): "no unusual transaction and no layering were found",
+}
+
+
+def risk_because(signals: RiskSignals) -> str:
+    return _RISK_BECAUSE[(bool(signals.unusual), bool(signals.layering))]
+
+
+def findings_lines(signals: RiskSignals) -> list[str]:
+    """The screening's findings and the risk level, in plain words. No key=value pairs: Qwen copied
+    "Layering_months=none" into summary points (logged 2026-10-12)."""
+    unusual = "; ".join(signals.unusual) or "none found"
+    layering = "; ".join(signals.layering) or "none found"
+    return [
+        f"FINDINGS: Unusual transaction: {unusual}. Layering: {layering}.",
+        f"RISK_LEVEL: {screening_risk(signals)}, because {risk_because(signals)}.",
+    ]
 
 
 def long_gap_months(rows: list[dict[str, Any]], long_gap_days: Decimal) -> list[dict[str, Any]]:
