@@ -69,6 +69,17 @@ app.mount(
 app.include_router(build_router(analyser, batch_runner, report_store, settings.batch_max_files))
 
 
+@app.middleware("http")
+async def always_check_for_newer_pages(request: Request, call_next):
+    """Make browsers re-check pages and scripts on every visit (a cheap 304 when unchanged),
+    so an updated results.js is never replaced by a stale cached copy."""
+    response = await call_next(request)
+    path = request.url.path
+    if path in ("/", "/results") or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 @app.get("/", include_in_schema=False)
 def workspace() -> FileResponse:
     return FileResponse(BASE_DIR / "templates" / "index.html")
