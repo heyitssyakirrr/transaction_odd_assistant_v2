@@ -74,21 +74,11 @@ class Settings:
     # at least this many consecutive zero-transaction months before a month with
     # transactions. This is an internal review rule, not a bank policy.
     dormancy_min_zero_months: int = int(os.getenv("DORMANCY_MIN_ZERO_MONTHS", "3"))
-    # Context for the LLM and the staff text only, never a forced risk level: the
-    # first active month is "above reference" when its largest single transaction,
-    # or its monthly total, reaches these amounts. Counting both keeps the signal
-    # count-aware (one 10,000 payment and twelve 1,000 payments both qualify).
-    # PLACEHOLDER DEFAULTS: set the compliance-approved values.
-    dormancy_review_single_amount: float = float(os.getenv("DORMANCY_REVIEW_SINGLE_AMOUNT", "5000"))
-    dormancy_review_month_total: float = float(os.getenv("DORMANCY_REVIEW_MONTH_TOTAL", "10000"))
     # Burst and gaps: a one-transaction month this many days or more after the previous
     # transaction is listed to the LLM as a long gap. Context only, never a risk level.
     review_long_gap_days: int = int(os.getenv("REVIEW_LONG_GAP_DAYS", "60"))
-    # Layering (money passing through): a month whose money in and money out are both at
-    # least REVIEW_LAYERING_MIN_AMOUNT and within REVIEW_LAYERING_MAX_DIFFERENCE_PCT of
-    # each other (the smaller side is at least 90% of the larger by default).
-    review_layering_min_amount: float = float(os.getenv("REVIEW_LAYERING_MIN_AMOUNT", "5000"))
-    review_layering_max_difference_pct: float = float(os.getenv("REVIEW_LAYERING_MAX_DIFFERENCE_PCT", "10"))
+    # Large transactions and layering have no configured amount: the AI decides them
+    # against each account's own usual level (see app/core/monthly_facts.py).
     # Retained for backwards-compatible .env files; no longer used by the
     # account-context workflow.
     llm_timeline_max_response_tokens: int = int(os.getenv("LLM_TIMELINE_MAX_RESPONSE_TOKENS", "260"))
@@ -142,11 +132,7 @@ class Settings:
             "LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS": self.llm_profile_context_max_response_tokens,
             "LLM_SUMMARY_MAX_RESPONSE_TOKENS": self.llm_summary_max_response_tokens,
             "DORMANCY_MIN_ZERO_MONTHS": self.dormancy_min_zero_months,
-            "DORMANCY_REVIEW_SINGLE_AMOUNT": self.dormancy_review_single_amount,
-            "DORMANCY_REVIEW_MONTH_TOTAL": self.dormancy_review_month_total,
             "REVIEW_LONG_GAP_DAYS": self.review_long_gap_days,
-            "REVIEW_LAYERING_MIN_AMOUNT": self.review_layering_min_amount,
-            "REVIEW_LAYERING_MAX_DIFFERENCE_PCT": self.review_layering_max_difference_pct,
             "LLM_TIMELINE_MAX_RESPONSE_TOKENS": self.llm_timeline_max_response_tokens,
             "LLM_FLOW_MAX_RESPONSE_TOKENS": self.llm_flow_max_response_tokens,
             "LLM_PROFILE_MAX_RESPONSE_TOKENS": self.llm_profile_max_response_tokens,
@@ -165,8 +151,6 @@ class Settings:
             raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
         if not 0 < self.llm_top_p <= 1:
             raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1")
-        if not 0 < self.review_layering_max_difference_pct < 100:
-            raise ValueError("REVIEW_LAYERING_MAX_DIFFERENCE_PCT must be between 0 and 100")
         if self.llm_repetition_penalty < 0:
             raise ValueError("LLM_REPETITION_PENALTY must not be negative")
         if self.llm_structured_output_protocol not in {"json_schema", "guided_json", "json_object", "off"}:

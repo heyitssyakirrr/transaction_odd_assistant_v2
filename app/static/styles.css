@@ -313,6 +313,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .decision-card.risk-low { border-left-color: var(--success); }
 .decision-card.risk-medium { border-left-color: var(--warning); }
 .decision-card.risk-high { border-left-color: var(--danger); }
+.decision-card.risk-not_assessed { border-left-color: var(--line-strong); }
 
 .decision-main { padding: 26px 28px; }
 
@@ -367,6 +368,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .risk-badge.risk-low { color: var(--success); background: var(--success-tint); }
 .risk-badge.risk-medium { color: var(--warning); background: var(--warning-tint); }
 .risk-badge.risk-high { color: var(--danger); background: var(--danger-tint); }
+.risk-badge.risk-not_assessed { color: var(--ink-soft); background: var(--canvas); }
 
 .section {
   margin-top: 28px;

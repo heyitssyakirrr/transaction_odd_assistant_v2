@@ -14,10 +14,10 @@ from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedErro
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
-    PATTERN_LABELS, InactivityRun, activity_pair_context, activity_six_month_context, allowed_burst_gap_numbers,
-    burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context, calendar_numbers,
-    canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, burst_guide_months, has_in_month_gap,
-    layering_context, layering_facts, layering_months, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
+    PATTERN_LABELS, InactivityRun, RiskSignals, activity_pair_context, activity_six_month_context,
+    allowed_burst_gap_numbers, burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context,
+    calendar_numbers, canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, burst_guide_months,
+    has_in_month_gap, layering_context, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
     risk_signals, unmatched_month_name, unquotable_number,
 )
 from app.core.models import (
@@ -26,9 +26,9 @@ from app.core.models import (
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
-    INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, account_notes, PROFILE_CONTEXT_SYSTEM_PROMPT, activity_money_input,
-    activity_money_prompt, format_retry_suffix,
-    OVERALL_SUMMARY_SYSTEM_PROMPT, inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
+    ACTIVITY_MONEY_SYSTEM_PROMPT, INACTIVITY_BURST_GAPS_SYSTEM_PROMPT, OVERALL_SUMMARY_SYSTEM_PROMPT,
+    PROFILE_CONTEXT_SYSTEM_PROMPT, account_notes, activity_money_input, format_retry_suffix,
+    inactivity_burst_gaps_input, overall_summary_input, profile_context_input,
 )
 from app.core.reference_data import resolve_citizenship, resolve_occupation
 
@@ -51,11 +51,6 @@ _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "activity_and_amount_change": ("txn_count_monthly", "total_amount", "max_amount"),
     "money_in_and_out": ("monthly_credit", "monthly_debit"),
     "burst_and_gaps": ("txn_count_monthly", "pct_burst", "pct_trx_gap"),
-}
-# CSV fields whose values an insight may quote, for the months it is about.
-_INSIGHT_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
-    "activity_and_amount_change": ("txn_count_monthly", "total_amount", "avg_amount", "std_amount", "max_amount"),
-    "money_in_and_out": ("monthly_debit", "monthly_credit"),
 }
 # Months a found pattern may select: one largest-transaction month (or two compared), up to six layering months.
 _MAX_MONTHS: dict[ReviewCheckName, int] = {"activity_and_amount_change": 2, "money_in_and_out": 6}
@@ -84,7 +79,6 @@ _FORBIDDEN_PROFILE_TEXT = (
 _MONTH_TOKEN = re.compile(r"^M?(\d{6})$")
 _NO_MONTHS = "none"
 _SAYS_NO_BURST = re.compile(r"\b(?:no|without|zero|absence of)\s+(?:\w+\s+){0,2}bursts?\b")
-_SAYS_NO_LAYERING = re.compile(r"\b(?:no|without|absence of)\s+(?:\w+\s+){0,2}layering\b", re.IGNORECASE)
 _SAYS_EVEN_SPACING = re.compile(r"\b(?:even(?:ly)?|regular(?:ly)?|consistent(?:ly)?)\s+(?:\w+\s+){0,1}(?:spaced|spread|spacing|timing|intervals?)\b")
 _OUTCOME_SYNONYMS = {
     "pattern_found": "pattern_found", "found": "pattern_found", "observed": "pattern_found",
@@ -93,7 +87,7 @@ _OUTCOME_SYNONYMS = {
 }
 
 _FALLBACK_HEADLINE = "The overall summary could not be produced. Review each check below."
-_FALLBACK_RISK_REASON = "No LLM risk decision was available, so the account is treated as medium risk until reviewed."
+_FALLBACK_RISK_REASON = "No AI risk decision was available, so the risk was not assessed. Review each check below."
 
 
 class ModelOutputError(ValueError):
@@ -219,14 +213,19 @@ class AnalysisService:
         self, case_id: str, monthly: list[dict[str, Any]], catalog: dict[str, EvidenceItem],
         run: InactivityRun | None,
     ) -> list[_LlmCall]:
+        activity_input = activity_money_input(monthly)
+        # The insights compare months with each other and with the usual level, so they may
+        # quote any figure the AI was given, and only those.
+        activity_numbers = numbers_in_text(activity_input) | calendar_numbers(monthly)
         return [
             _LlmCall(
                 stage="activity-money-context",
                 checks=("activity_and_amount_change", "money_in_and_out"),
-                system_prompt=activity_money_prompt(monthly, *self._layering_rule()),
-                prompt_input=activity_money_input(monthly, self._single_reference(), *self._layering_rule()),
+                system_prompt=ACTIVITY_MONEY_SYSTEM_PROMPT,
+                prompt_input=activity_input,
                 model_type=_RawActivityMoney,
-                validator=lambda raw, final: self._validate_activity_money(raw, catalog, monthly, case_id, final),
+                validator=lambda raw, final: self._validate_activity_money(
+                    raw, catalog, monthly, activity_numbers, case_id, final),
             ),
             _LlmCall(
                 stage="inactivity-burst-gaps-context",
@@ -251,7 +250,7 @@ class AnalysisService:
 
     def _validate_activity_money(
         self, raw: "_RawActivityMoney", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
-        case_id: str, final_attempt: bool,
+        allowed_numbers: set[Decimal], case_id: str, final_attempt: bool,
     ) -> "_RawActivityMoney":
         known_months = self._known_months(catalog)
         updates: dict[str, Any] = {}
@@ -260,16 +259,21 @@ class AnalysisService:
         for name, check in raw.checks().items():
             try:
                 updates.update(self._checked_amount_or_flow(
-                    name, check, monthly, known_months, case_id, final_attempt, issues))
+                    name, check, monthly, known_months, allowed_numbers, case_id, final_attempt, issues))
             except ModelOutputError as exc:
                 problems[name] = str(exc)
         return self._accepted(raw, updates, issues, problems, case_id, final_attempt, tuple(raw.checks()))
 
     def _checked_amount_or_flow(
         self, name: ReviewCheckName, check: _Check, monthly: list[dict[str, Any]], known_months: set[str],
-        case_id: str, final_attempt: bool, issues: dict[str, list[str]],
+        allowed_numbers: set[Decimal], case_id: str, final_attempt: bool, issues: dict[str, list[str]],
     ) -> dict[str, Any]:
-        """Validate one check of call 1; returns its corrected fields and records its issues."""
+        """Validate one check of call 1; returns its corrected fields and records its issues.
+
+        The decision (large or not, layering or not) is the AI's and is never changed. Only
+        what the rows make impossible is listed as an issue: months that are not in the data,
+        a figure the AI was not given, a pattern that cannot fit the selected months.
+        """
         prefix = check.prefix
         if check.outcome is None:
             raise ModelOutputError(f"{prefix}_outcome is missing; it must be pattern_found or no_pattern_found")
@@ -285,33 +289,17 @@ class AnalysisService:
                 raise ModelOutputError(f"{prefix}_months {months[0]} and {months[1]} show no change in this check's figures")
             pattern = canonical_pattern(name, check.pattern)
             updates = {f"{prefix}_pattern": pattern, f"{prefix}_months": ",".join(months)}
-            if problem := pattern_problem(name, pattern, monthly, months, **self._thresholds()):
+            if problem := pattern_problem(name, pattern, monthly, months, long_gap_days=self._long_gap_days()):
                 found.append(f"Pattern label: {problem}")
-        all_months = [row["year_month"] for row in monthly]
-        allowed = quotable_numbers(monthly, months, _INSIGHT_FIELDS[name]) | self._reference_numbers()
-        if name == "money_in_and_out":
-            allowed |= self._layering_numbers(monthly)
-        found += self._text_issues(check.insight, allowed, months or all_months)
+        # The insight compares months, so it may name any month with transactions. A month with
+        # none cannot hold a transaction, so naming it is still caught (logged 2026-10-05: "RM
+        # 10,000.00 in June 2025" for a 202511 transaction, June 2025 being a quiet month).
+        active_months = [row["year_month"] for row in monthly if row["txn_count_monthly"] > 0]
+        found += self._text_issues(check.insight, allowed_numbers, active_months, figures="the AI was given")
         if any(row["txn_count_monthly"] for row in monthly) and _SAYS_NO_ACTIVITY.search(check.insight):
             found.append("Says there was no activity in the six months, but transactions were recorded.")
-        if name == "money_in_and_out":
-            found += self._layering_issues(check, months, monthly)
         issues[name] = self._log_issues(case_id, name, found)
         return updates
-
-    def _layering_issues(self, check: _Check, months: list[str], monthly: list[dict[str, Any]]) -> list[str]:
-        """Where the answer leaves out layering months the rows show (listed for staff, no retry)."""
-        layered = [row["year_month"] for row in layering_months(monthly, *self._layering_rule())]
-        if not layered:
-            return []
-        if check.outcome != "pattern_found":
-            return [f"Found no layering, but these months have money in and money out of similar size: "
-                    f"{', '.join(layered)}."]
-        missed = [month for month in layered if month not in months]
-        issues = [f"Layering months not selected: {', '.join(missed)}."] if missed else []
-        if _SAYS_NO_LAYERING.search(check.insight):
-            issues.append("Says there was no layering, but a month has money in and money out of similar size.")
-        return issues
 
     @staticmethod
     def _unchanged(name: ReviewCheckName, monthly: list[dict[str, Any]], months: list[str]) -> bool:
@@ -369,7 +357,7 @@ class AnalysisService:
             self._validate_transaction_months(months, self._known_months(catalog), "burst_and_gaps")
             pattern = canonical_pattern("burst_and_gaps", raw.burst_gaps_pattern)
             updates = {"burst_gaps_months": ",".join(months), "burst_gaps_pattern": pattern}
-            if problem := pattern_problem("burst_and_gaps", pattern, monthly, months, **self._thresholds()):
+            if problem := pattern_problem("burst_and_gaps", pattern, monthly, months, long_gap_days=self._long_gap_days()):
                 found.append(f"Pattern label: {problem}")
         all_months = [row["year_month"] for row in monthly]
         found += self._text_issues(raw.burst_gaps_insight, allowed_burst_gap_numbers(monthly), all_months)
@@ -412,27 +400,6 @@ class AnalysisService:
     def _long_gap_days(self) -> Decimal:
         return Decimal(self._settings.review_long_gap_days)
 
-    def _thresholds(self) -> dict[str, Decimal]:
-        """The configured amounts the pattern checks compare against."""
-        min_amount, max_difference = self._layering_rule()
-        return {"long_gap_days": self._long_gap_days(), "single_reference": self._single_reference(),
-                "layering_min_amount": min_amount, "layering_max_difference_pct": max_difference}
-
-    def _layering_rule(self) -> tuple[Decimal, Decimal]:
-        """(minimum money in and out, maximum difference %) for a layering month."""
-        return (Decimal(str(self._settings.review_layering_min_amount)),
-                Decimal(str(self._settings.review_layering_max_difference_pct)))
-
-    def _layering_numbers(self, monthly: list[dict[str, Any]]) -> set[Decimal]:
-        """The layering rule and each month's difference, as the LAYERING lines show them."""
-        return numbers_in_text(layering_facts(monthly, *self._layering_rule()))
-
-    def _single_reference(self) -> Decimal:
-        return Decimal(str(self._settings.dormancy_review_single_amount))
-
-    def _reference_numbers(self) -> set[Decimal]:
-        return numbers_in_text(f"{self._settings.dormancy_review_single_amount} {self._settings.dormancy_review_month_total}")
-
     @staticmethod
     def _run_months(run: InactivityRun, monthly: list[dict[str, Any]]) -> list[str]:
         """The zero months of the inactive run and the month activity resumed."""
@@ -442,21 +409,24 @@ class AnalysisService:
         fields = ("txn_count_monthly", "debit_count_monthly", "credit_count_monthly", "total_amount",
                   "max_amount", "monthly_debit", "monthly_credit", "pct_trx_gap")
         allowed = quotable_numbers(monthly, [run.active_month], fields)
-        extra = {Decimal(run.zero_months), Decimal(run.later_transactions), run.later_total,
-                 Decimal(str(self._settings.dormancy_review_single_amount)),
-                 Decimal(str(self._settings.dormancy_review_month_total))}
+        extra = {Decimal(run.zero_months), Decimal(run.later_transactions), run.later_total}
         return allowed | {value.normalize() for value in extra} | numbers_in_text(" ".join(map(str, extra)))
 
     @staticmethod
-    def _text_issues(text: str, allowed: set[Decimal], months: list[str]) -> list[str]:
-        """Where a model sentence does not fit the CSV, in plain words for staff (empty when it fits)."""
+    def _text_issues(
+        text: str, allowed: set[Decimal], months: list[str], figures: str = "for the months this check is about",
+    ) -> list[str]:
+        """Where a model sentence does not fit the CSV, in plain words for staff (empty when it fits).
+
+        ``figures`` says where a quoted number should have come from, for the issue text.
+        """
         if not text.strip():
             return []
         issues = []
         if any(phrase in text.casefold() for phrase in _NON_ANSWER_TEXT):
             issues.append("Is not a real answer (for example N/A or a request for more data).")
         if token := unquotable_number(text, allowed):
-            issues.append(f"Quotes {token}, which is not a figure for the months this check is about.")
+            issues.append(f"Quotes {token}, which is not a figure {figures}.")
         if name := unmatched_month_name(text, months):
             issues.append(f"Mentions {name}, which is not one of the months this check is about.")
         return issues
@@ -518,7 +488,7 @@ class AnalysisService:
         if name == "activity_and_amount_change":
             facts = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
         else:
-            facts = layering_context(monthly, months, *self._layering_rule())
+            facts = layering_context(monthly, months)
         return ReviewCheck(
             check=name, title=_CHECK_TITLES[name], outcome=check.outcome,
             pattern=_pattern_label(check.pattern), months=months,
@@ -544,13 +514,12 @@ class AnalysisService:
         self, case_id: str, monthly: list[dict[str, Any]], run: InactivityRun | None, checks: list[ReviewCheck],
         profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None,
     ) -> "tuple[OverallSummary, RiskLevel] | None":
-        reference = self._single_reference()
         prompt_input = overall_summary_input(
             monthly, run, self._settings.dormancy_min_zero_months,
             [self._check_line(check) for check in checks],
             [check.check for check in checks if check.outcome == "not_verified"],
             self._profile_lines(profile, profile_context),
-            risk_signals(monthly, reference, *self._layering_rule()), reference,
+            self._risk_signals(monthly, checks),
         )
         quotable = numbers_in_text(prompt_input) | calendar_numbers(monthly)
         try:
@@ -613,6 +582,13 @@ class AnalysisService:
         return (raw.model_copy(update=blank) if blank else raw), issues
 
     @staticmethod
+    def _risk_signals(monthly: list[dict[str, Any]], checks: list[ReviewCheck]) -> RiskSignals:
+        """The risk guide reads what call 1's AI decided: its large-transaction and layering months.
+        A check that could not be verified is passed as not checked, never guessed."""
+        decided = {check.check: None if check.outcome == "not_verified" else check.months for check in checks}
+        return risk_signals(monthly, decided["activity_and_amount_change"], decided["money_in_and_out"])
+
+    @staticmethod
     def _check_line(check: ReviewCheck) -> str:
         months = ",".join(check.months) or "none"
         return (
@@ -644,7 +620,7 @@ class AnalysisService:
         if summary is None:
             overall, risk_level = OverallSummary(
                 verified=False, headline=_FALLBACK_HEADLINE, risk_reason=_FALLBACK_RISK_REASON,
-            ), "medium"
+            ), "not_assessed"
         else:
             overall, risk_level = summary
         complete = overall.verified and all_checks_verified
@@ -728,7 +704,7 @@ class AnalysisService:
             return None
         return await self._complete_with_retry(
             case_id, "profile-context", PROFILE_CONTEXT_SYSTEM_PROMPT,
-            profile_context_input(profile, monthly, self._single_reference()), _RawProfileContext,
+            profile_context_input(profile, monthly), _RawProfileContext,
             self._settings.llm_profile_context_max_response_tokens,
             lambda value, final: self._validate_profile_context(value),
         )
@@ -767,12 +743,7 @@ class AnalysisService:
                 raise ModelOutputError(f"{stage} did not produce a verifiable result after one format retry.") from second_error
 
     def _inactivity_run(self, monthly: list[dict[str, Any]]) -> InactivityRun | None:
-        settings = self._settings
-        return find_inactivity_run(
-            monthly, min_zero_months=settings.dormancy_min_zero_months,
-            single_reference=Decimal(str(settings.dormancy_review_single_amount)),
-            month_total_reference=Decimal(str(settings.dormancy_review_month_total)),
-        )
+        return find_inactivity_run(monthly, min_zero_months=self._settings.dormancy_min_zero_months)
 
     def _validate_profile_context(self, raw: "_RawProfileContext") -> None:
         self._reject_forbidden_text(raw.profile_summary, _FORBIDDEN_PROFILE_TEXT, "profile summary")

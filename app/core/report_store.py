@@ -74,6 +74,8 @@ class ReportStore:
     # Risk colours are distinct from the app's brand red (#c8102e), so "high risk" is
     # never read as page branding.
     _RISK_COLORS = {"low": "#1c7a4d", "medium": "#8a6100", "high": "#b3261e"}
+    _RISK_LABELS = {"not_assessed": "RISK NOT ASSESSED"}
+    _RISK_REASON_LABELS = {"not_assessed": "Why the risk was not assessed:"}
     _OUTCOME_LABELS = {
         "pattern_found": "Pattern found", "no_pattern_found": "No pattern found", "not_verified": "Not verified",
     }
@@ -126,6 +128,9 @@ class ReportStore:
   {self._table(check.table)}
 </article>"""
 
+    def _risk_reason_label(self, risk_level: str) -> str:
+        return self._RISK_REASON_LABELS.get(risk_level, f"Why {risk_level} risk:")
+
     def _render_html(self, result: AccountAssessment) -> str:
         overall = result.overall
         risk_color = self._RISK_COLORS.get(result.risk_level, "#d3d6db")
@@ -137,7 +142,8 @@ class ReportStore:
             + "".join(f"<li>{html.escape(item)}</li>" for item in overall.verify_first) + "</ol></div>"
         ) if overall.verify_first else ""
         reason = (
-            f"<p class='reason'><b>Why {html.escape(result.risk_level)} risk:</b> {html.escape(overall.risk_reason)}</p>"
+            f"<p class='reason'><b>{html.escape(self._risk_reason_label(result.risk_level))}</b> "
+            f"{html.escape(overall.risk_reason)}</p>"
             if overall.risk_reason else ""
         ) + self._issues(overall.issues)
         note = (
@@ -206,7 +212,7 @@ table.kv td:first-child {{ width: 38%; color: #6b7280; }}
   <small>Case: {html.escape(result.case_id)} &middot; Account: {html.escape(result.acct_num)}<br>Generated: {result.generated_at.strftime('%Y-%m-%d %H:%M UTC')}</small>
 </header>
 <section class="decision">
-  <span class="risk">{html.escape(result.risk_level.upper())} RISK</span>
+  <span class="risk">{html.escape(self._RISK_LABELS.get(result.risk_level, result.risk_level.upper() + " RISK"))}</span>
   <h2>{self._DECISION_LABELS[result.decision]}</h2>
   <p class="headline">{html.escape(overall.headline)}</p>
   <p class="muted">{note}</p>

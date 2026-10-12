@@ -7,7 +7,9 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 
-RiskLevel = Literal["low", "medium", "high"]
+# not_assessed: the AI could not decide, because a check the risk depends on was not verified
+# or the summary failed. Never a guessed level.
+RiskLevel = Literal["low", "medium", "high", "not_assessed"]
 ReviewCheckName = Literal[
     "activity_after_inactivity",
     "activity_and_amount_change",

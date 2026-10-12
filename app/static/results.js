@@ -12,6 +12,10 @@ const OUTCOME_LABELS = {
   no_pattern_found: "No pattern found",
   not_verified: "Not verified",
 };
+// "not_assessed": the AI could not decide the risk because a check it depends on was not verified.
+const RISK_LABELS = { low: "LOW RISK", medium: "MEDIUM RISK", high: "HIGH RISK", not_assessed: "RISK NOT ASSESSED" };
+const RISK_REASON_LABELS = { not_assessed: "Why the risk was not assessed:" };
+
 const DECISION_LABELS = {
   further_review_suggested: "Further review suggested",
   no_further_review_suggested: "No further review suggested",
@@ -192,7 +196,7 @@ function renderResult(data) {
     : "";
 
   els.decisionCard.className = `decision-card risk-${data.risk_level}`;
-  els.riskBadge.textContent = `${data.risk_level.toUpperCase()} RISK`;
+  els.riskBadge.textContent = RISK_LABELS[data.risk_level] || `${data.risk_level.toUpperCase()} RISK`;
   els.riskBadge.className = `risk-badge risk-${data.risk_level}`;
   els.decision.textContent = DECISION_LABELS[data.decision] || data.decision;
   els.headline.textContent = data.overall.headline;
@@ -203,7 +207,7 @@ function renderResult(data) {
   els.acctNum.textContent = data.acct_num;
   els.monthsReviewed.textContent = data.months_reviewed;
   els.profileRecordsMatched.textContent = data.profile_records_matched ?? 0;
-  els.riskLevel.textContent = data.risk_level.toUpperCase();
+  els.riskLevel.textContent = data.risk_level === "not_assessed" ? "NOT ASSESSED" : data.risk_level.toUpperCase();
 
   renderSummary(data.overall, data.risk_level);
   renderReviewChecks(data.review_checks || []);
@@ -228,7 +232,7 @@ function renderSummary(overall, riskLevel) {
   els.verifyFirst.innerHTML = verify.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
 
   els.riskReason.innerHTML = (overall.risk_reason
-    ? `<strong>Why ${escapeHtml(riskLevel)} risk:</strong> ${escapeHtml(overall.risk_reason)}`
+    ? `<strong>${escapeHtml(RISK_REASON_LABELS[riskLevel] || `Why ${riskLevel} risk:`)}</strong> ${escapeHtml(overall.risk_reason)}`
     : "") + renderIssues(overall.issues);
 }
 

@@ -42,34 +42,108 @@ def _share(part: Decimal, whole: Decimal) -> str:
     return f"{(part / whole * 100).quantize(Decimal('0.1'))}%" if whole else "0.0%"
 
 
-def amount_facts(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
-    """Labelled amount facts per month and the main amount candidates, for call 1.
+# --- How this account usually transacts -------------------------------------
+# No fixed amount decides what is large: the AI compares each month with this
+# account's own usual level. The code does the arithmetic (7B models are weak at
+# ratios) and gives the result as a figure; the AI makes the judgement.
 
-    largest_single is the largest single transaction in the month; largest_share is
-    that transaction as a share of the month's total. The model decides what matters.
-    """
-    lines = ["AMOUNT_FACTS — amounts in RM; average and std are the upstream avg_amount and std_amount."]
+# A usual level needs at least this many months with transactions; with fewer, a
+# "middle value" would just be one or two transactions, so none is given.
+_MIN_HISTORY_MONTHS = 3
+_NOT_ENOUGH_HISTORY = "not_enough_history"
+
+
+@dataclass(frozen=True)
+class AccountUsual:
+    """The middle value across the months with transactions; None with too little history."""
+
+    active_months: int
+    largest_single: Decimal | None
+    month_total: Decimal | None
+
+
+def account_usual(rows: list[dict[str, Any]]) -> AccountUsual:
+    active = [row for row in rows if row["txn_count_monthly"] > 0]
+    if len(active) < _MIN_HISTORY_MONTHS:
+        return AccountUsual(len(active), None, None)
+    return AccountUsual(
+        len(active),
+        _median([_amount(row, "max_amount") for row in active]),
+        _median([_amount(row, "total_amount") for row in active]),
+    )
+
+
+def _median(values: list[Decimal]) -> Decimal:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    value = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    return value.quantize(Decimal("0.01"))
+
+
+def _times(value: Decimal, usual: Decimal | None) -> str:
+    """How many times the usual level, e.g. 7.7; not_enough_history when there is no usual level."""
+    if not usual:
+        return _NOT_ENOUGH_HISTORY
+    ratio = value / usual
+    # Two decimals under 1, so a small month reads 0.05 rather than 0.0 (which looks like nothing).
+    return f"{ratio.quantize(Decimal('0.01') if ratio < 1 else Decimal('0.1'))}"
+
+
+def account_usual_line(usual: AccountUsual) -> str:
+    if usual.largest_single is None:
+        return (f"ACCOUNT_USUAL|months_with_transactions={usual.active_months}|usual={_NOT_ENOUGH_HISTORY} "
+                f"(fewer than {_MIN_HISTORY_MONTHS} months with transactions)")
+    return (
+        f"ACCOUNT_USUAL|months_with_transactions={usual.active_months}|"
+        f"usual_largest_single={_money(usual.largest_single)}|usual_month_total={_money(usual.month_total)}"
+    )
+
+
+def _largest_single(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The month with the largest single transaction of the six (the earliest on a tie)."""
+    return max(rows, key=lambda row: _amount(row, "max_amount"))
+
+
+def amount_facts(rows: list[dict[str, Any]], usual: AccountUsual) -> str:
+    """Call 1 facts for the large-transaction check: each month's largest single transaction
+    against this account's usual largest. The AI decides whether one is large."""
+    lines = [
+        "AMOUNT_FACTS — amounts in RM. times_usual_largest = this month's largest single transaction divided by "
+        "usual_largest_single. share_of_month_total = the largest single transaction as a share of the month total."
+    ]
     for row in rows:
+        if not row["txn_count_monthly"]:
+            lines.append(f"LARGEST|{row['year_month']}|transactions=0")
+            continue
+        largest = _amount(row, "max_amount")
         lines.append(
-            f"AMOUNT|{row['year_month']}|transactions={row['txn_count_monthly']}|"
-            f"total={_money(_amount(row, 'total_amount'))}|average={_money(_amount(row, 'avg_amount'))}|"
-            f"std={_money(_amount(row, 'std_amount'))}|largest_single={_money(_amount(row, 'max_amount'))}|"
-            f"largest_share_of_total={_share(_amount(row, 'max_amount'), _amount(row, 'total_amount'))}"
+            f"LARGEST|{row['year_month']}|largest_single={_money(largest)}|"
+            f"times_usual_largest={_times(largest, usual.largest_single)}|transactions={row['txn_count_monthly']}|"
+            f"month_total={_money(_amount(row, 'total_amount'))}|"
+            f"share_of_month_total={_share(largest, _amount(row, 'total_amount'))}"
         )
-    largest = max(rows, key=lambda row: _amount(row, "max_amount"))
-    reference = "above" if _amount(largest, "max_amount") >= single_reference else "below"
+    top = _largest_single(rows)
     lines.append(
-        f"AMOUNT_CANDIDATES|largest_single_in_six_months={largest['year_month']}:{_money(_amount(largest, 'max_amount'))}|"
-        f"largest_single_vs_review_reference={reference} (reference {_money(single_reference)})"
+        f"LARGEST_IN_SIX_MONTHS|{top['year_month']}|largest_single={_money(_amount(top, 'max_amount'))}|"
+        f"times_usual_largest={_times(_amount(top, 'max_amount'), usual.largest_single)}"
     )
     return "\n".join(lines)
+
+
+def _vs_usual_largest(row: dict[str, Any], usual: AccountUsual) -> str:
+    """", 7.7 times the usual largest (RM 17,511.50)" for staff; empty with too little history."""
+    if usual.largest_single is None:
+        return ""
+    return (f", {_times(_amount(row, 'max_amount'), usual.largest_single)} times the usual largest "
+            f"({_rm(usual.largest_single)})")
 
 
 def activity_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
     """Key figures for one or two selected months, led by the amounts."""
     by_month = {row["year_month"]: row for row in rows}
     if len(months) == 1:
-        return f"{months[0]}: {_amount_phrase(by_month[months[0]])}."
+        row = by_month[months[0]]
+        return f"{months[0]}: {_amount_phrase(row)}{_vs_usual_largest(row, account_usual(rows))}."
     first, second = (by_month[month] for month in months)
     return (
         f"{months[0]} to {months[1]}: total {_rm(_amount(first, 'total_amount'))} to {_rm(_amount(second, 'total_amount'))}; "
@@ -80,10 +154,10 @@ def activity_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
 
 def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
     totals = [_amount(row, "total_amount") for row in rows]
-    largest = max(rows, key=lambda row: _amount(row, "max_amount"))
+    largest = _largest_single(rows)
     return (
         f"Six-month totals range {_rm(min(totals))} to {_rm(max(totals))}; largest single transaction "
-        f"{_rm(_amount(largest, 'max_amount'))} in {largest['year_month']}."
+        f"{_rm(_amount(largest, 'max_amount'))} in {largest['year_month']}{_vs_usual_largest(largest, account_usual(rows))}."
     )
 
 
@@ -91,9 +165,9 @@ def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
 # Whether this pattern exists is arithmetic on the six rows, so the code decides
 # it. The model still judges the overall risk. Wording stays observational: six
 # rows cannot establish formal dormancy or that the account was ever active.
+# No reference amount: the amount is stated, and the AI judges what it means.
 
 Direction = Literal["debit", "credit", "mixed", "unspecified"]
-AmountBand = Literal["above", "below"]
 
 
 @dataclass(frozen=True)
@@ -112,25 +186,16 @@ class InactivityRun:
     credit: Decimal
     largest_single: Decimal
     direction: Direction
-    amount_band: AmountBand
-    # Which reference was reached, and its value; None when below reference.
-    trigger: Literal["single", "total"] | None
-    trigger_reference: Decimal | None
     later_active_months: int
     later_transactions: int
     later_total: Decimal
 
 
-def find_inactivity_run(
-    rows: list[dict[str, Any]], *, min_zero_months: int,
-    single_reference: Decimal, month_total_reference: Decimal,
-) -> InactivityRun | None:
+def find_inactivity_run(rows: list[dict[str, Any]], *, min_zero_months: int) -> InactivityRun | None:
     """Return the most recent run of ``min_zero_months`` or more zero-count months
     immediately followed by a month with transactions, or None.
 
     Rows are the six consecutive months in order (guaranteed by the CSV loader).
-    The amount band uses the largest single transaction and the monthly total, so
-    one large payment and many mid-sized payments are both recognised.
     """
     for index in range(len(rows) - 1, 0, -1):
         if rows[index]["txn_count_monthly"] <= 0:
@@ -150,19 +215,12 @@ def find_inactivity_run(
             "mixed" if has_debit and has_credit else "debit" if has_debit
             else "credit" if has_credit else "unspecified"
         )
-        trigger: Literal["single", "total"] | None = None
-        reference: Decimal | None = None
-        if largest >= single_reference:
-            trigger, reference = "single", single_reference
-        elif total >= month_total_reference:
-            trigger, reference = "total", month_total_reference
         later = [row for row in rows[index + 1:] if row["txn_count_monthly"] > 0]
         return InactivityRun(
             zero_start=rows[start]["year_month"], zero_end=rows[index - 1]["year_month"], zero_months=zeros,
             active_month=active["year_month"], transactions=active["txn_count_monthly"],
             debit_count=active["debit_count_monthly"], credit_count=active["credit_count_monthly"],
             total=total, debit=debit, credit=credit, largest_single=largest, direction=direction,
-            amount_band="above" if trigger else "below", trigger=trigger, trigger_reference=reference,
             later_active_months=len(later), later_transactions=sum(row["txn_count_monthly"] for row in later),
             later_total=sum((_amount(row, "total_amount") for row in later), Decimal(0)),
         )
@@ -170,7 +228,7 @@ def find_inactivity_run(
 
 
 def inactivity_run_fact(run: InactivityRun | None, min_zero_months: int) -> str:
-    """One labelled prompt line. It states facts and a band, never a risk level."""
+    """One labelled prompt line. It states facts, never a risk level."""
     if run is None:
         return f"INACTIVITY_RUN|status=none|rule={min_zero_months}_or_more_zero_months_then_activity"
     return (
@@ -178,15 +236,14 @@ def inactivity_run_fact(run: InactivityRun | None, min_zero_months: int) -> str:
         f"zero_months={run.zero_months}|active_month={run.active_month}|transactions={run.transactions}|"
         f"debits={run.debit_count}/{_money(run.debit)}|credits={run.credit_count}/{_money(run.credit)}|"
         f"largest_single={_money(run.largest_single)}|direction={run.direction}|"
-        f"amount_vs_reference={run.amount_band}|later_active_months={run.later_active_months}"
+        f"later_active_months={run.later_active_months}"
     )
 
 
 def inactivity_summary_fact(run: InactivityRun | None, min_zero_months: int) -> str:
     """The inactive period for the summary: when, and the largest single transaction after it.
 
-    No debit/credit direction and no amount band: the summary does not describe flows, and
-    its risk guide compares only single transactions with the review reference.
+    No debit/credit direction: the summary does not describe flows.
     """
     if run is None:
         return f"INACTIVITY_RUN|status=none|rule={min_zero_months}_or_more_zero_months_then_activity"
@@ -210,16 +267,10 @@ def _flow_phrase(run: InactivityRun) -> str:
 
 
 def _staff_check(run: InactivityRun) -> str:
-    if run.amount_band == "below":
-        return "Amount is below the review reference: looks like renewed use with limited movement."
-    scope = "Largest single transaction" if run.trigger == "single" else "Monthly total"
-    reference = "review reference" if run.trigger == "single" else "monthly-total reference"
-    reached = f"{scope} is at or above the {_rm(run.trigger_reference or Decimal(0))} {reference}."
-    ask = {
+    return {
         "debit": "Suggested check: confirm the payment purpose and how the account was funded.",
         "credit": "Suggested check: confirm the source and purpose of the incoming funds.",
     }.get(run.direction, "Suggested check: confirm the payment purpose and the source of incoming funds.")
-    return f"{reached} {ask}"
 
 
 def dormancy_rationale(run: InactivityRun) -> str:
@@ -301,7 +352,9 @@ def burst_guide_months(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # --- Layering: money in close to money out -----------------------------------
 # Money passing through: in the same month, money in (credits) and money out (debits)
-# are both large and nearly equal. The code lists the months; the model explains them.
+# are both large for this account and nearly equal. No fixed amount or percentage
+# decides it: the code lays out the figures and the AI decides which months, if any,
+# show layering, and explains why.
 
 def _layering_difference(row: dict[str, Any]) -> Decimal:
     """How far apart money in and money out are, as a share of the larger (0 = equal)."""
@@ -309,7 +362,6 @@ def _layering_difference(row: dict[str, Any]) -> Decimal:
     larger = max(money_in, money_out)
     if not larger:
         return Decimal(100)
-    # Rounded once, so the rule and the figure staff see always agree (10.04% shows as 10.0% and counts as 10.0%).
     return ((larger - min(money_in, money_out)) / larger * 100).quantize(Decimal("0.1"))
 
 
@@ -317,21 +369,31 @@ def _pct(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.1'))}%"
 
 
+def _has_money_in_and_out(row: dict[str, Any]) -> bool:
+    return _amount(row, "monthly_credit") > 0 and _amount(row, "monthly_debit") > 0
+
+
 def _difference_cell(row: dict[str, Any]) -> str:
-    """The difference for display; "-" for a month with no money in or out."""
+    """The difference for the evidence table; "-" for a month with no money in or out."""
     has_money = _amount(row, "monthly_credit") or _amount(row, "monthly_debit")
     return _pct(_layering_difference(row)) if has_money else "-"
 
 
-def layering_months(
-    rows: list[dict[str, Any]], min_amount: Decimal, max_difference_pct: Decimal,
-) -> list[dict[str, Any]]:
-    """Months whose money in and money out are both ``min_amount`` or more and within ``max_difference_pct``."""
-    return [
-        row for row in rows
-        if min(_amount(row, "monthly_credit"), _amount(row, "monthly_debit")) >= min_amount
-        and _layering_difference(row) <= max_difference_pct
-    ]
+def _difference_fact(row: dict[str, Any]) -> str:
+    """The difference for the AI, in RM and as a share of the larger side; one-sided months are named."""
+    money_in, money_out = _amount(row, "monthly_credit"), _amount(row, "monthly_debit")
+    if not money_in and not money_out:
+        return "no_money_in_or_out"
+    if not money_in or not money_out:
+        return "money_out_only" if not money_in else "money_in_only"
+    return f"{_money(abs(money_in - money_out))} ({_pct(_layering_difference(row))})"
+
+
+def closest_money_in_and_out(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The month whose money in and money out are nearest each other (both present); None if no month has both.
+    A figure for the AI and staff to consider, not a finding."""
+    both = [row for row in rows if _has_money_in_and_out(row)]
+    return min(both, key=_layering_difference) if both else None
 
 
 def _layering_phrase(row: dict[str, Any]) -> str:
@@ -341,119 +403,81 @@ def _layering_phrase(row: dict[str, Any]) -> str:
     )
 
 
-def _layering_rule(min_amount: Decimal, max_difference_pct: Decimal) -> str:
-    return (f"money in and money out both {_rm(min_amount)} or more and within "
-            f"{_pct(max_difference_pct)} of each other")
-
-
-def layering_facts(rows: list[dict[str, Any]], min_amount: Decimal, max_difference_pct: Decimal) -> str:
-    """Call 1 facts: money in and out per month, their difference, and the layering months."""
-    lines = ["LAYERING_FACTS — money in = credits, money out = debits; difference = how far apart money in and "
-             "money out are, as a share of the larger."]
-    lines.extend(
-        f"LAYERING|{row['year_month']}|money_in={_money(_amount(row, 'monthly_credit'))}|"
-        f"money_out={_money(_amount(row, 'monthly_debit'))}|difference={_difference_cell(row)}"
-        for row in rows
-    )
-    found = ",".join(f"{row['year_month']}:{_pct(_layering_difference(row))}"
-                     for row in layering_months(rows, min_amount, max_difference_pct))
-    lines.append(f"LAYERING_GUIDE|layering_months_with_{_layering_rule(min_amount, max_difference_pct).replace(' ', '_')}="
-                 + (found or "no month"))
+def layering_facts(rows: list[dict[str, Any]], usual: AccountUsual) -> str:
+    """Call 1 facts for the layering check: money in and out per month, how close they are,
+    and how big the month is for this account. The AI decides which months, if any, are layering."""
+    lines = [
+        "LAYERING_FACTS — money in = credits, money out = debits. difference = the gap between money in and money "
+        "out, in RM and as a share of the larger side (0% = equal). times_usual_month = this month's total divided "
+        "by usual_month_total."
+    ]
+    for row in rows:
+        lines.append(
+            f"LAYERING|{row['year_month']}|money_in={_money(_amount(row, 'monthly_credit'))}|"
+            f"money_out={_money(_amount(row, 'monthly_debit'))}|difference={_difference_fact(row)}|"
+            f"month_total={_money(_amount(row, 'total_amount'))}|"
+            f"times_usual_month={_times(_amount(row, 'total_amount'), usual.month_total)}"
+        )
+    closest = closest_money_in_and_out(rows)
+    lines.append("CLOSEST_MONEY_IN_AND_OUT|" + (
+        f"{closest['year_month']}|difference={_difference_fact(closest)}" if closest
+        else "no month has both money in and money out"))
     return "\n".join(lines)
 
 
-def layering_note(rows: list[dict[str, Any]], min_amount: Decimal, max_difference_pct: Decimal) -> str:
-    """The layering finding for this account, in plain words, for the end of the call 1 prompt.
+def layering_context(rows: list[dict[str, Any]], months: list[str]) -> str:
+    """Key figures for the layering check, from the rows: the months the AI judged layering,
+    or, when it judged none, the month where money in and money out were closest.
 
-    The same method as the burst note in call 2: the end of the prompt is where Qwen 7B
-    pays most attention.
+    Full figures for one or two months; month and difference only for more, so the text
+    stays short.
     """
-    rule = _layering_rule(min_amount, max_difference_pct)
-    months = layering_months(rows, min_amount, max_difference_pct)
-    if not months:
-        return (
-            f"\nLAYERING NOTE: This account has NO layering month: no month has {rule}. money_flow_insight must say "
-            "in one sentence that no layering was seen; do not describe debit or credit changes. money_flow_pattern "
-            'is "none", money_flow_months is "none" and money_flow_outcome is no_pattern_found.\n'
-        )
-    listed = "; ".join(_layering_phrase(row) for row in months)
-    selected = ",".join(row["year_month"] for row in months)
-    largest = max(months, key=lambda row: _amount(row, "monthly_credit"))
-    return (
-        f"\nLAYERING NOTE: This account HAS layering months ({rule}, so the money passed through the account): "
-        f"{listed}. money_flow_insight must explain this in one or two sentences: name every layering month, give "
-        f"the money in and money out for {largest['year_month']} (the largest), and say that staff should verify "
-        "where the money came from and where it went. Do not describe debit or credit changes. "
-        f'money_flow_pattern is "layering", money_flow_months is "{selected}" and money_flow_outcome is '
-        "pattern_found.\n"
-    )
-
-
-def layering_context(
-    rows: list[dict[str, Any]], months: list[str], min_amount: Decimal, max_difference_pct: Decimal,
-) -> str:
-    """Key figures for the layering check, from the rows (not from the AI's answer).
-
-    Full figures for one or two selected months; month and difference only for more, so
-    the text stays short. Layering months the AI did not select are named.
-    """
-    layered = layering_months(rows, min_amount, max_difference_pct)
-    if not layered:
-        return f"No layering month: no month had {_layering_rule(min_amount, max_difference_pct)}."
     by_month = {row["year_month"]: row for row in rows}
     selected = [by_month[month] for month in months if month in by_month]
-    if not selected:
-        return f"Layering months in the rows (not selected by the AI): {_short_layering_list(layered)}."
-    text = ("; ".join(_layering_phrase(row) for row in selected) + "." if len(selected) <= 2
-            else f"Layering months: {_short_layering_list(selected)}.")
-    missed = [row["year_month"] for row in layered if row not in selected]
-    return text + (f" Also layering, not selected: {', '.join(missed)}." if missed else "")
+    if len(selected) > 2:
+        return f"Months judged layering: {_short_layering_list(selected)}."
+    if selected:
+        return "; ".join(_layering_phrase(row) for row in selected) + "."
+    closest = closest_money_in_and_out(rows)
+    if closest is None:
+        return "No month had both money in and money out."
+    return f"No month judged layering. Closest money in and money out: {_layering_phrase(closest)}."
 
 
 def _short_layering_list(rows: list[dict[str, Any]]) -> str:
     return ", ".join(f"{row['year_month']} (difference {_pct(_layering_difference(row))})" for row in rows)
 
 
+# --- What the summary's risk guide reads -------------------------------------------
+
 @dataclass(frozen=True)
 class RiskSignals:
-    """The two facts the summary's risk guide uses: large single transactions and layering months.
-    Facts only; the AI decides the risk level. Each entry is staff-readable."""
+    """What call 1's AI decided: its large single transactions and its layering months.
+    None means that check could not be verified. Facts only; the AI decides the risk level."""
 
-    large_singles: tuple[str, ...]
-    layering: tuple[str, ...]
+    large_singles: tuple[str, ...] | None
+    layering: tuple[str, ...] | None
 
 
 def risk_signals(
-    rows: list[dict[str, Any]], single_reference: Decimal, layering_min_amount: Decimal,
-    layering_max_difference_pct: Decimal,
+    rows: list[dict[str, Any]], large_months: list[str] | None, layering_months: list[str] | None,
 ) -> RiskSignals:
+    """The AI's decided months, each with its figures from the rows (None = not checked)."""
+    by_month = {row["year_month"]: row for row in rows}
     return RiskSignals(
-        large_singles=tuple(
-            f"{row['year_month']}: {_rm(_amount(row, 'max_amount'))}"
-            for row in rows if _amount(row, "max_amount") >= single_reference
-        ),
-        layering=tuple(_layering_phrase(row) for row in layering_months(rows, layering_min_amount,
-                                                                       layering_max_difference_pct)),
+        large_singles=None if large_months is None else tuple(
+            f"{month}: {_rm(_amount(by_month[month], 'max_amount'))}" for month in large_months),
+        layering=None if layering_months is None else tuple(
+            _layering_phrase(by_month[month]) for month in layering_months),
     )
 
 
-def risk_signals_line(signals: RiskSignals, single_reference: Decimal) -> str:
-    """The summary's data line for the risk guide; it lists facts, never a level."""
-    return (
-        f"RISK_SIGNALS|{_single_reference_field(single_reference)}|"
-        f"large_single_transactions={'; '.join(signals.large_singles) or 'none'}|"
-        f"layering_months={'; '.join(signals.layering) or 'none'}"
-    )
-
-
-def _largest_single(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """The month with the largest single transaction of the six (the earliest on a tie)."""
-    return max(rows, key=lambda row: _amount(row, "max_amount"))
-
-
-def _single_reference_field(single_reference: Decimal) -> str:
-    """The reference applies to one transaction, never to a month's total, credits or debits; the label says so."""
-    return f"review_reference_for_single_transactions={_rm(single_reference)}"
+def risk_signals_line(signals: RiskSignals) -> str:
+    """The summary's data line for the risk guide; it lists the checks' decisions, never a level."""
+    def listed(values: tuple[str, ...] | None) -> str:
+        return "not_checked" if values is None else "; ".join(values) or "none"
+    return (f"RISK_SIGNALS|large_single_transactions={listed(signals.large_singles)}|"
+            f"layering_months={listed(signals.layering)}")
 
 
 def long_gap_months(rows: list[dict[str, Any]], long_gap_days: Decimal) -> list[dict[str, Any]]:
@@ -685,11 +709,14 @@ def canonical_pattern(check: str, name: str) -> str:
 
 
 def pattern_problem(
-    check: str, pattern: str, rows: list[dict[str, Any]], months: list[str], *,
-    long_gap_days: Decimal, single_reference: Decimal, layering_min_amount: Decimal,
-    layering_max_difference_pct: Decimal,
+    check: str, pattern: str, rows: list[dict[str, Any]], months: list[str], *, long_gap_days: Decimal,
 ) -> str | None:
-    """Why the pattern name does not fit the selected months, in plain words; None when it fits."""
+    """Why the pattern name does not fit the selected months, in plain words; None when it fits.
+
+    Large transaction and layering are the AI's judgement, so only what the rows make
+    impossible is checked: a large transaction needs a transaction in that month, and
+    layering needs both money in and money out in it.
+    """
     by_month = {row["year_month"]: row for row in rows}
     selected = [by_month[month] for month in months if month in by_month]
     if pattern == "none" or not selected:
@@ -697,15 +724,13 @@ def pattern_problem(
     if pattern not in PATTERN_NAMES.get(check, ()):
         return f'"{pattern}" is not one of the pattern labels for this check.'
     if pattern == "layering":
-        # Every selected month must be a layering month; the others are named with the rule.
-        layered = layering_months(selected, layering_min_amount, layering_max_difference_pct)
-        other = [row for row in selected if row not in layered]
-        return None if not other else (
-            f'"{PATTERN_LABELS[pattern]}" does not fit {"; ".join(_layering_phrase(row) for row in other)} '
-            f"(layering needs {_layering_rule(layering_min_amount, layering_max_difference_pct)})."
+        one_sided = [row for row in selected if not _has_money_in_and_out(row)]
+        return None if not one_sided else (
+            f'"{PATTERN_LABELS[pattern]}" does not fit {"; ".join(_layering_phrase(row) for row in one_sided)} '
+            "(layering needs both money in and money out in the month)."
         )
     fits = {
-        "large_transaction": lambda: any(_amount(row, "max_amount") >= single_reference for row in selected),
+        "large_transaction": lambda: all(row["txn_count_monthly"] > 0 for row in selected),
         "burst": lambda: bool(burst_guide_months(selected)),
         "long_gap": lambda: bool(long_gap_months(selected, long_gap_days)),
     }[pattern]()
@@ -718,7 +743,7 @@ def _selected_facts(check: str, rows: list[dict[str, Any]], selected: list[dict[
     """What the rows actually show for the selected months, for a mismatch message."""
     if check == "burst_and_gaps":
         return "; ".join(_burst_month_phrase(row) for row in selected)
-    largest = max(rows, key=lambda row: _amount(row, "max_amount"))
+    largest = _largest_single(rows)
     return "; ".join(
         f"{row['year_month']} total {_rm(_amount(row, 'total_amount'))}, largest single {_rm(_amount(row, 'max_amount'))}"
         for row in selected
@@ -808,17 +833,18 @@ def summary_month_lines(rows: list[dict[str, Any]]) -> list[str]:
     ]
 
 
-def profile_activity_focus(rows: list[dict[str, Any]], single_reference: Decimal) -> str:
-    """The profile call's focus line: the largest single transaction and how it compares with the reference.
+def profile_activity_focus(rows: list[dict[str, Any]]) -> str:
+    """The profile call's focus line: the largest single transaction against this account's usual largest.
 
-    Only the largest single transaction, on purpose. Given a month total, Qwen called it
-    credits (logged 2026-10-05, RM 7,234.04); given monthly credits, it compared them with
-    the single-transaction reference (logged 2026-10-08, RM 6,404.50 from 3 credits).
+    Only single transactions, on purpose. Given a month total, Qwen called it credits
+    (logged 2026-10-05, RM 7,234.04); given monthly credits, it compared them with a
+    single-transaction amount (logged 2026-10-08, RM 6,404.50 from 3 credits).
     """
     largest = _largest_single(rows)
     amount = _amount(largest, "max_amount")
+    usual = account_usual(rows).largest_single
     return (
         f"PROFILE_ACTIVITY_FOCUS|largest_single_transaction={_rm(amount)} in {largest['year_month']}|"
-        f"{_single_reference_field(single_reference)}|"
-        f"largest_single_vs_reference={'below' if amount < single_reference else 'above'}"
+        + (f"usual_largest_single={_rm(usual)}|times_usual_largest={_times(amount, usual)}" if usual
+           else f"usual_largest_single={_NOT_ENOUGH_HISTORY}")
     )
