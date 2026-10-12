@@ -6,9 +6,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.adapters.llm_client import OpenAICompatibleClient
-from app.api.routes import build_router
+from app.api.routes import UploadAnalyser, build_router
 from app.config import Settings
 from app.core.analysis_service import AnalysisService
+from app.core.batch_runner import BatchRunner
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.report_store import ReportStore
 from app.logging_config import LOG_FORMAT, configure_persistent_logging
@@ -51,6 +52,8 @@ llm_queue = LlmWorkQueue(
 service = AnalysisService(llm_client, settings, llm_queue)
 
 report_store = ReportStore(settings.report_directory_path)
+analyser = UploadAnalyser(service, report_store, settings.customer_info_path)
+batch_runner = BatchRunner(analyser.analyse_for_batch, max_kept_batches=settings.batch_keep_recent)
 
 app = FastAPI(
     title="Transaction Due-Diligence Assistant",
@@ -63,7 +66,7 @@ app.mount(
     name="static",
 )
 
-app.include_router(build_router(service, report_store, settings.customer_info_path))
+app.include_router(build_router(analyser, batch_runner, report_store, settings.batch_max_files))
 
 
 @app.get("/", include_in_schema=False)
@@ -113,10 +116,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 @app.on_event("startup")
 async def start_llm_queue() -> None:
     await llm_queue.start()
+    await batch_runner.start()
 
 
 @app.on_event("shutdown")
 async def close_llm_client() -> None:
+    await batch_runner.close()
     await llm_queue.close()
     await llm_client.close()
 

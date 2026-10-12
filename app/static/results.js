@@ -1,4 +1,11 @@
 const RESULT_STORAGE_KEY = "dd:last-result";
+const BATCH_POLL_MS = 5000;
+const FILE_STATUS_LABELS = {
+  queued: "Waiting",
+  analysing: "Analysing",
+  done: "Ready",
+  failed: "Failed",
+};
 
 const OUTCOME_LABELS = {
   pattern_found: "Pattern found",
@@ -39,11 +46,123 @@ const els = {
   limitations: document.querySelector("#limitations"),
   reportHtmlLink: document.querySelector("#report-html-link"),
   reportJsonLink: document.querySelector("#report-json-link"),
+  emptyStateText: document.querySelector("#empty-state-text"),
+  batchBar: document.querySelector("#batch-bar"),
+  batchPosition: document.querySelector("#batch-position"),
+  batchFile: document.querySelector("#batch-file"),
+  batchFileStatus: document.querySelector("#batch-file-status"),
+  batchProgress: document.querySelector("#batch-progress"),
+  batchPlaceholder: document.querySelector("#batch-placeholder"),
+  batchPlaceholderText: document.querySelector("#batch-placeholder-text"),
+  prevReport: document.querySelector("#prev-report"),
+  nextReport: document.querySelector("#next-report"),
 };
+
+// Batch mode: /results?batch=<id>&page=<n>. One report per page; the batch is polled
+// until every file has finished, and a page is drawn once its report is ready.
+const batchState = { id: null, data: null, page: 1, shown: null };
 
 init();
 
 function init() {
+  const params = new URLSearchParams(window.location.search);
+  const batchId = params.get("batch");
+  if (batchId) {
+    initBatch(batchId, Number.parseInt(params.get("page"), 10) || 1);
+    return;
+  }
+  initSingleResult();
+}
+
+function initBatch(batchId, page) {
+  batchState.id = batchId;
+  batchState.page = page;
+  els.emptyState.classList.add("hidden");
+  els.prevReport.addEventListener("click", () => goToPage(batchState.page - 1));
+  els.nextReport.addEventListener("click", () => goToPage(batchState.page + 1));
+  pollBatch();
+}
+
+async function pollBatch() {
+  try {
+    const response = await fetch(`/v1/accounts/batches/${encodeURIComponent(batchState.id)}`);
+    const body = await response.json().catch(() => null);
+    if (!response.ok) {
+      showBatchError(body?.detail || `Could not load this upload (HTTP ${response.status}).`);
+      return;
+    }
+    batchState.data = body;
+    batchState.page = Math.min(Math.max(batchState.page, 1), body.total);
+    showBatchPage();
+    if (!body.finished) setTimeout(pollBatch, BATCH_POLL_MS);
+  } catch {
+    // A dropped connection should not stop the page; try again shortly.
+    setTimeout(pollBatch, BATCH_POLL_MS);
+  }
+}
+
+function goToPage(page) {
+  if (!batchState.data || page < 1 || page > batchState.data.total) return;
+  batchState.page = page;
+  const url = new URL(window.location.href);
+  url.searchParams.set("page", String(page));
+  window.history.replaceState(null, "", url);
+  showBatchPage();
+  window.scrollTo({ top: 0 });
+}
+
+function showBatchPage() {
+  const { data, page } = batchState;
+  const file = data.files[page - 1];
+
+  els.batchBar.classList.remove("hidden");
+  els.batchPosition.textContent = `Report ${page} of ${data.total}`;
+  els.batchFile.textContent = file.filename;
+  els.batchFileStatus.textContent = FILE_STATUS_LABELS[file.status] || file.status;
+  els.batchFileStatus.className = `file-status status-${file.status}`;
+  els.prevReport.disabled = page <= 1;
+  els.nextReport.disabled = page >= data.total;
+
+  const counts = data.counts;
+  els.batchProgress.textContent = data.finished
+    ? `All ${data.total} files finished: ${counts.done} ready, ${counts.failed} failed.`
+    : `${counts.done} ready \u00b7 ${counts.analysing} analysing \u00b7 ${counts.queued} waiting \u00b7 ${counts.failed} failed. `
+      + "Files are analysed one at a time.";
+  els.batchProgress.classList.remove("hidden");
+
+  if (file.status === "done" && file.result) {
+    const key = `${page}:done`;
+    if (batchState.shown !== key) {  // draw once, so polling does not reset the page
+      renderResult(file.result);
+      batchState.shown = key;
+    }
+    els.batchPlaceholder.classList.add("hidden");
+    els.result.classList.remove("hidden");
+    return;
+  }
+
+  batchState.shown = null;
+  els.result.classList.add("hidden");
+  els.batchPlaceholderText.textContent = placeholderText(file);
+  els.batchPlaceholder.classList.remove("hidden");
+}
+
+function placeholderText(file) {
+  if (file.status === "failed") return `This file could not be analysed: ${file.error}`;
+  if (file.status === "analysing") return "Analysing this account now. This usually takes a few minutes; the report appears here when it is ready.";
+  return "Waiting in the queue. Files are analysed one at a time, so this one starts after the files before it.";
+}
+
+function showBatchError(message) {
+  els.batchBar.classList.add("hidden");
+  els.batchProgress.classList.add("hidden");
+  els.batchPlaceholder.classList.add("hidden");
+  els.result.classList.add("hidden");
+  els.emptyStateText.textContent = message;
+  els.emptyState.classList.remove("hidden");
+}
+
+function initSingleResult() {
   const raw = sessionStorage.getItem(RESULT_STORAGE_KEY);
   const data = raw ? safeParse(raw) : null;
 

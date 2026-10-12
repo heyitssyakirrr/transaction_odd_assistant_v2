@@ -19,8 +19,23 @@
   </header>
 
   <main class="results-page">
+    <nav id="batch-bar" class="batch-bar hidden" aria-label="Reports in this upload">
+      <button id="prev-report" class="pager-button" type="button">&larr; Previous</button>
+      <div class="batch-position">
+        <strong id="batch-position"></strong>
+        <span id="batch-file" class="batch-file"></span>
+        <span id="batch-file-status" class="file-status"></span>
+      </div>
+      <button id="next-report" class="pager-button" type="button">Next &rarr;</button>
+    </nav>
+    <p id="batch-progress" class="batch-progress hidden"></p>
+
+    <div id="batch-placeholder" class="results-empty hidden">
+      <p id="batch-placeholder-text"></p>
+    </div>
+
     <div id="empty-state" class="results-empty">
-      <p>No assessment is loaded. Upload a statement to run a review.</p>
+      <p id="empty-state-text">No assessment is loaded. Upload a statement to run a review.</p>
       <a class="report-link" href="/">Go to upload</a>
     </div>
 

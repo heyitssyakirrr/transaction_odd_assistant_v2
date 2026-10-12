@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 
 from app.adapters.llm_client import LlmContextWindowError, LlmServiceError
 from app.core.analysis_service import AnalysisService, ModelOutputError
+from app.core.batch_runner import BatchFile, BatchRunner, FileAnalysisError
 from app.core.llm_work_queue import LlmQueueClosedError, LlmQueueFullError
 from app.core.models import AccountAnalysisRequest
 from app.core.report_store import ReportStore
@@ -26,27 +27,19 @@ logger = logging.getLogger("app.api")
 _MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
 
-def build_router(
-    service: AnalysisService,
-    report_store: ReportStore,
-    customer_info_path: Path,
-) -> APIRouter:
-    router = APIRouter(prefix="/v1/accounts", tags=["accounts"])
+class UploadAnalyser:
+    """Analyses one uploaded CSV. Used by the single-file endpoint and by the batch runner,
+    so a file gives the same result whichever way it was uploaded."""
 
-    @router.post("/analyze-file")
-    async def analyze_file(file: UploadFile = File(...)) -> dict:
-        if not (file.filename or "").lower().endswith(".csv"):
-            raise HTTPException(
-                status_code=415,
-                detail="Please upload the 6-month monthly summary CSV for one account.",
-            )
+    def __init__(self, service: AnalysisService, report_store: ReportStore, customer_info_path: Path) -> None:
+        self._service = service
+        self._report_store = report_store
+        self._customer_info_path = customer_info_path
 
-        raw = await file.read()
-        if len(raw) > _MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail="The CSV exceeds the 2 MB upload limit for a 6-row monthly summary.",
-            )
+    async def analyse(self, filename: str, raw: bytes) -> dict:
+        """The assessment and report links; raises HTTPException with a message for staff."""
+        if problem := upload_problem(filename, len(raw)):
+            raise HTTPException(status_code=problem[0], detail=problem[1])
 
         started_at = time.monotonic()
         case_id = "unknown"
@@ -58,22 +51,20 @@ def build_router(
             logger.info("Starting analysis: case=%s acct=%s months=%s", case_id, acct_num, len(monthly_summary))
 
             # Parquet I/O is blocking; keep it off the event loop.
-            customer_profile = await asyncio.to_thread(
-                load_customer_profile, customer_info_path, acct_num
-            )
+            customer_profile = await asyncio.to_thread(load_customer_profile, self._customer_info_path, acct_num)
 
             request = AccountAnalysisRequest(
                 case_id=case_id,
-                source_filename=file.filename or "monthly-summary.csv",
+                source_filename=filename or "monthly-summary.csv",
                 acct_num=acct_num,
                 monthly_summary=monthly_summary,
                 customer_profile=customer_profile,
             )
 
-            result = await service.analyze_account(request)
+            result = await self._service.analyze_account(request)
             # Report rendering and disk I/O must not block queue workers or
             # other concurrent uploads on the event loop.
-            saved = await asyncio.to_thread(report_store.save, result)
+            saved = await asyncio.to_thread(self._report_store.save, result)
 
             logger.info(
                 "Analysis complete: case=%s decision=%s risk=%s duration=%.1fs",
@@ -81,6 +72,7 @@ def build_router(
             )
             return {
                 **result.model_dump(mode="json"),
+                "source_filename": filename,
                 "report_html": f"/v1/accounts/reports/{saved.html_name}",
                 "report_json": f"/v1/accounts/reports/{saved.json_name}",
             }
@@ -112,6 +104,66 @@ def build_router(
         except LlmQueueClosedError as exc:
             logger.warning("LLM queue unavailable during shutdown: case=%s", case_id)
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    async def analyse_for_batch(self, filename: str, raw: bytes) -> dict:
+        """The same analysis, with the failure message the batch shows for that file."""
+        try:
+            return await self.analyse(filename, raw)
+        except HTTPException as exc:
+            raise FileAnalysisError(str(exc.detail)) from exc
+
+
+def upload_problem(filename: str | None, size: int) -> tuple[int, str] | None:
+    """(HTTP status, message) when the upload cannot be a monthly-summary CSV; None when it may be."""
+    if not (filename or "").lower().endswith(".csv"):
+        return 415, "Please upload the 6-month monthly summary CSV for one account."
+    if size > _MAX_UPLOAD_BYTES:
+        return 413, "The CSV exceeds the 2 MB upload limit for a 6-row monthly summary."
+    return None
+
+
+def build_router(
+    analyser: UploadAnalyser,
+    batch_runner: BatchRunner,
+    report_store: ReportStore,
+    batch_max_files: int,
+) -> APIRouter:
+    router = APIRouter(prefix="/v1/accounts", tags=["accounts"])
+
+    @router.post("/analyze-file")
+    async def analyze_file(file: UploadFile = File(...)) -> dict:
+        """One CSV, analysed now; the response is the assessment."""
+        return await analyser.analyse(file.filename or "", await file.read())
+
+    @router.post("/batches", status_code=202)
+    async def create_batch(files: list[UploadFile] = File(...)) -> dict:
+        """Several CSVs, one account each. They are queued and analysed one at a time;
+        poll GET /v1/accounts/batches/{batch_id} for each file's status and result."""
+        if not files:
+            raise HTTPException(status_code=422, detail="Choose at least one CSV file.")
+        if len(files) > batch_max_files:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upload at most {batch_max_files} CSV files at a time; {len(files)} were selected.",
+            )
+        items = []
+        for upload in files:
+            raw = await upload.read()
+            item = BatchFile(filename=upload.filename or "unnamed.csv", content=raw)
+            if problem := upload_problem(upload.filename, len(raw)):
+                item.fail(problem[1])  # a wrong file is reported, the others still run
+            items.append(item)
+        return batch_runner.submit(items).as_dict()
+
+    @router.get("/batches/{batch_id}")
+    def batch_status(batch_id: str) -> dict:
+        batch = batch_runner.get(batch_id)
+        if batch is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Batch not found. Batches are kept in memory and are cleared when the application restarts.",
+            )
+        return batch.as_dict()
 
     @router.get("/reports/{report_name}")
     def download_report(report_name: str) -> FileResponse:

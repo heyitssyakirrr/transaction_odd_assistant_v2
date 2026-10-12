@@ -910,6 +910,14 @@ class AnalysisService:
         return catalog
 
 
+# How much text the code accepts from the AI before treating it as runaway output.
+# Generous on purpose: the prompts ask for shorter text, and a normal answer must
+# never be cut (an explanation cut mid-sentence changes what the AI said).
+_INSIGHT_TEXT_LIMIT = 600
+_HEADLINE_TEXT_LIMIT = 300
+_SUMMARY_TEXT_LIMIT = 600
+
+
 def _cap(text: str, limit: int) -> str:
     """Shorten text to ``limit`` characters at a word boundary."""
     if len(text) <= limit:
@@ -989,13 +997,14 @@ class _RawAnswer(BaseModel):
 class _RawActivityMoney(_RawAnswer):
     _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ("activity_outcome", "money_flow_outcome")
     _PATTERN_KEYS: ClassVar[tuple[str, ...]] = ("activity_pattern", "money_flow_pattern")
-    _TEXT_LIMITS: ClassVar[dict[str, int]] = {"activity_insight": 300, "money_flow_insight": 300}
-    activity_insight: str = Field(default="", max_length=300)
+    _TEXT_LIMITS: ClassVar[dict[str, int]] = {
+        "activity_insight": _INSIGHT_TEXT_LIMIT, "money_flow_insight": _INSIGHT_TEXT_LIMIT}
+    activity_insight: str = Field(default="", max_length=_INSIGHT_TEXT_LIMIT)
     activity_pattern: str = Field(default="none", max_length=40)
     # Outcome and months may be missing; the validator then retries or marks only that check.
     activity_months: str | None = Field(default=None, max_length=200)
     activity_outcome: Outcome | None = None
-    money_flow_insight: str = Field(default="", max_length=300)
+    money_flow_insight: str = Field(default="", max_length=_INSIGHT_TEXT_LIMIT)
     money_flow_pattern: str = Field(default="none", max_length=40)
     money_flow_months: str | None = Field(default=None, max_length=200)
     money_flow_outcome: Outcome | None = None
@@ -1013,13 +1022,14 @@ class _RawActivityMoney(_RawAnswer):
 class _RawInactivityBurstGaps(_RawAnswer):
     _OUTCOME_KEYS: ClassVar[tuple[str, ...]] = ("burst_gaps_outcome",)
     _PATTERN_KEYS: ClassVar[tuple[str, ...]] = ("burst_gaps_pattern",)
-    _TEXT_LIMITS: ClassVar[dict[str, int]] = {"inactivity_insight": 300, "burst_gaps_insight": 300}
+    _TEXT_LIMITS: ClassVar[dict[str, int]] = {
+        "inactivity_insight": _INSIGHT_TEXT_LIMIT, "burst_gaps_insight": _INSIGHT_TEXT_LIMIT}
     # Fields are in the prompt's key order; the retry message lists them in this order.
-    burst_gaps_insight: str = Field(default="", max_length=300)
+    burst_gaps_insight: str = Field(default="", max_length=_INSIGHT_TEXT_LIMIT)
     burst_gaps_pattern: str = Field(default="none", max_length=40)
     burst_gaps_months: str | None = Field(default=None, max_length=200)
     burst_gaps_outcome: Outcome | None = None
-    inactivity_insight: str = Field(default="", max_length=300)
+    inactivity_insight: str = Field(default="", max_length=_INSIGHT_TEXT_LIMIT)
 
 
 class _RawOverallSummary(_RawAnswer):
@@ -1027,17 +1037,16 @@ class _RawOverallSummary(_RawAnswer):
         "headline", "point_1", "point_2", "point_3", "why_it_matters", "verify_1", "verify_2", "risk_reason",
     )
     _TEXT_LIMITS: ClassVar[dict[str, int]] = {
-        "headline": 160, "point_1": 300, "point_2": 300, "point_3": 300, "why_it_matters": 360,
-        "verify_1": 260, "verify_2": 260, "risk_reason": 260,
+        field: _HEADLINE_TEXT_LIMIT if field == "headline" else _SUMMARY_TEXT_LIMIT for field in TEXT_FIELDS
     }
-    headline: str = Field(default="", max_length=160)
-    point_1: str = Field(default="", max_length=300)
-    point_2: str = Field(default="", max_length=300)
-    point_3: str = Field(default="", max_length=300)
-    why_it_matters: str = Field(default="", max_length=360)
-    verify_1: str = Field(default="", max_length=260)
-    verify_2: str = Field(default="", max_length=260)
-    risk_reason: str = Field(default="", max_length=260)
+    headline: str = Field(default="", max_length=_HEADLINE_TEXT_LIMIT)
+    point_1: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
+    point_2: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
+    point_3: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
+    why_it_matters: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
+    verify_1: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
+    verify_2: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
+    risk_reason: str = Field(default="", max_length=_SUMMARY_TEXT_LIMIT)
     risk_level: RiskLevel
 
     @classmethod

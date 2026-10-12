@@ -44,6 +44,11 @@ class Settings:
     llm_log_raw_response_max_chars: int = int(os.getenv("LLM_LOG_RAW_RESPONSE_MAX_CHARS", "20000"))
     llm_queue_maxsize: int = int(os.getenv("LLM_QUEUE_MAXSIZE", "60"))
     llm_queue_enqueue_timeout_seconds: float = float(os.getenv("LLM_QUEUE_ENQUEUE_TIMEOUT_SECONDS", "5"))
+    # Multi-file upload: files wait in the application and run one account at a time,
+    # so a batch never adds LLM calls beyond LLM_CONCURRENCY.
+    batch_max_files: int = int(os.getenv("BATCH_MAX_FILES", "20"))
+    # Finished batches kept in memory for the results page (cleared on restart).
+    batch_keep_recent: int = int(os.getenv("BATCH_KEEP_RECENT", "20"))
     customer_info_parquet_path: str = os.getenv(
         "CUSTOMER_INFO_PARQUET_PATH",
         str(BASE_DIR / "data" / "customer_info.parquet"), 
@@ -130,6 +135,8 @@ class Settings:
             "LLM_CONCURRENCY": self.llm_concurrency,
             "LLM_QUEUE_MAXSIZE": self.llm_queue_maxsize,
             "LLM_QUEUE_ENQUEUE_TIMEOUT_SECONDS": self.llm_queue_enqueue_timeout_seconds,
+            "BATCH_MAX_FILES": self.batch_max_files,
+            "BATCH_KEEP_RECENT": self.batch_keep_recent,
             "MAX_RESPONSE_TOKENS": self.max_response_tokens,
             "LLM_TRANSACTION_MAX_RESPONSE_TOKENS": self.llm_transaction_max_response_tokens,
             "LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS": self.llm_profile_context_max_response_tokens,

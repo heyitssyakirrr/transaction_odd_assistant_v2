@@ -23,9 +23,9 @@
       <p class="eyebrow">Transaction review</p>
       <h1>Analyse customer statements with <em>clarity and confidence</em></h1>
       <p class="upload-hero-lead">
-        Upload one account's 6-month monthly summary. Linked customer profile
-        history is joined automatically, and the system runs a single-pass
-        AML review. You'll be taken to a results page once the assessment is ready.
+        Upload one or more 6-month monthly summaries, one CSV per account. Linked
+        customer profile history is joined automatically. Accounts are analysed
+        one at a time, and you can page through each report as soon as it is ready.
       </p>
     </section>
 
@@ -38,9 +38,9 @@
       <form id="analysis-form">
         <label id="file-field" class="file-field" for="file">
           <span class="file-field-icon" aria-hidden="true">&uarr;</span>
-          <span id="file-name" class="file-field-title">Drop CSV file here</span>
-          <span class="file-field-hint">or click to browse &middot; .csv up to 2 MB</span>
-          <input id="file" type="file" accept=".csv,text/csv" required>
+          <span id="file-name" class="file-field-title">Drop CSV files here</span>
+          <span class="file-field-hint">or click to browse &middot; one .csv per account, up to 2 MB each</span>
+          <input id="file" type="file" accept=".csv,text/csv" multiple required>
         </label>
 
         <p class="upload-note">
@@ -50,10 +50,12 @@
           monthly_avg_debit, monthly_avg_credit.
         </p>
 
+        <ul id="file-list" class="file-list hidden"></ul>
+
         <div id="error" class="error hidden" role="alert"></div>
         <div id="loading" class="loading hidden">
           <span class="spinner" aria-hidden="true"></span>
-          <span>Segmenting the statement and consulting the model&hellip;</span>
+          <span>Uploading and queuing the files&hellip;</span>
         </div>
 
         <button id="submit-button" type="submit">

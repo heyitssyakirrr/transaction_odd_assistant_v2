@@ -92,7 +92,7 @@ class ReviewCheck(BaseModel):
     pattern: str | None = None
     months: list[str] = Field(default_factory=list)
     # The model's explanation for staff, exactly as written; None when it gave none.
-    insight: str | None = Field(default=None, max_length=400)
+    insight: str | None = Field(default=None, max_length=600)
     # Where the model's sentence or pattern label does not match the CSV, in plain words.
     # Shown under the sentence; nothing the model wrote is hidden.
     issues: list[str] = Field(default_factory=list)
@@ -121,7 +121,7 @@ class OverallSummary(BaseModel):
 
     # False when the summary call failed and the application could not supply an LLM view.
     verified: bool
-    headline: str = Field(min_length=1, max_length=200)
+    headline: str = Field(min_length=1, max_length=300)
     points: list[str] = Field(default_factory=list, max_length=3)
     why_it_matters: str | None = None
     verify_first: list[str] = Field(default_factory=list, max_length=2)
