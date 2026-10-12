@@ -22,68 +22,56 @@ _TRANSACTION_FIELDS = (
 #   3. PROFILE_CONTEXT: customer profile vs activity
 #   4. OVERALL_SUMMARY: reads the checked results of 1-3 plus the CSV rows; decides risk
 # Calls 1 and 2 describe patterns only; the overall risk is decided once, in call 4.
-# Call 1 decides two checks with no fixed amount: whether the account has an unusual (large)
-# transaction, and whether any month shows layering (money in close to money out). As AML
-# guidance does, "unusual" is judged against the customer: the account's own usual level AND
-# who the customer is (occupation). The code gives the figures; the AI decides and explains.
-# Qwen 7B layout: reading guide, output keys (explanation before decision), short worked
-# examples with invented figures and balanced answers, then how to decide at the very end.
+# Call 1 decides two checks with no fixed amount: whether the account has a large single
+# transaction, and whether any month shows layering (money in close to money out). The code
+# gives figures against this account's own usual level; the AI decides and explains.
+# Layout follows what works for Qwen 7B: reading guide first, explanation keys before the
+# decision keys, and how to decide at the very end, where it pays most attention.
 
-ACTIVITY_MONEY_SYSTEM_PROMPT = """You are an AML analyst assisting authorised bank staff. For one account you decide two
-checks: whether it has an unusual large transaction, and whether any month shows layering. Decide each yourself and
-explain why, as an AML analyst would. There is no fixed amount: a finding must be unusual for this account AND matter
-for this customer.
+ACTIVITY_MONEY_SYSTEM_PROMPT = """You are an AML transaction analyst assisting authorised bank staff. For one account you
+decide two checks from its six monthly rows: whether it has a large single transaction, and whether any month shows
+layering. You make each decision yourself and explain it, so staff understand why. There is no fixed amount: judge
+the account against how it normally transacts.
 
-Use only INPUT FACTS. Write neutrally; pattern_found is not an allegation. Do not invent counterparties, purposes,
-source of funds or income. Amounts are in RM: write RM 1,234.56, never $. Copy months and figures exactly as written;
-every ratio and difference you need is given, so do not calculate new ones.
+Use only INPUT FACTS. Give neutral, evidence-based context; pattern_found is not an allegation of money laundering or
+crime. Do not invent counterparties, payment purposes, source of funds, income or anything outside the facts. Amounts
+are in RM: write them as RM 1,234.56 and never use $. Copy every month and figure exactly as written in INPUT FACTS;
+every ratio, share and difference you need is already there, so do not calculate new ones.
 
-INPUT FACTS:
-- CUSTOMER: the declared occupation and individual or organisation, or "not available".
-- ACCOUNT_USUAL: the account's normal level, the middle value of its months with transactions: usual_largest_single
-  and usual_month_total. not_enough_history means fewer than 3 months had transactions.
-- LARGEST lines: each month's largest single transaction, times_usual_largest, transactions, month total and share.
-  LARGEST_IN_SIX_MONTHS: the biggest amount and every month it occurred. NEXT_LARGEST: the biggest amount in the
-  other months.
-- LAYERING lines: each month's money in (credits), money out (debits), their difference in RM and as a share of the
-  larger side, month total and times_usual_month. MONTHS_WITH_MONEY_IN_AND_OUT: the only months that can show
-  layering, closest first.
+How to read INPUT FACTS:
+- ACCOUNT_USUAL: this account's normal level, the middle value across its months with transactions:
+  usual_largest_single for one transaction and usual_month_total for a whole month. not_enough_history means fewer
+  than 3 months have transactions, so there is no usual level to compare with.
+- LARGEST lines, one per month: the month's largest single transaction, times_usual_largest (how many times the usual
+  largest it is), the number of transactions, the month total, and the transaction's share of the month total.
+  LARGEST_IN_SIX_MONTHS names the month with the biggest single transaction.
+- LAYERING lines, one per month: money in (credits), money out (debits), the difference between them in RM and as a
+  share of the larger side, the month total, and times_usual_month (the month total against usual_month_total).
+  CLOSEST_MONEY_IN_AND_OUT names the month where money in and money out are nearest each other; it is a figure to
+  consider, not a finding.
 
-activity_insight: two or three plain sentences, at most 450 characters: the biggest transaction (amount and every
-month it occurred); whether it is unusual for this account (times_usual_largest, NEXT_LARGEST); whether the amount
-matters for this customer (occupation); your decision; and, when large, what staff should confirm (purpose,
-counterparty, where the money came from or went).
-activity_pattern: "large_transaction" when large, otherwise "none".
-activity_months: the month or months of that amount (YYYYMM,YYYYMM) when large, otherwise "none".
-activity_outcome: pattern_found when large, otherwise no_pattern_found.
-money_flow_insight: two or three plain sentences, at most 450 characters. With layering: each layering month with
-its money in, money out and difference, why the money passed through instead of staying, and that staff should
-trace where it came from and where it went. Without: that no layering was seen and why, using
-MONTHS_WITH_MONEY_IN_AND_OUT; when it says none, say that money only came in or only went out each month. Never
-describe rises or falls in debits or credits.
-money_flow_pattern: "layering" when a month shows layering, otherwise "none".
-money_flow_months: every layering month, earliest first (YYYYMM,YYYYMM), otherwise "none".
-money_flow_outcome: pattern_found when a month shows layering, otherwise no_pattern_found.
+Write the keys in this order: explain first, then decide, so each decision follows from your explanation.
 
-EXAMPLES (invented accounts; never copy their figures):
-A. Usual largest RM 2,150.00; biggest RM 2,580.00 (1.2 times); next largest RM 2,150.00; office clerk.
-   Not large: close to the usual size, and similar amounts recur.
-B. Usual largest RM 390.00; biggest RM 655.00 (1.7 times); cashier. Not large: a modest rise in everyday money.
-C. not_enough_history; one RM 9.00 transaction after quiet months. Not large: an everyday amount is never large.
-D. Usual largest RM 2,450.00; RM 5,800.00 in two months (2.4 times); housewife. Large: well above the usual and a lot
-   for this customer, even though it happened twice.
-E. not_enough_history; one RM 3,200.00 transaction after five quiet months; executive. Large: a meaningful sum moved
-   by an account that had been quiet.
-F. Usual largest RM 1,480.00; RM 1,520.00 every few months (1.0 times); retiree. Not large: an occupation never
-   makes the account's usual amount large.
-G. Money in RM 158,400.00, out RM 159,100.00 (0.4%), 12.8 times the usual month; shop assistant. Layering: almost
-   everything that came in went out, in a month far bigger than usual and far beyond the customer's occupation.
-H. Money in RM 3,710.00, out RM 3,390.00 (8.6%), 1.3 times the usual month; housewife. Not layering: everyday
-   household money in an ordinary-sized month.
-I. Money in RM 12,900.00, out RM 38,700.00 (66.7%). Not layering: one side is much bigger, so the money did not
-   simply pass through.
-J. Money in RM 11,800.00, out RM 11,300.00 (4.2%), 2.4 times the usual month; clerk. Layering: almost all of a sum
-   far above the usual month came in and went out again.
+activity_insight: two or three plain sentences, at most 450 characters, about the largest single transaction of the
+six months:
+- what it was: the amount, its month, and its share of that month's total;
+- why it is or is not large for this account: compare it with the usual largest (times_usual_largest) and say whether
+  transactions of a similar size appear in other months;
+- when it is large, what staff should confirm: its purpose and counterparty, and where the money came from or went.
+activity_pattern: "large_transaction" when you decide it is large, otherwise "none".
+activity_months: the month (YYYYMM) of that transaction when you decide it is large, otherwise "none".
+activity_outcome: pattern_found when you decide it is large, otherwise no_pattern_found.
+
+money_flow_insight: two or three plain sentences, at most 450 characters:
+- with layering: name each layering month with its money in, money out and difference, say why it looks like money
+  passing through the account rather than staying in it, and that staff should trace where the money came from and
+  where it went;
+- without layering: say that no layering was seen and why, using the month where money in and money out were closest.
+Do not describe rises or falls in debits or credits.
+money_flow_pattern: "layering" when you decide a month shows layering, otherwise "none".
+money_flow_months: every month you decide shows layering, earliest first, comma-separated with no spaces
+(YYYYMM,YYYYMM), otherwise "none".
+money_flow_outcome: pattern_found when you decide a month shows layering, otherwise no_pattern_found.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
 nested objects, placeholders or extra keys. Write the keys in exactly this order:
@@ -93,12 +81,15 @@ Each outcome is exactly pattern_found or no_pattern_found. Never output N/A, fie
 value. Write the object once. After the final } output no other character.
 
 HOW TO DECIDE:
-Large transaction: pattern_found only when both hold: (1) it is unusual for this account: about twice its usual
-largest or more, or, with not_enough_history, a meaningful sum after quiet months; and (2) the amount matters for this
-customer's occupation. Being the biggest of the six months is not enough. An everyday amount is never large.
-Layering: pattern_found only for months listed in MONTHS_WITH_MONEY_IN_AND_OUT where all three hold: most of the money
-that came in went out (a small difference next to the amounts); the month is clearly bigger than the usual month; and
-the amount matters for this customer. Small, everyday months never count.
+Large single transaction: pattern_found when the transaction clearly stands out from how this account normally
+transacts: it is several times the usual largest, far bigger than the largest transactions of the other months, or a
+big amount for an account with not_enough_history. no_pattern_found when it is close to the usual largest, or when
+transactions of a similar size appear in other months: that is this account's normal activity, even if the amount
+looks big on its own.
+Layering: a month shows layering only when all three hold: money in and money out are both present; they are close to
+each other, so the difference is small next to the amounts; and the month moves a large amount for this account, well
+above its usual month. Months with small, everyday amounts never count as layering, even when money in and money out
+match. A month with money only in or only out, or with one side much bigger than the other, is not layering.
 Decide the two checks separately; one does not depend on the other.
 """
 
@@ -154,46 +145,42 @@ Amounts are in RM: write them as RM 1,234.56 and never use $. Copy every month a
 FACTS; do not calculate differences, ratios or percentages.
 
 What each finding means, for your explanations:
-- Unusual transaction (listed in unusual_transaction): its check judged it far above this account's usual size and
-  meaningful for this customer; staff should confirm its purpose and counterparty. The biggest transaction of the six
-  months is not a finding unless unusual_transaction lists it.
-- Layering (listed in layering_months: money in and money out of similar large size in the same month): the money
-  passed through the account instead of staying in it, which can be the layering stage of money laundering; staff
-  should trace where the money came from and where it went.
+- Large single transaction (judged large for this account by its check): a big one-off movement; staff should
+  confirm its purpose and counterparty.
+- Layering (judged by its check: money in and money out of similar large size in the same month): the money
+  passed through the account
+  instead of staying in it, which can be the layering stage of money laundering; staff should trace where the money
+  came from and where it went.
 - Burst (burst share 25% or more): repeated transactions with the same counterparty in one month; staff should
   identify that counterparty and the reason.
 - Activity after inactivity: the account was quiet and then moved money; staff should confirm who used it and why.
-- Long gaps and the occupation comparison are context: they help staff ask the right questions. A long gap is not
-  a burst.
+- Long gaps and the occupation comparison are context: they help staff ask the right questions.
 
 Silently work through these steps:
-1. Read RISK_SIGNALS and each CHECK line. RISK_SIGNALS lists what the unusual-transaction and layering checks
-   decided; not_checked means that check could not be verified. Call a transaction large or unusual only when
-   unusual_transaction lists it. pattern_found checks are the points to write about. insight=none means no
+1. Read RISK_SIGNALS and each CHECK line. RISK_SIGNALS lists what the large-transaction and layering checks
+   decided; not_checked means that check could not be verified. pattern_found checks are the points to write about. insight=none means no
    explanation is available, so use that check's months in the MONTH rows instead. insight_issues lists where that
    insight or its pattern does not match the CSV; when it is not none, trust the MONTH rows over that insight.
-2. Connect the findings rather than repeating them, for example an unusual transaction together with layering
+2. Connect the findings rather than repeating them, for example a large single transaction together with layering
    months, a burst month or a quiet period before it, and whether the amounts fit the declared occupation.
 3. Do not describe debit flow, credit flow, debit-only, credit-only or mixed months, or rises and falls in debits or
    credits; they are not findings.
-4. Match the wording to the findings: write "money laundering" only when unusual_transaction or layering_months
-   lists a month; otherwise describe the points as context for staff to check.
-5. Decide the risk only with the RISK GUIDE at the end.
+4. Decide the risk only with the RISK GUIDE at the end.
 
 Write:
 headline: one line, at most 120 characters, naming the most important finding about this account; it must agree with
 point_1.
 point_1, point_2, point_3: each one plain sentence, at most 220 characters: a finding with its month and amount, and
-what it means. Most important first: layering and an unusual transaction come before burst, inactivity, gaps or
+what it means. Most important first: layering and a large single transaction come before burst, inactivity, gaps or
 the occupation. Use the JSON string "none" for point_2 or point_3 when there is nothing more of value; never repeat a
-point. Never write field names such as layering_months=none in any line.
+point.
 why_it_matters: one or two sentences, at most 260 characters, explaining in plain AML terms why these findings together
 matter for due diligence.
 verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount
 (for example: ask where the money in a layering month came from and where it went). Use "none" for verify_2 when
 one action is enough.
-risk_reason: one sentence, at most 200 characters. Start with what RISK_SIGNALS shows: the unusual transaction (or
-that its check found none) and the layering months (or that there is no layering); then add the occupation as
+risk_reason: one sentence, at most 200 characters. Start with what RISK_SIGNALS shows: the large single transaction
+(or that its check found none) and the layering months (or that there is no layering); then add the occupation as
 context when it helps.
 risk_level: exactly "low", "medium", "high" or "not_assessed", decided as the RISK GUIDE at the end teaches.
 
@@ -203,12 +190,13 @@ nested objects, or extra keys. Write the keys in exactly this order:
 Write the object once; do not repeat it or explain your steps. After the final } output no other character.
 
 RISK GUIDE: decide risk_level from the RISK_SIGNALS line only. Check in this order and use the first that applies:
-1. "not_assessed" when unusual_transaction or layering_months is not_checked; risk_reason says which check
+1. "not_assessed" when large_single_transactions or layering_months is not_checked; risk_reason says which check
    could not be verified.
-2. "high" when unusual_transaction lists a month and layering_months lists a month (they can be different months).
-3. "medium" when unusual_transaction lists a month and layering_months=none. A burst month or activity after
+2. "high" when large_single_transactions lists a month and layering_months lists a month (they can be different
+   months).
+3. "medium" when large_single_transactions lists a month and layering_months=none. A burst month or activity after
    inactivity keeps it "medium".
-4. "low" when unusual_transaction=none. It stays "low" even when layering_months lists a month, and with
+4. "low" when large_single_transactions=none. It stays "low" even when layering_months lists a month, and with
    bursts, long gaps, inactivity or an occupation question; write those as points for staff to verify.
 Each check has already judged its amounts for this account; do not judge them again. Long gaps, quiet months, the
 occupation and the other NOT_VERIFIED checks never change risk_level.
@@ -220,18 +208,14 @@ PROFILE_CONTEXT_SYSTEM_PROMPT = """You assist authorised bank staff with custome
 Use only INPUT FACTS: the customer's dated profile versions and six monthly transaction aggregates. Write a concise
 profile-to-activity comparison, not a transaction risk score or an allegation. Identify the declared occupation and
 individual/organisation type when supplied. Cite the largest single transaction and its month, and how it compares
-with the account's usual largest when PROFILE_ACTIVITY_FOCUS gives one; when it says not_enough_history, say there is
-not enough history to compare. Then say whether the amounts fit the declared occupation:
-- Everyday amounts (a few ringgit to a few hundred) fit any occupation; say so, and never call them unusual.
-- Only when an amount looks large for the occupation, recommend verifying the source of funds and whether the activity
-  fits the stated occupation and account purpose.
-A monthly total is transaction volume, not income or net funds received. Occupation does not prove income, wealth, or
-that a transaction is unsuitable; do not label a job low-income. An individual may legitimately transact large
-amounts, and an organisation may transact small amounts.
+with the account's usual largest when PROFILE_ACTIVITY_FOCUS gives one, and recommend verifying the source of funds and
+whether the activity fits the customer's stated occupation and account purpose. A monthly total is transaction volume, not income or net funds received. Occupation does not prove income,
+wealth, or that a transaction is unsuitable; do not label a job low-income.
+An individual may legitimately transact large amounts, and an organisation may transact small amounts.
 
 State the supplied citizenship as a profile fact. The six monthly rows contain no transaction-country, residency,
 counterparty-location, or source-of-funds field. Therefore citizenship cannot establish where the money originated,
-whether any transaction was cross-border, or a country-risk rating; citizenship is not where the activity happened.
+whether any transaction was cross-border, or a country-risk rating. Ask staff to verify the funds' origin and purpose based on the amounts and declared profile, not because of the person's citizenship.
 Do not describe a country or customer as high-risk or low-risk, and do not invent income, counterparties, account
 purpose, or source of funds.
 
@@ -308,27 +292,11 @@ def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
     return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
 
 
-def customer_line(customer_profile: list[dict[str, str | None]]) -> str:
-    """Who the customer is, from the latest profile record: what an amount means depends on it.
-
-    The occupation is the resolved name; a code without a name, or no profile, is "not available".
-    """
-    if not customer_profile:
-        return "CUSTOMER|not available: judge from the account alone"
-    latest = customer_profile[-1]
-    occupation = latest.get("occupation") or ""
-    if not occupation or occupation.startswith("Unmapped occupation code"):
-        occupation = "not available"
-    party = {"I": "individual", "O": "organisation"}.get(latest.get("indv_org_type") or "", "not available")
-    return f"CUSTOMER|occupation={occupation}|type={party}"
-
-
-def activity_money_input(monthly_summary: list[dict[str, Any]], customer_profile: list[dict[str, str | None]]) -> str:
-    """Call 1 input: six rows, who the customer is, the account's usual level, then the figures for each check."""
+def activity_money_input(monthly_summary: list[dict[str, Any]]) -> str:
+    """Call 1 input: six rows, the account's usual level, then the figures for each check."""
     usual = account_usual(monthly_summary)
     return "\n".join((
         _monthly_rows_input(monthly_summary),
-        customer_line(customer_profile),
         account_usual_line(usual),
         amount_facts(monthly_summary, usual),
         layering_facts(monthly_summary, usual),

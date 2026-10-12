@@ -122,22 +122,11 @@ def amount_facts(rows: list[dict[str, Any]], usual: AccountUsual) -> str:
             f"month_total={_money(_amount(row, 'total_amount'))}|"
             f"share_of_month_total={_share(largest, _amount(row, 'total_amount'))}"
         )
-    top_amount = _amount(_largest_single(rows), "max_amount")
-    # Every month with the top amount: naming only the first let Qwen miss a tied month
-    # (logged 2026-10-12: "April and May" when August had the same RM 1,500.00).
-    tied = [row["year_month"] for row in rows if row["txn_count_monthly"] and _amount(row, "max_amount") == top_amount]
+    top = _largest_single(rows)
     lines.append(
-        f"LARGEST_IN_SIX_MONTHS|largest_single={_money(top_amount)}|months_with_this_amount={','.join(tied)}|"
-        f"times_usual_largest={_times(top_amount, usual.largest_single)}"
+        f"LARGEST_IN_SIX_MONTHS|{top['year_month']}|largest_single={_money(_amount(top, 'max_amount'))}|"
+        f"times_usual_largest={_times(_amount(top, 'max_amount'), usual.largest_single)}"
     )
-    # The biggest amount in any other month, so "far bigger than the other months" is a figure,
-    # not an assumption (logged: RM 3,000.00 called far bigger than RM 2,500.00).
-    others = [row for row in rows if row["txn_count_monthly"] and _amount(row, "max_amount") < top_amount]
-    if others:
-        second = _largest_single(others)
-        lines.append(f"NEXT_LARGEST|largest_single={_money(_amount(second, 'max_amount'))}|month={second['year_month']}")
-    else:
-        lines.append("NEXT_LARGEST|none: no other month has a transaction of a different amount")
     return "\n".join(lines)
 
 
@@ -149,16 +138,18 @@ def _vs_usual_largest(row: dict[str, Any], usual: AccountUsual) -> str:
             f"({_rm(usual.largest_single)})")
 
 
-def activity_months_context(rows: list[dict[str, Any]], months: list[str]) -> str:
-    """Key figures for the month or months the AI judged large: full figures for one or two,
-    the amount per month for more (a recurring amount), so the text stays short."""
+def activity_pair_context(rows: list[dict[str, Any]], months: list[str]) -> str:
+    """Key figures for one or two selected months, led by the amounts."""
     by_month = {row["year_month"]: row for row in rows}
-    usual = account_usual(rows)
-    selected = [by_month[month] for month in months]
-    if len(selected) > 2:
-        return "; ".join(f"{row['year_month']}: largest single {_rm(_amount(row, 'max_amount'))}" for row in selected) + (
-            f" (usual largest {_rm(usual.largest_single)})." if usual.largest_single else ".")
-    return "; ".join(f"{row['year_month']}: {_amount_phrase(row)}{_vs_usual_largest(row, usual)}" for row in selected) + "."
+    if len(months) == 1:
+        row = by_month[months[0]]
+        return f"{months[0]}: {_amount_phrase(row)}{_vs_usual_largest(row, account_usual(rows))}."
+    first, second = (by_month[month] for month in months)
+    return (
+        f"{months[0]} to {months[1]}: total {_rm(_amount(first, 'total_amount'))} to {_rm(_amount(second, 'total_amount'))}; "
+        f"largest single {_rm(_amount(first, 'max_amount'))} to {_rm(_amount(second, 'max_amount'))}; "
+        f"transactions {first['txn_count_monthly']} to {second['txn_count_monthly']}."
+    )
 
 
 def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
@@ -427,15 +418,10 @@ def layering_facts(rows: list[dict[str, Any]], usual: AccountUsual) -> str:
             f"month_total={_money(_amount(row, 'total_amount'))}|"
             f"times_usual_month={_times(_amount(row, 'total_amount'), usual.month_total)}"
         )
-    # Only a month with both money in and money out can show layering. Listing them all,
-    # closest first, stops the AI inventing a "closest month" from one-sided or empty months
-    # (logged 2026-10-12 in four accounts).
-    both = sorted((row for row in rows if _has_money_in_and_out(row)), key=_layering_difference)
-    lines.append("MONTHS_WITH_MONEY_IN_AND_OUT|" + (
-        ", ".join(f"{row['year_month']} (difference {_pct(_layering_difference(row))}"
-                  + (f", {_times(_amount(row, 'total_amount'), usual.month_total)} times the usual month)"
-                     if usual.month_total else ")") for row in both)
-        if both else "none: each month money only came in or only went out, so no money passed through"))
+    closest = closest_money_in_and_out(rows)
+    lines.append("CLOSEST_MONEY_IN_AND_OUT|" + (
+        f"{closest['year_month']}|difference={_difference_fact(closest)}" if closest
+        else "no month has both money in and money out"))
     return "\n".join(lines)
 
 
@@ -466,7 +452,7 @@ def _short_layering_list(rows: list[dict[str, Any]]) -> str:
 
 @dataclass(frozen=True)
 class RiskSignals:
-    """What call 1's AI decided: its unusual (large) transactions and its layering months.
+    """What call 1's AI decided: its large single transactions and its layering months.
     None means that check could not be verified. Facts only; the AI decides the risk level."""
 
     large_singles: tuple[str, ...] | None
@@ -490,9 +476,7 @@ def risk_signals_line(signals: RiskSignals) -> str:
     """The summary's data line for the risk guide; it lists the checks' decisions, never a level."""
     def listed(values: tuple[str, ...] | None) -> str:
         return "not_checked" if values is None else "; ".join(values) or "none"
-    # "unusual_transaction", not "large_single_...": Qwen confused it with the "largest single"
-    # transaction every account has, and called RM 1,500.00 large (logged 2026-10-12).
-    return (f"RISK_SIGNALS|unusual_transaction={listed(signals.large_singles)}|"
+    return (f"RISK_SIGNALS|large_single_transactions={listed(signals.large_singles)}|"
             f"layering_months={listed(signals.layering)}")
 
 

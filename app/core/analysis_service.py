@@ -14,7 +14,7 @@ from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedErro
 from app.config import Settings
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
-    PATTERN_LABELS, InactivityRun, RiskSignals, activity_months_context, activity_six_month_context,
+    PATTERN_LABELS, InactivityRun, RiskSignals, activity_pair_context, activity_six_month_context,
     allowed_burst_gap_numbers, burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context,
     calendar_numbers, canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, burst_guide_months,
     has_in_month_gap, layering_context, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
@@ -52,8 +52,8 @@ _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "money_in_and_out": ("monthly_credit", "monthly_debit"),
     "burst_and_gaps": ("txn_count_monthly", "pct_burst", "pct_trx_gap"),
 }
-# Months a found pattern may select: every month of the large amount (it can recur), every layering month.
-_MAX_MONTHS: dict[ReviewCheckName, int] = {"activity_and_amount_change": 6, "money_in_and_out": 6}
+# Months a found pattern may select: one largest-transaction month (or two compared), up to six layering months.
+_MAX_MONTHS: dict[ReviewCheckName, int] = {"activity_and_amount_change": 2, "money_in_and_out": 6}
 def _sentence_issue(text: str) -> str:
     """Why an explanation does not count as one, in plain words for staff."""
     return "Is a label, not a sentence: the AI wrote a pattern name or a few words instead of an explanation."
@@ -178,7 +178,7 @@ class AnalysisService:
         catalog = self._evidence_catalog(request, profile)
         monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
         run = self._inactivity_run(monthly)
-        calls = self._pattern_calls(request.case_id, monthly, profile, catalog, run)
+        calls = self._pattern_calls(request.case_id, monthly, catalog, run)
 
         call_tasks = [
             asyncio.create_task(self._complete_with_retry(
@@ -210,11 +210,10 @@ class AnalysisService:
         return self._assessment(request, checks, summary, profile_context)
 
     def _pattern_calls(
-        self, case_id: str, monthly: list[dict[str, Any]], profile: list[dict[str, str | None]],
-        catalog: dict[str, EvidenceItem], run: InactivityRun | None,
+        self, case_id: str, monthly: list[dict[str, Any]], catalog: dict[str, EvidenceItem],
+        run: InactivityRun | None,
     ) -> list[_LlmCall]:
-        # Call 1 is told who the customer is: whether an amount matters depends on it.
-        activity_input = activity_money_input(monthly, profile)
+        activity_input = activity_money_input(monthly)
         # The insights compare months with each other and with the usual level, so they may
         # quote any figure the AI was given, and only those.
         activity_numbers = numbers_in_text(activity_input) | calendar_numbers(monthly)
@@ -286,6 +285,8 @@ class AnalysisService:
             months = self._split_months(
                 check.months_text or "", f"{prefix}_months", min_count=1, max_count=_MAX_MONTHS[name])
             self._validate_transaction_months(months, known_months, name)
+            if name == "activity_and_amount_change" and len(months) == 2 and self._unchanged(name, monthly, months):
+                raise ModelOutputError(f"{prefix}_months {months[0]} and {months[1]} show no change in this check's figures")
             pattern = canonical_pattern(name, check.pattern)
             updates = {f"{prefix}_pattern": pattern, f"{prefix}_months": ",".join(months)}
             if problem := pattern_problem(name, pattern, monthly, months, long_gap_days=self._long_gap_days()):
@@ -299,6 +300,13 @@ class AnalysisService:
             found.append("Says there was no activity in the six months, but transactions were recorded.")
         issues[name] = self._log_issues(case_id, name, found)
         return updates
+
+    @staticmethod
+    def _unchanged(name: ReviewCheckName, monthly: list[dict[str, Any]], months: list[str]) -> bool:
+        """True when two selected months show the same figures for this check (not a comparison)."""
+        by_month = {row["year_month"]: row for row in monthly}
+        first, second = (by_month[month] for month in months)
+        return all(Decimal(str(first[field])) == Decimal(str(second[field])) for field in _EVIDENCE_FIELDS[name])
 
     def _validate_inactivity_burst_gaps(
         self, raw: "_RawInactivityBurstGaps", catalog: dict[str, EvidenceItem], monthly: list[dict[str, Any]],
@@ -478,7 +486,7 @@ class AnalysisService:
         check = raw.checks()[name]
         months = [] if check.outcome != "pattern_found" else check.months_text.split(",")
         if name == "activity_and_amount_change":
-            facts = activity_months_context(monthly, months) if months else activity_six_month_context(monthly)
+            facts = activity_pair_context(monthly, months) if months else activity_six_month_context(monthly)
         else:
             facts = layering_context(monthly, months)
         return ReviewCheck(
