@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import json
 import logging
 import random
@@ -65,8 +66,13 @@ class OpenAICompatibleClient:
                 max_connections=settings.llm_concurrency,
                 max_keepalive_connections=settings.llm_concurrency,
             ),
+            # Without stored cookies a load balancer cannot pin requests to one server, so
+            # calls 1-3 can be answered in parallel (LLM_KEEP_COOKIES=true restores keeping them).
+            cookies=None if settings.llm_keep_cookies else no_cookie_jar(),
             verify=False
         )
+        logger.info("LLM cookies: %s", "kept (requests may stick to one server)" if settings.llm_keep_cookies
+                    else "not kept (each request may go to any server)")
 
     async def complete_json(
         self,
@@ -315,6 +321,16 @@ class OpenAICompatibleClient:
         delay = _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
         logger.debug("Backing off %.2fs before retry (%s).", delay, reason)
         await asyncio.sleep(delay)
+
+
+class _RejectAllCookies(http.cookiejar.DefaultCookiePolicy):
+    def set_ok(self, cookie: http.cookiejar.Cookie, request: Any) -> bool:
+        return False
+
+
+def no_cookie_jar() -> http.cookiejar.CookieJar:
+    """A cookie jar that never stores a cookie, so no request carries one back to the server."""
+    return http.cookiejar.CookieJar(policy=_RejectAllCookies())
 
 
 def _extract_content(payload: dict[str, Any]) -> str | dict[str, Any]:

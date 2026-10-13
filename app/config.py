@@ -33,6 +33,10 @@ class Settings:
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_api_key_header: str = os.getenv("LLM_API_KEY_HEADER", "Authorization")
     llm_timeout_seconds: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "180"))
+    # Keep cookies the LLM server sets? Off by default: the app authenticates with the API key
+    # header, and a load balancer's sticky-session cookie pins every later request to one
+    # server, which then answers calls 1-3 one after another (seen in the 2026-10-12 logs).
+    llm_keep_cookies: bool = os.getenv("LLM_KEEP_COOKIES", "false").lower() == "true"
     llm_concurrency: int = int(os.getenv("LLM_CONCURRENCY", "3"))
     # Set this to the model's confirmed total context window. Zero disables
     # local preflight validation when the platform does not expose that value.
