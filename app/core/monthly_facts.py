@@ -164,9 +164,11 @@ def unusual_transaction_note(rows: list[dict[str, Any]], screening: Screening) -
     reason = (f"below the RM {_money(screening.min_amount)} minimum the screening reviews" if top < screening.min_amount
               else f"{_times(top, usual)} times the usual largest of RM {_money(usual)}, under "
                    f"{_number(screening.unusual_times_usual)} times")
+    # The real reason, never "within the normal range": with one transaction there is no normal range,
+    # and Qwen wrote "within the account's normal range of RM 8.00" (logged 2026-10-12 16:52).
     return (f"\nUNUSUAL TRANSACTION NOTE: The screening found no unusual transaction. The largest single transaction was "
-            f"RM {_money(top)} in {', '.join(_months_with(rows, top))}, {reason}. activity_insight describes this: the "
-            "largest amount, every month it occurred, and that it is within the account's normal range.\n")
+            f"RM {_money(top)} in {', '.join(_months_with(rows, top))}. activity_insight describes this: the "
+            f"largest amount, every month it occurred, and why it was not flagged: it is {reason}.\n")
 
 
 def layering_note(rows: list[dict[str, Any]], screening: Screening) -> str:

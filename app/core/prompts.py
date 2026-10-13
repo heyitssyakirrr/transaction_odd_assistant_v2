@@ -5,7 +5,7 @@ from typing import Any
 
 from app.core.monthly_facts import (
     InactivityRun, RiskSignals, Screening, account_usual, account_usual_line, amount_facts, burst_gap_facts,
-    burst_gap_note, findings_lines, inactivity_run_fact, inactivity_summary_fact, layering_facts, layering_note,
+    burst_gap_note, findings_lines, inactivity_run_fact, risk_because, screening_risk, inactivity_summary_fact, layering_facts, layering_note,
     profile_activity_focus, summary_month_lines, unusual_transaction_note,
 )
 
@@ -114,13 +114,13 @@ Write:
 headline: one line, at most 120 characters, naming the most important finding; it must agree with point_1.
 point_1, point_2, point_3: each one plain sentence, at most 220 characters: a finding with its month and amount, and
 what it means. Unusual transactions and layering come first. Use the JSON string "none" for point_2 or point_3 when
-there is nothing more of value; never repeat a point and never write field names.
-why_it_matters: one or two sentences, at most 260 characters, on why these findings matter for due diligence. When
-RISK_LEVEL is low, describe them as context for staff to check and do not mention money laundering or suspicion.
+there is nothing more of value; never repeat a point, and never make a point of something that was not found.
+why_it_matters: one or two sentences, at most 260 characters, on why these findings matter for due diligence.
 occupation_fit: follow the OCCUPATION NOTE at the end.
 verify_1, verify_2: each one concrete action for staff, at most 200 characters, tied to a specific month and amount.
 Use "none" for verify_2 when one action is enough.
-risk_reason: one sentence, at most 200 characters, explaining RISK_LEVEL in your own words from its "because" part.
+risk_reason: follow the RISK NOTE at the end.
+In every line, write in plain words: never write field names such as RISK_LEVEL, FINDINGS or layering_months.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object. Double-quote every key and string. Do not use markdown, arrays,
 nested objects, or extra keys. Write the keys in exactly this order:
@@ -131,16 +131,17 @@ Write the object once; do not repeat it or explain your steps. After the final }
 
 PROFILE_CONTEXT_SYSTEM_PROMPT = """You assist authorised bank staff with customer-profile context.
 
-Use only INPUT FACTS: the customer's dated profile versions and six monthly transaction aggregates. Describe the
+Use only INPUT FACTS: the customer's dated profile versions and the PROFILE_ACTIVITY_FOCUS line. Describe the
 profile as evidence; do not judge whether the activity fits the occupation and do not recommend checks: a later step
 does that. State the declared occupation and individual/organisation type when supplied. Cite the largest single
 transaction and its month, and how it compares with the account's usual largest when PROFILE_ACTIVITY_FOCUS gives one;
-when it says not_enough_history, say there is not enough history to compare. A monthly total is transaction volume, not income or net funds received. Occupation does not prove income,
+when it says not_enough_history, say there is not enough history to compare. Occupation does not prove income,
 wealth, or that a transaction is unsuitable; do not label a job low-income.
 An individual may legitimately transact large amounts, and an organisation may transact small amounts.
 
-State the supplied citizenship as a profile fact. The six monthly rows contain no transaction-country, residency,
-counterparty-location, or source-of-funds field. Therefore citizenship cannot establish where the money originated,
+State the supplied citizenship as a profile fact, for example "Malaysian citizenship"; never write it as where the
+customer works or lives. The facts contain no transaction-country, residency, counterparty-location, or
+source-of-funds field. Therefore citizenship cannot establish where the money originated,
 whether any transaction was cross-border, or a country-risk rating; citizenship is not where the activity happened.
 Do not describe a country or customer as high-risk or low-risk, and do not invent income, counterparties, account
 purpose, or source of funds.
@@ -152,7 +153,8 @@ an open-ended record, not a future event. With one version, say that historical 
 Never claim there were no changes outside the supplied records. Prefer the resolved occupation_name to occupation_code.
 
 STRICT JSON ONLY. Return one RFC 8259 JSON object with exactly one key: "profile_summary". The value is 2-4 clear
-sentences, at most 650 characters. Use exact months and amounts from INPUT FACTS; do not calculate income or percentages.
+sentences, at most 650 characters. Use exact months and amounts from INPUT FACTS; do not calculate amounts, ratios or
+percentages.
 Amounts are in RM: write them as RM 1,234.56 and never use $.
 No markdown, arrays, extra keys, record IDs, or text after the final }.
 """
@@ -248,8 +250,9 @@ def inactivity_burst_gaps_input(
 
 
 def overall_summary_prompt(signals: RiskSignals, occupation: str | None) -> str:
-    """Call 4 instructions: the fixed prompt, then what occupation_fit must judge, last."""
-    return OVERALL_SUMMARY_SYSTEM_PROMPT + occupation_note(signals, occupation)
+    """Call 4 instructions: the fixed prompt, then this account's two notes, last and in key order
+    (occupation_fit before risk_reason), where Qwen 7B pays most attention."""
+    return OVERALL_SUMMARY_SYSTEM_PROMPT + occupation_note(signals, occupation) + risk_note(signals)
 
 
 def occupation_note(signals: RiskSignals, occupation: str | None) -> str:
@@ -263,9 +266,27 @@ def occupation_note(signals: RiskSignals, occupation: str | None) -> str:
         ) if part)
     if not evidence or not occupation:
         return '\nOCCUPATION NOTE: There is nothing to compare with the occupation. Write the JSON string "none" for occupation_fit.\n'
+    # Verdict first, then the reason, so the reason must agree with it (logged 2026-10-12 16:52:
+    # "fit the declared occupation of a housewife, as large transactions are not typical").
     return (f"\nOCCUPATION NOTE: Judge whether this evidence fits the declared occupation ({occupation}): {evidence}. "
-            "occupation_fit is one or two sentences, at most 260 characters: whether it fits and why. This is context "
-            "for staff; it does not change RISK_LEVEL.\n")
+            'occupation_fit starts with "Fits the occupation:" or "Does not fit the occupation:", then one sentence on '
+            "why, at most 260 characters in all; the reason must agree with the verdict. This is context for staff and "
+            "does not change the risk.\n")
+
+
+def risk_note(signals: RiskSignals) -> str:
+    """What risk_reason must explain, at the end of the prompt. A general rule in the middle was ignored
+    in 4 of 5 low accounts (logged 2026-10-12 16:52: a burst called "a red flag for potential money
+    laundering" on a low-risk account). Says "the risk", never the field name, so it is not copied."""
+    level = screening_risk(signals)
+    note = (f"\nRISK NOTE: The risk is {level} because {risk_because(signals)}. risk_reason is one sentence, at most "
+            "200 characters, explaining this in your own words.")
+    if level != "low":
+        return note + "\n"
+    if signals.layering:
+        return note + " The layering months are points for staff to check; do not call the account high risk.\n"
+    return note + (" Bursts, long gaps and inactivity are context for staff, not the reason for the risk. In every line, "
+                   "do not write money laundering, suspicious, suspicion or red flag.\n")
 
 
 def overall_summary_input(
@@ -287,7 +308,9 @@ def overall_summary_input(
 def profile_context_input(
     customer_profile: list[dict[str, str | None]], monthly_summary: list[dict[str, Any]],
 ) -> str:
-    """Give the profile stage the same six source rows used by transaction review."""
+    """The profile records and the largest-transaction focus line. No raw monthly rows: the call only
+    describes the profile, and given them it mislabelled figures (logged 2026-10-12: the usual largest
+    single transaction called the "usual largest monthly total") and calculated a percentage."""
     lines = ["INPUT FACTS — supplied customer-profile records. Do not copy labels or invent values."]
     field_labels = (
         ("occupation", "occupation_name"),
@@ -307,4 +330,4 @@ def profile_context_input(
             if record.get(field) is not None
         )
         lines.append("PROFILE_RECORD|" + "|".join(values))
-    return "\n".join((*lines, profile_activity_focus(monthly_summary), _monthly_rows_input(monthly_summary)))
+    return "\n".join((*lines, profile_activity_focus(monthly_summary)))

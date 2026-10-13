@@ -62,6 +62,9 @@ def _sentence_issue(text: str) -> str:
     return "Is a label, not a sentence: the AI wrote a pattern name or a few words instead of an explanation."
 _SAYS_NO_INACTIVITY = re.compile(r"\bno (?:inactive|quiet|dormant) period\b", re.IGNORECASE)
 # "No activity in the six months" when transactions exist (seen for one-transaction accounts).
+# Words the summary is told not to use when nothing was found (the risk is low); shown as an issue if used.
+_SUSPICION_WORDS = re.compile(r"money laundering|suspicious|suspicion|red flag", re.IGNORECASE)
+_FIT_VERDICTS = ("Fits the occupation:", "Does not fit the occupation:")
 _SAYS_NO_ACTIVITY = re.compile(
     r"\bno (?:activity|transactions?|debit or credit flow|flow)\b[^.]{0,30}\bsix months\b", re.IGNORECASE)
 _SUMMARY_FIELD_NAMES = {
@@ -511,7 +514,9 @@ class AnalysisService:
                 case_id, "overall-summary", system_prompt, prompt_input,
                 _RawOverallSummary, self._settings.llm_summary_max_response_tokens,
                 lambda value, final: self._validate_overall_summary(
-                    value, quotable, [row["year_month"] for row in monthly], case_id, final),
+                    value, quotable, [row["year_month"] for row in monthly], case_id, final,
+                    nothing_found=not (signals.unusual or signals.layering),
+                    fit_expected=bool((signals.unusual or signals.layering) and occupation)),
             )
         except Exception as exc:  # the report must still be shown without the summary
             logger.error("Overall summary failed: case=%s error=%s", case_id, exc)
@@ -548,6 +553,7 @@ class AnalysisService:
 
     def _validate_overall_summary(
         self, raw: "_RawOverallSummary", quotable: set[Decimal], months: list[str], case_id: str, final_attempt: bool,
+        *, nothing_found: bool = False, fit_expected: bool = False,
     ) -> "_RawOverallSummary":
         """Keep every line as written and list any that quote a figure or month not in the input.
 
@@ -555,7 +561,9 @@ class AnalysisService:
         listed as an issue; the headline and risk reason are kept with the issue, because
         the summary cannot be shown without them. A summary without a headline
         or risk reason costs the one retry. A missing verify step costs the retry only on
-        the first attempt; on the final attempt it is kept without.
+        the first attempt; on the final attempt it is kept without. Where the AI ignored a note
+        (suspicion wording with nothing found, a fit without its verdict), the line is kept and
+        the problem listed, never rewritten.
         """
         checked, not_sentences = self._without_non_sentences(raw)
         if not checked.verify_1 and checked.verify_2:
@@ -569,6 +577,12 @@ class AnalysisService:
             for field in _RawOverallSummary.TEXT_FIELDS
             for issue in self._text_issues(getattr(checked, field), quotable, months)
         ]
+        if nothing_found:
+            issues += [f"{_SUMMARY_FIELD_NAMES[field]}: Uses suspicion wording, but nothing was found and the risk is low."
+                       for field in _RawOverallSummary.TEXT_FIELDS if _SUSPICION_WORDS.search(getattr(checked, field))]
+        if fit_expected and checked.occupation_fit and not checked.occupation_fit.startswith(_FIT_VERDICTS):
+            issues.append(f"{_SUMMARY_FIELD_NAMES['occupation_fit']}: Does not start with a verdict "
+                          "(Fits the occupation / Does not fit the occupation).")
         return self._with_issues(checked, {"overall_summary": self._log_issues(case_id, "overall_summary", issues)})
 
     @staticmethod
