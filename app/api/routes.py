@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.adapters.llm_client import LlmContextWindowError, LlmServiceError
 from app.config import Settings
@@ -146,8 +146,17 @@ def upload_problem(filename: str | None, size: int) -> tuple[int, str] | None:
 
 
 class FolderBatchRequest(BaseModel):
+    """Accounts ``start`` to ``end`` (1-based, inclusive) of the files matching ``citizenship``,
+    in file-name order: start 6, end 10 is the 6th to the 10th matching file."""
     citizenship: CitizenshipChoice
-    count: int = Field(ge=1)
+    start: int = Field(default=1, ge=1)
+    end: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _start_not_after_end(self) -> "FolderBatchRequest":
+        if self.start > self.end:
+            raise ValueError("start must not be after end")
+        return self
 
 
 def build_router(
@@ -183,16 +192,20 @@ def build_router(
 
     @router.post("/folder-batches", status_code=202)
     async def create_folder_batch(request: FolderBatchRequest) -> dict:
-        """The first ``count`` accounts (by file name) matching the citizenship choice, analysed
-        one at a time like an upload. Poll GET /v1/accounts/batches/{batch_id}."""
+        """Matching accounts ``start`` to ``end`` (by file name), analysed one at a time like an
+        upload. Poll GET /v1/accounts/batches/{batch_id}."""
         accounts = (await scan()).matching(request.citizenship, settings.malaysian_citizen_cd)
         if not accounts:
             raise HTTPException(status_code=422, detail="No account in the folder matches this citizenship choice.")
-        chosen = accounts[:request.count]
-        logger.info("Folder batch: citizenship=%s requested=%d matching=%d chosen=%d",
-                    request.citizenship, request.count, len(accounts), len(chosen))
+        if request.start > len(accounts):
+            raise HTTPException(status_code=422, detail=(
+                f"Start {request.start} is after the last matching account ({len(accounts)})."))
+        end = min(request.end, len(accounts))
+        logger.info("Folder batch: citizenship=%s range=%d-%d matching=%d chosen=%d",
+                    request.citizenship, request.start, end, len(accounts), end - request.start + 1)
         files = [BatchFile(filename=account.path.name, path=account.path, acct_num=account.acct_num,
-                           citizen_cd=account.citizen_cd) for account in chosen]
+                           citizen_cd=account.citizen_cd, list_position=position)
+                 for position, account in enumerate(accounts[request.start - 1:end], start=request.start)]
         return submit(files, "folder", settings.folder_expected_risk).as_dict()
 
     @router.post("/analyze-file")

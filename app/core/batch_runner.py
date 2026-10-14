@@ -43,6 +43,8 @@ class BatchFile:
     # Known before the analysis for folder accounts; written to the batch results CSV.
     acct_num: str | None = None
     citizen_cd: str | None = None
+    # A folder account's place among the files matching the citizenship choice, e.g. 6 for "start 6".
+    list_position: int | None = None
     status: FileStatus = "queued"
     result: dict[str, Any] | None = None
     error: str | None = None

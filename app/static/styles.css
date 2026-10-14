@@ -330,6 +330,8 @@ button.source-option:focus-visible { outline: 2px solid var(--red); outline-offs
 .choice input:checked + span { border-color: var(--red); background: var(--red-tint); color: var(--ink); font-weight: 650; }
 .choice input:focus-visible + span { outline: 2px solid var(--red); outline-offset: 1px; }
 
+.range-fields { display: flex; align-items: flex-end; gap: 12px; }
+.range-to { padding-bottom: 10px; color: var(--muted); font-size: 14px; }
 .number-field { display: flex; flex-direction: column; gap: 6px; }
 .number-field input {
   width: 160px;
@@ -346,7 +348,7 @@ button.source-option:focus-visible { outline: 2px solid var(--red); outline-offs
 .number-field input:focus { outline: 2px solid var(--red); outline-offset: 0; border-color: transparent; }
 
 .field-hint { margin: 6px 0 0; font-size: 12.5px; color: var(--muted); }
-.number-field + .field-hint { margin-top: -12px; }
+.range-fields + .field-hint { margin-top: -12px; }
 .folder-warning {
   margin: 0;
   padding: 8px 12px;

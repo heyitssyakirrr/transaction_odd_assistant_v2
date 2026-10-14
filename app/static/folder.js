@@ -1,10 +1,12 @@
 // Upload page — "Read from folder": analyse accounts straight from the server folder.
 //
 // The folder itself is fixed on the server (ACCOUNT_FOLDER_PATH); staff choose the
-// citizenship and how many accounts. The first N matching files (by file name) are
-// queued as one batch and followed on the same results page as an upload.
+// citizenship and a range of the matching files, by file name: from 1 to 5 is the first
+// five, from 6 to 10 the next five. They are queued as one batch and followed on the
+// same results page as an upload.
 
 const SECONDS_PER_ACCOUNT = 80; // rough guide from UAT runs, for the time estimate only
+const DEFAULT_RANGE_SIZE = 5;   // a small first run; change "To account" for more
 
 const folderEls = {
   switchButtons: document.querySelectorAll(".source-option"),
@@ -14,7 +16,8 @@ const folderEls = {
   panel: document.querySelector("#folder-panel"),
   path: document.querySelector("#folder-path"),
   total: document.querySelector("#folder-total"),
-  count: document.querySelector("#account-count"),
+  start: document.querySelector("#range-start"),
+  end: document.querySelector("#range-end"),
   countHint: document.querySelector("#count-hint"),
   citizenCodes: document.querySelector("#citizen-codes"),
   unreadable: document.querySelector("#folder-unreadable"),
@@ -29,9 +32,10 @@ folderEls.switchButtons.forEach((button) => {
   button.addEventListener("click", () => showSource(button.dataset.source));
 });
 folderEls.folderForm.addEventListener("change", (event) => {
-  if (event.target.name === "citizenship") updateCount(true);
+  if (event.target.name === "citizenship") updateRange(true);
 });
-folderEls.count.addEventListener("input", () => updateCount(false));
+folderEls.start.addEventListener("input", () => updateRange(false));
+folderEls.end.addEventListener("input", () => updateRange(false));
 folderEls.folderForm.addEventListener("submit", startFolderBatch);
 
 function showSource(source) {
@@ -70,7 +74,7 @@ async function loadFolder() {
       folderEls.unreadable.classList.remove("hidden");
     }
     folderEls.panel.classList.remove("hidden");
-    updateCount(true);
+    updateRange(true);
   } catch (error) {
     folderState.loaded = false; // let staff try again by switching back
     showFolderError(error.message || "Could not read the folder.");
@@ -83,23 +87,34 @@ function chosenCitizenship() {
   return folderEls.folderForm.querySelector("input[name=citizenship]:checked").value;
 }
 
-// Keep the number within what matches; a new citizenship choice starts at all of its accounts.
-function updateCount(reset) {
+// Keep the range within the matching files; a new citizenship choice starts again at 1 to 5.
+function updateRange(reset) {
   const available = folderState.summary?.counts[chosenCitizenship()] ?? 0;
-  folderEls.count.max = String(Math.max(available, 1));
-  if (reset) folderEls.count.value = String(available);
-  const requested = Number.parseInt(folderEls.count.value, 10);
-  const valid = Number.isInteger(requested) && requested >= 1 && requested <= available;
+  for (const input of [folderEls.start, folderEls.end]) input.max = String(Math.max(available, 1));
+  if (reset) {
+    folderEls.start.value = "1";
+    folderEls.end.value = String(Math.min(DEFAULT_RANGE_SIZE, available));
+  }
+  const { start, end } = chosenRange();
+  const valid = Number.isInteger(start) && Number.isInteger(end) && start >= 1 && start <= end && end <= available;
   folderEls.submit.disabled = !valid;
   if (!available) {
     folderEls.countHint.textContent = "No account in the folder matches this choice.";
   } else if (!valid) {
-    folderEls.countHint.textContent = `Enter a number from 1 to ${available}.`;
+    folderEls.countHint.textContent = `Enter a range within 1 to ${available}, with "From" no bigger than "To".`;
   } else {
-    folderEls.countHint.textContent = `The first ${requested} of ${available} matching files, by file name. `
-      + `About ${duration(requested * SECONDS_PER_ACCOUNT)} at one account at a time.`;
+    const count = end - start + 1;
+    folderEls.countHint.textContent = `Matching files ${start} to ${end} of ${available}, by file name: `
+      + `${count} account${count === 1 ? "" : "s"}, about ${duration(count * SECONDS_PER_ACCOUNT)} at one account at a time.`;
   }
   clearFolderError();
+}
+
+function chosenRange() {
+  return {
+    start: Number.parseInt(folderEls.start.value, 10),
+    end: Number.parseInt(folderEls.end.value, 10),
+  };
 }
 
 function duration(seconds) {
@@ -110,14 +125,14 @@ function duration(seconds) {
 
 async function startFolderBatch(event) {
   event.preventDefault();
-  const count = Number.parseInt(folderEls.count.value, 10);
+  const { start, end } = chosenRange();
   folderEls.submit.disabled = true;
   folderEls.submitLabel.textContent = "Queuing…";
   try {
     const response = await fetch("/v1/accounts/folder-batches", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ citizenship: chosenCitizenship(), count }),
+      body: JSON.stringify({ citizenship: chosenCitizenship(), start, end }),
     });
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new Error(typeof body?.detail === "string" ? body.detail : `Could not start (HTTP ${response.status}).`);

@@ -15,7 +15,7 @@ from typing import Any
 from app.core.batch_runner import Batch, BatchFile
 
 COLUMNS = (
-    "position", "file", "acct_num", "citizen_cd", "expected_risk", "risk_level", "matches_expected",
+    "position", "list_position", "file", "acct_num", "citizen_cd", "expected_risk", "risk_level", "matches_expected",
     "decision", "status", "error", "calls_1_to_3_seconds", "total_seconds", "report_html",
 )
 
@@ -55,7 +55,7 @@ def row(batch: Batch, position: int, item: BatchFile) -> list[Any]:
     risk = result.get("risk_level", "")
     expected = batch.expected_risk or ""
     return [
-        position, item.filename, item.acct_num or result.get("acct_num", ""), item.citizen_cd or "", expected,
+        position, item.list_position or "", item.filename, item.acct_num or result.get("acct_num", ""), item.citizen_cd or "", expected,
         risk, ("yes" if risk == expected else "no") if expected and risk else "", result.get("decision", ""),
         item.status, item.error or "", timing.get("calls_1_to_3_seconds", ""), timing.get("total_seconds", ""),
         result.get("report_html", ""),

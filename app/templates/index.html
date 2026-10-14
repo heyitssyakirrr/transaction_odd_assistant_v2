@@ -66,10 +66,17 @@
             <p id="citizen-codes" class="field-hint"></p>
           </fieldset>
 
-          <label class="number-field" for="account-count">
-            <span>Number of accounts</span>
-            <input id="account-count" type="number" min="1" step="1" inputmode="numeric">
-          </label>
+          <div class="range-fields">
+            <label class="number-field" for="range-start">
+              <span>From account</span>
+              <input id="range-start" type="number" min="1" step="1" inputmode="numeric" value="1">
+            </label>
+            <span class="range-to" aria-hidden="true">to</span>
+            <label class="number-field" for="range-end">
+              <span>To account</span>
+              <input id="range-end" type="number" min="1" step="1" inputmode="numeric">
+            </label>
+          </div>
           <p id="count-hint" class="field-hint"></p>
           <p id="folder-unreadable" class="folder-warning hidden"></p>
         </div>
