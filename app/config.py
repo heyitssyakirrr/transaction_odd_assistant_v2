@@ -9,6 +9,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent # change based on where u put 
 _DEFAULT_LLM_STOP_SEQUENCES = ("<|im_end|>", "<|endoftext|>", "assistant:", "system:", "user:")
 
 
+def _optional_float(name: str, default: str) -> float | None:
+    """A number from .env; blank means "do not send this parameter"."""
+    value = os.getenv(name, default).strip()
+    return float(value) if value else None
+
+
+def _stop_sequences(raw: str) -> tuple[str, ...]:
+    """Comma-separated stop sequences; blank uses the Qwen defaults, "none" sends none."""
+    if raw.strip().lower() == "none":
+        return ()
+    return tuple(value.strip() for value in raw.split(",") if value.strip()) or _DEFAULT_LLM_STOP_SEQUENCES
+
+
 def _load_dotenv(path: Path) -> None:
     """Small dependency-free dotenv loader; existing environment wins."""
     env_path = Path(path)
@@ -103,8 +116,10 @@ class Settings:
     llm_synthesis_max_response_tokens: int = int(os.getenv("LLM_SYNTHESIS_MAX_RESPONSE_TOKENS", "260"))
     # Qwen's low-variance sampling defaults. Set only parameters accepted by
     # the bank's OpenAI-compatible loader.
-    llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0"))
-    llm_top_p: float = float(os.getenv("LLM_TOP_P", "0.001"))
+    # Leave blank in .env to not send the parameter at all (some models, such
+    # as OpenAI reasoning models behind Foundry, reject it with a 400).
+    llm_temperature: float | None = _optional_float("LLM_TEMPERATURE", "0")
+    llm_top_p: float | None = _optional_float("LLM_TOP_P", "0.001")
     # This is a vLLM/Qwen extension rather than a portable OpenAI parameter.
     # Leave disabled unless the bank loader is confirmed to accept it.
     llm_repetition_penalty: float = float(os.getenv("LLM_REPETITION_PENALTY", "0"))
@@ -120,9 +135,8 @@ class Settings:
     # Use commas, not pipes: Qwen's native special tokens themselves contain
     # pipes. Literal assistant: prevents the loader from starting a duplicate
     # assistant turn after a complete object.
-    llm_stop_sequences: tuple[str, ...] = tuple(
-        value.strip() for value in os.getenv("LLM_STOP_SEQUENCES", "").split(",") if value.strip()
-    ) or _DEFAULT_LLM_STOP_SEQUENCES
+    # "none" sends no stop sequences (OpenAI reasoning models reject "stop").
+    llm_stop_sequences: tuple[str, ...] = _stop_sequences(os.getenv("LLM_STOP_SEQUENCES", ""))
     # Every answer is one flat JSON object, so its first } is its end. Stopping there
     # stops Qwen from repeating the object or explaining it until the token limit, which
     # saves time. The loader drops the stop text, so the client adds the } back.
@@ -167,9 +181,9 @@ class Settings:
             raise ValueError("LLM_CONTEXT_WINDOW_TOKENS must be zero or greater")
         if self.llm_context_safety_margin_tokens < 0:
             raise ValueError("LLM_CONTEXT_SAFETY_MARGIN_TOKENS must be zero or greater")
-        if not 0 <= self.llm_temperature <= 2:
+        if self.llm_temperature is not None and not 0 <= self.llm_temperature <= 2:
             raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
-        if not 0 < self.llm_top_p <= 1:
+        if self.llm_top_p is not None and not 0 < self.llm_top_p <= 1:
             raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1")
         if not 0 < self.review_layering_max_difference_pct < 100:
             raise ValueError("REVIEW_LAYERING_MAX_DIFFERENCE_PCT must be between 0 and 100")

@@ -168,11 +168,14 @@ class OpenAICompatibleClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, ensure_ascii=False, default=str)},
             ],
-            "temperature": self._settings.llm_temperature,
-            "top_p": self._settings.llm_top_p,
             "max_tokens": output_tokens,
             "stream": False,
         }
+        # Blank in .env means the model does not accept the parameter: leave it out.
+        if self._settings.llm_temperature is not None:
+            body["temperature"] = self._settings.llm_temperature
+        if self._settings.llm_top_p is not None:
+            body["top_p"] = self._settings.llm_top_p
         if self._settings.llm_repetition_penalty:
             body["repetition_penalty"] = self._settings.llm_repetition_penalty
         stop = list(self._settings.llm_stop_sequences)
