@@ -145,6 +145,8 @@ class OpenAICompatibleClient:
             if self._settings.llm_api_key_header.lower() == "authorization":
                 value = f"Bearer {value}"
             headers[self._settings.llm_api_key_header] = value
+        if self._settings.helper_id:
+            headers["X-PBAI-Helper-Id"] = self._settings.helper_id
         return headers
 
     def _build_body(

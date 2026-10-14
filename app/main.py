@@ -37,10 +37,11 @@ if not settings.llm_base_url:
     )
 else:
     logger.info(
-        "LLM loader configured: %s (model=%s, concurrency=%s)",
+        "LLM loader configured: %s (model=%s, concurrency=%s, helper_id=%s)",
         settings.chat_url,
         settings.llm_model,
         settings.llm_concurrency,
+        "set" if settings.helper_id else "not set",
     )
 
 llm_client = OpenAICompatibleClient(settings)
