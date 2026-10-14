@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from app.core.models import AccountAssessment, EvidenceTable, ReviewCheck
+from app.core.models import AccountAssessment, AnalysisTiming, EvidenceTable, ReviewCheck
 
 
 @dataclass(frozen=True)
@@ -128,6 +128,38 @@ class ReportStore:
   {self._table(check.table)}
 </article>"""
 
+    _TIMING_STATUS_LABELS = {"answered": "Answered", "failed": "No usable answer", "not_run": "Not sent"}
+    _TIMING_COLUMNS = ["Call", "LLM time", "Started at", "Waited in app queue", "Output tokens", "Speed", "Result"]
+
+    @staticmethod
+    def _seconds(value: float | None) -> str:
+        return "-" if value is None else f"{value:.1f} s"
+
+    def _timing(self, timing: AnalysisTiming | None) -> str:
+        """Each call's time once it was sent to the LLM; same columns and wording as app/static/results.js."""
+        if timing is None:
+            return ""
+        rows = []
+        for call in timing.calls:
+            if call.status == "not_run":
+                rows.append([call.call, "-", "-", "-", "-", "-", self._TIMING_STATUS_LABELS["not_run"]])
+                continue
+            rows.append([
+                call.call, self._seconds(call.llm_seconds), self._seconds(call.started_after_seconds),
+                self._seconds(call.queue_wait_seconds), "-" if call.output_tokens is None else str(call.output_tokens),
+                "-" if call.tokens_per_second is None else f"{call.tokens_per_second:.1f} tokens/s",
+                self._TIMING_STATUS_LABELS[call.status] + (f" ({call.attempts} attempts)" if call.attempts > 1 else ""),
+            ])
+        table = self._table(EvidenceTable(columns=self._TIMING_COLUMNS, rows=rows), "timing")
+        return f"""
+<h2>Processing time</h2>
+<p class="muted">LLM time runs from when the app sent the call to the LLM until the answer arrived, including a format retry.
+Time waiting in the app's own queue is shown separately and is not counted. A wait inside the LLM server cannot be seen on its
+own and is part of LLM time: a call with a much lower speed than the others most likely waited there.</p>
+<p><b>Calls 1&ndash;3 together:</b> {self._seconds(timing.calls_1_to_3_seconds)} &middot;
+<b>Whole account:</b> {self._seconds(timing.total_seconds)}</p>
+{table}"""
+
     def _risk_reason_label(self, risk_level: str) -> str:
         return self._RISK_REASON_LABELS.get(risk_level, f"Why {risk_level} risk:")
 
@@ -207,6 +239,7 @@ th:first-child, td:first-child {{ text-align: left; }}
 tr.sel td {{ font-weight: 700; color: #1c1f26; background: #fbf1d6; }}
 table.kv td, table.kv th {{ text-align: left; white-space: normal; }}
 table.kv td:first-child {{ width: 38%; color: #6b7280; }}
+table.timing td:last-child, table.timing th:last-child {{ text-align: left; }}
 </style>
 </head>
 <body>
@@ -229,6 +262,7 @@ table.kv td:first-child {{ width: 38%; color: #6b7280; }}
 {result.months_reviewed} month(s) reviewed; {result.profile_records_matched} linked profile record(s) available.</p>
 {checks}
 {profile}
+{self._timing(result.timing)}
 <h2>Limitations</h2>
 <ul>{limitations}</ul>
 </body>

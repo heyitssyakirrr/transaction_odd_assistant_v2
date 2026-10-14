@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.call_timing import CallMeasure
+
 
 logger = logging.getLogger("app.llm_queue")
 
@@ -25,6 +27,7 @@ class _WorkItem:
     operation: Callable[[], Awaitable[Any]]
     result: asyncio.Future[Any]
     enqueued_at: float
+    measure: CallMeasure | None = None
 
 
 class LlmWorkQueue:
@@ -78,12 +81,16 @@ class LlmWorkQueue:
         ]
         logger.info("LLM queue started: workers=%d capacity=%d", self._worker_count, self._queue.maxsize)
 
-    async def submit(self, name: str, operation: Callable[[], Awaitable[Any]]) -> Any:
+    async def submit(
+        self, name: str, operation: Callable[[], Awaitable[Any]], measure: CallMeasure | None = None,
+    ) -> Any:
+        """Run ``operation`` on the next free worker. ``measure``, when given, receives the time
+        this job waited in the queue and the time the LLM took once a worker sent it."""
         if not self._accepting:
             raise LlmQueueClosedError("The LLM queue is not accepting new work.")
 
         loop = asyncio.get_running_loop()
-        item = _WorkItem(name, operation, loop.create_future(), time.monotonic())
+        item = _WorkItem(name, operation, loop.create_future(), time.monotonic(), measure)
         try:
             await asyncio.wait_for(self._queue.put(item), timeout=self._enqueue_timeout_seconds)
         except TimeoutError as exc:
@@ -125,6 +132,10 @@ class LlmWorkQueue:
                 self._active += 1
                 queued_ms = int((time.monotonic() - item.enqueued_at) * 1000)
                 started_at = time.monotonic()
+                if item.measure is not None:
+                    item.measure.queue_wait_ms += queued_ms
+                    if item.measure.started_at is None:
+                        item.measure.started_at = started_at
                 logger.info(
                     "LLM job started: worker=%d job=%s queue_wait_ms=%d queued=%d active=%d",
                     worker_id, item.name, queued_ms, self.queued_jobs, self.active_jobs,
@@ -147,5 +158,10 @@ class LlmWorkQueue:
                         item.result.set_result(value)
                 finally:
                     self._active -= 1
+                    if item.measure is not None:
+                        finished_at = time.monotonic()
+                        item.measure.llm_ms += int((finished_at - started_at) * 1000)
+                        item.measure.attempts += 1
+                        item.measure.finished_at = finished_at
             finally:
                 self._queue.task_done()

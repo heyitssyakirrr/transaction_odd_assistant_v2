@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.core.call_timing import CallMeasure
 
 logger = logging.getLogger("app.llm_client")
 
@@ -82,6 +83,7 @@ class OpenAICompatibleClient:
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
         max_response_tokens: int | None = None,
+        measure: CallMeasure | None = None,
     ) -> dict[str, Any]:
         if not self._settings.llm_base_url:
             raise LlmServiceError(
@@ -103,11 +105,12 @@ class OpenAICompatibleClient:
         payload = await self._post_with_retries(body, headers)
 
         choice = (payload.get("choices") or [{}])[0]
+        completion_tokens = (payload.get("usage") or {}).get("completion_tokens")
         logger.info(
-            "LLM completion: finish_reason=%s completion_tokens=%s",
-            choice.get("finish_reason"),
-            (payload.get("usage") or {}).get("completion_tokens"),
+            "LLM completion: finish_reason=%s completion_tokens=%s", choice.get("finish_reason"), completion_tokens,
         )
+        if measure is not None and isinstance(completion_tokens, int):
+            measure.add_tokens(completion_tokens)
         content = _extract_content(payload)
         self._log_raw_response(content)
         if body.get("stop") and _OBJECT_END in body["stop"] and choice.get("finish_reason") == "stop":
@@ -168,14 +171,11 @@ class OpenAICompatibleClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, ensure_ascii=False, default=str)},
             ],
+            "temperature": self._settings.llm_temperature,
+            "top_p": self._settings.llm_top_p,
             "max_tokens": output_tokens,
             "stream": False,
         }
-        # Blank in .env means the model does not accept the parameter: leave it out.
-        if self._settings.llm_temperature is not None:
-            body["temperature"] = self._settings.llm_temperature
-        if self._settings.llm_top_p is not None:
-            body["top_p"] = self._settings.llm_top_p
         if self._settings.llm_repetition_penalty:
             body["repetition_penalty"] = self._settings.llm_repetition_penalty
         stop = list(self._settings.llm_stop_sequences)

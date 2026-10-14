@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -12,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
 
 from app.adapters.llm_client import LlmOutputFormatError, LlmOutputTruncatedError
 from app.config import Settings
+from app.core.call_timing import CallMeasure
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
     PATTERN_LABELS, InactivityRun, Screening, activity_months_context, activity_six_month_context,
@@ -22,8 +24,8 @@ from app.core.monthly_facts import (
     unusual_transaction_months,
 )
 from app.core.models import (
-    AccountAnalysisRequest, AccountAssessment, AssessmentLimitation, CustomerProfileContext,
-    CustomerProfileRecord, Decision, EvidenceItem, EvidenceTable, LlmClient, OverallSummary,
+    AccountAnalysisRequest, AccountAssessment, AnalysisTiming, AssessmentLimitation, CallTiming,
+    CustomerProfileContext, CustomerProfileRecord, Decision, EvidenceItem, EvidenceTable, LlmClient, OverallSummary,
     ReviewCheck, ReviewCheckName, RiskLevel,
 )
 from app.core.prompts import (
@@ -93,6 +95,14 @@ _OUTCOME_SYNONYMS = {
 }
 
 _FALLBACK_HEADLINE = "The overall summary could not be produced. Review each check below."
+
+# The four LLM calls, in the order staff read them on the timing table.
+_TIMED_CALLS: tuple[tuple[str, str], ...] = (
+    ("activity-money-context", "Call 1: Activity and money"),
+    ("inactivity-burst-gaps-context", "Call 2: Inactivity, burst and gaps"),
+    ("profile-context", "Call 3: Customer profile"),
+    ("overall-summary", "Call 4: Overall summary"),
+)
 # occupation_fit when there is nothing for the AI to judge (it is not asked; see occupation_note).
 _NOTHING_TO_COMPARE = "No unusual transaction or layering was found, so there is nothing to compare with the occupation."
 _NO_OCCUPATION = "The declared occupation is not available, so the findings could not be compared with it."
@@ -168,6 +178,8 @@ class AnalysisService:
         self._llm_queue = llm_queue
 
     async def analyze_account(self, request: AccountAnalysisRequest) -> AccountAssessment:
+        started = time.monotonic()
+        measures = {stage: CallMeasure() for stage, _ in _TIMED_CALLS}
         profile = self._profile_records_for_llm(request.customer_profile)
         catalog = self._evidence_catalog(request, profile)
         monthly = [row.model_dump(mode="json") for row in request.monthly_summary]
@@ -186,12 +198,15 @@ class AnalysisService:
         call_tasks = [
             asyncio.create_task(self._complete_with_retry(
                 request.case_id, call.stage, call.system_prompt, call.prompt_input, call.model_type,
-                self._settings.llm_transaction_max_response_tokens, call.validator,
+                self._settings.llm_transaction_max_response_tokens, call.validator, measures[call.stage],
             ))
             for call in calls
         ]
-        profile_task = asyncio.create_task(self._profile_context_or_none(request.case_id, profile, monthly))
+        profile_task = asyncio.create_task(
+            self._profile_context_or_none(request.case_id, profile, monthly, measures["profile-context"]))
+        parallel_started = time.monotonic()
         *call_results, profile_result = await asyncio.gather(*call_tasks, profile_task, return_exceptions=True)
+        parallel_seconds = time.monotonic() - parallel_started
 
         profile_context: CustomerProfileContext | None = None
         if isinstance(profile_result, Exception):
@@ -209,8 +224,41 @@ class AnalysisService:
         checks = self._build_checks(calls, results, monthly, catalog, run, screened)
         signals = risk_signals(monthly, screening)
         summary = None if not results else await self._overall_summary_or_none(
-            request.case_id, monthly, run, checks, profile, profile_context, signals)
-        return self._assessment(request, checks, summary, signals, profile_context)
+            request.case_id, monthly, run, checks, profile, profile_context, signals, measures["overall-summary"])
+        assessment = self._assessment(request, checks, summary, signals, profile_context)
+        timing = self._timing(measures, started, parallel_seconds)
+        logger.info(
+            "Timing: case=%s %s calls_1_to_3=%.1fs total=%.1fs", request.case_id,
+            " ".join(f"call{index}={call.llm_seconds if call.llm_seconds is not None else '-'}s"
+                     f"/{call.output_tokens if call.output_tokens is not None else '-'}tok"
+                     for index, call in enumerate(timing.calls, start=1)),
+            timing.calls_1_to_3_seconds, timing.total_seconds,
+        )
+        return assessment.model_copy(update={"timing": timing})
+
+    @staticmethod
+    def _timing(measures: dict[str, CallMeasure], started: float, parallel_seconds: float) -> AnalysisTiming:
+        """Each call's time from when a worker sent it to the LLM, and the account's total time."""
+        calls = []
+        for stage, label in _TIMED_CALLS:
+            measure = measures[stage]
+            if not measure.attempts:
+                calls.append(CallTiming(call=label, status="not_run"))
+                continue
+            llm_seconds = measure.llm_ms / 1000
+            calls.append(CallTiming(
+                call=label, status="failed" if measure.failed else "answered",
+                llm_seconds=round(llm_seconds, 1),
+                started_after_seconds=round((measure.started_at or started) - started, 1),
+                queue_wait_seconds=round(measure.queue_wait_ms / 1000, 1), attempts=measure.attempts,
+                output_tokens=measure.output_tokens,
+                tokens_per_second=(round(measure.output_tokens / llm_seconds, 1)
+                                   if measure.output_tokens and llm_seconds > 0 else None),
+            ))
+        return AnalysisTiming(
+            calls=calls, calls_1_to_3_seconds=round(parallel_seconds, 1),
+            total_seconds=round(time.monotonic() - started, 1),
+        )
 
     def _pattern_calls(
         self, case_id: str, monthly: list[dict[str, Any]], catalog: dict[str, EvidenceItem],
@@ -497,6 +545,7 @@ class AnalysisService:
     async def _overall_summary_or_none(
         self, case_id: str, monthly: list[dict[str, Any]], run: InactivityRun | None, checks: list[ReviewCheck],
         profile: list[dict[str, str | None]], profile_context: CustomerProfileContext | None, signals: RiskSignals,
+        measure: CallMeasure | None = None,
     ) -> OverallSummary | None:
         """Call 4 explains the screening's findings and risk, and judges whether the evidence fits the
         occupation. The risk level itself is the screening's (see screening_risk)."""
@@ -517,6 +566,7 @@ class AnalysisService:
                     value, quotable, [row["year_month"] for row in monthly], case_id, final,
                     nothing_found=not (signals.unusual or signals.layering),
                     fit_expected=bool((signals.unusual or signals.layering) and occupation)),
+                measure,
             )
         except Exception as exc:  # the report must still be shown without the summary
             logger.error("Overall summary failed: case=%s error=%s", case_id, exc)
@@ -695,15 +745,16 @@ class AnalysisService:
 
     async def _ask(
         self, case_id: str, stage: str, system_prompt: str, prompt_input: str,
-        model_type: type[ModelType], max_response_tokens: int,
+        model_type: type[ModelType], max_response_tokens: int, measure: CallMeasure | None = None,
     ) -> ModelType:
         result = await self._llm_queue.submit(
             name=f"case={case_id} stage={stage}",
             operation=lambda: self._llm.complete_json(
                 system_prompt=system_prompt, user_payload=prompt_input,
                 response_schema=model_type.model_json_schema(), schema_name=stage.replace("-", "_"),
-                max_response_tokens=max_response_tokens,
+                max_response_tokens=max_response_tokens, measure=measure,
             ),
+            measure=measure,
         )
         prepare = getattr(model_type, "prepare_payload", None)
         if prepare is not None:
@@ -718,6 +769,7 @@ class AnalysisService:
 
     async def _profile_context_or_none(
         self, case_id: str, profile: list[dict[str, str | None]], monthly: list[dict[str, Any]],
+        measure: CallMeasure | None = None,
     ) -> "_RawProfileContext | None":
         if not profile:
             return None
@@ -726,12 +778,27 @@ class AnalysisService:
             profile_context_input(profile, monthly), _RawProfileContext,
             self._settings.llm_profile_context_max_response_tokens,
             lambda value, final: self._validate_profile_context(value),
+            measure,
         )
 
     async def _complete_with_retry(
         self, case_id: str, stage: str, system_prompt: str, prompt_input: str,
         model_type: type[ModelType], max_response_tokens: int,
-        validator: Callable[[ModelType, bool], ModelType | None],
+        validator: Callable[[ModelType, bool], ModelType | None], measure: CallMeasure | None = None,
+    ) -> ModelType:
+        """Ask, validate, retry once on a format problem; ``measure`` records the call's time."""
+        try:
+            return await self._ask_and_validate(
+                case_id, stage, system_prompt, prompt_input, model_type, max_response_tokens, validator, measure)
+        except Exception:
+            if measure is not None:
+                measure.failed = True
+            raise
+
+    async def _ask_and_validate(
+        self, case_id: str, stage: str, system_prompt: str, prompt_input: str,
+        model_type: type[ModelType], max_response_tokens: int,
+        validator: Callable[[ModelType, bool], ModelType | None], measure: CallMeasure | None,
     ) -> ModelType:
         """Ask, validate, retry once on a format problem.
 
@@ -739,7 +806,7 @@ class AnalysisService:
         reconciling a field with source facts); returning None keeps the original.
         """
         try:
-            result = await self._ask(case_id, stage, system_prompt, prompt_input, model_type, max_response_tokens)
+            result = await self._ask(case_id, stage, system_prompt, prompt_input, model_type, max_response_tokens, measure)
             corrected = validator(result, not self._settings.llm_format_retry_enabled)
             return result if corrected is None else corrected
         except LlmOutputTruncatedError as exc:
@@ -751,7 +818,7 @@ class AnalysisService:
             try:
                 result = await self._ask(
                     case_id, f"{stage}-format-retry", system_prompt + format_retry_suffix(first_error, list(model_type.model_fields)),
-                    prompt_input, model_type, max_response_tokens,
+                    prompt_input, model_type, max_response_tokens, measure,
                 )
                 corrected = validator(result, True)
                 return result if corrected is None else corrected

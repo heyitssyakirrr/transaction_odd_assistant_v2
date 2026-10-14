@@ -6,6 +6,8 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.call_timing import CallMeasure
+
 
 # not_assessed: the AI could not decide, because a check the risk depends on was not verified
 # or the summary failed. Never a guessed level.
@@ -135,6 +137,30 @@ class OverallSummary(BaseModel):
     issues: list[str] = Field(default_factory=list)
 
 
+class CallTiming(BaseModel):
+    """One LLM call's time, shown to staff. llm_seconds runs from when a worker sent the call
+    to the LLM until the answer arrived, across all attempts; any wait inside the LLM server
+    is part of it, while the wait in this app's queue is queue_wait_seconds."""
+
+    call: str
+    # answered: the LLM's answer was used; failed: no usable answer; not_run: never sent.
+    status: Literal["answered", "failed", "not_run"]
+    llm_seconds: float | None = None
+    # When a worker took the call, counted from the start of this account's analysis.
+    started_after_seconds: float | None = None
+    queue_wait_seconds: float = 0
+    attempts: int = 0
+    output_tokens: int | None = None
+    tokens_per_second: float | None = None
+
+
+class AnalysisTiming(BaseModel):
+    calls: list[CallTiming]
+    # Calls 1-3 run at the same time, so this is the longest of them when they run in parallel.
+    calls_1_to_3_seconds: float
+    total_seconds: float
+
+
 class AccountAssessment(BaseModel):
     case_id: str
     acct_num: str
@@ -148,6 +174,7 @@ class AccountAssessment(BaseModel):
     months_reviewed: int
     profile_records_matched: int
     generated_at: datetime
+    timing: AnalysisTiming | None = None
 
 
 class LlmClient(Protocol):
@@ -159,4 +186,5 @@ class LlmClient(Protocol):
         response_schema: dict[str, Any],
         schema_name: str,
         max_response_tokens: int | None = None,
+        measure: CallMeasure | None = None,
     ) -> dict[str, Any]: ...

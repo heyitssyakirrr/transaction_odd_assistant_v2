@@ -16,6 +16,9 @@ const OUTCOME_LABELS = {
 const RISK_LABELS = { low: "LOW RISK", medium: "MEDIUM RISK", high: "HIGH RISK", not_assessed: "RISK NOT ASSESSED" };
 const RISK_REASON_LABELS = { not_assessed: "Why the risk was not assessed:" };
 
+const TIMING_STATUS_LABELS = { answered: "Answered", failed: "No usable answer", not_run: "Not sent" };
+const TIMING_COLUMNS = ["Call", "LLM time", "Started at", "Waited in app queue", "Output tokens", "Speed", "Result"];
+
 const DECISION_LABELS = {
   further_review_suggested: "Further review suggested",
   no_further_review_suggested: "No further review suggested",
@@ -48,6 +51,9 @@ const els = {
   customerProfileSection: document.querySelector("#customer-profile-section"),
   customerProfileTitle: document.querySelector("#customer-profile-title"),
   customerProfileContext: document.querySelector("#customer-profile-context"),
+  timingSection: document.querySelector("#timing-section"),
+  timingTotals: document.querySelector("#timing-totals"),
+  timingTable: document.querySelector("#timing-table"),
   limitationsTitle: document.querySelector("#limitations-title"),
   limitations: document.querySelector("#limitations"),
   reportHtmlLink: document.querySelector("#report-html-link"),
@@ -214,6 +220,7 @@ function renderResult(data) {
   renderSummary(data.overall, data.risk_level);
   renderReviewChecks(data.review_checks || []);
   renderCustomerProfile(data.customer_profile_context);
+  renderTiming(data.timing);
   renderLimitations(data.limitations || []);
 
   els.reportHtmlLink.href = data.report_html;
@@ -293,6 +300,31 @@ function renderCustomerProfile(context) {
       <p class="check-insight">${escapeHtml(context.summary)}</p>
       ${renderTable(context.table, "profile-table")}
     </article>`;
+}
+
+// Same columns and wording as app/core/report_store.py.
+function renderTiming(timing) {
+  toggle(els.timingSection, Boolean(timing));
+  if (!timing) return;
+  els.timingTotals.innerHTML = `
+    <div><span>Calls 1&ndash;3 together</span><strong>${seconds(timing.calls_1_to_3_seconds)}</strong></div>
+    <div><span>Whole account</span><strong>${seconds(timing.total_seconds)}</strong></div>`;
+  const rows = timing.calls.map((call) => call.status === "not_run"
+    ? [call.call, "-", "-", "-", "-", "-", TIMING_STATUS_LABELS.not_run]
+    : [
+      call.call,
+      seconds(call.llm_seconds),
+      seconds(call.started_after_seconds),
+      seconds(call.queue_wait_seconds),
+      call.output_tokens ?? "-",
+      call.tokens_per_second == null ? "-" : `${Number(call.tokens_per_second).toFixed(1)} tokens/s`,
+      TIMING_STATUS_LABELS[call.status] + (call.attempts > 1 ? ` (${call.attempts} attempts)` : ""),
+    ]);
+  els.timingTable.innerHTML = renderTable({ columns: TIMING_COLUMNS, rows: rows.map((row) => row.map(String)) }, "timing-table");
+}
+
+function seconds(value) {
+  return value == null ? "-" : `${Number(value).toFixed(1)} s`;
 }
 
 function renderLimitations(limitations) {

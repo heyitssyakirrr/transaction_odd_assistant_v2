@@ -535,6 +535,18 @@ button:disabled { cursor: wait; opacity: .65; }
 
 .section-hint { margin: -6px 0 14px; font-size: 13px; color: var(--muted); }
 
+.timing-totals { display: flex; flex-wrap: wrap; gap: 12px 32px; margin-bottom: 12px; }
+.timing-totals div { display: flex; flex-direction: column; gap: 2px; }
+.timing-totals span {
+  font-size: 11.5px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--muted);
+}
+.timing-totals strong { font-size: 18px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.timing-table td:last-child, .timing-table th:last-child { text-align: left; }
+
 .plain-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
 .plain-list li {
   display: flex;
