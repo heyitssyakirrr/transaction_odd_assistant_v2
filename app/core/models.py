@@ -64,7 +64,8 @@ class AccountAnalysisRequest(BaseModel):
     case_id: str = Field(min_length=1, max_length=128)
     source_filename: str = Field(min_length=1, max_length=255)
     acct_num: str = Field(min_length=1, max_length=64)
-    monthly_summary: list[MonthlySummaryRow] = Field(min_length=6, max_length=6)
+    # The loader enforces exactly REVIEW_MONTHS consecutive months; the analysis works on any count here.
+    monthly_summary: list[MonthlySummaryRow] = Field(min_length=1, max_length=24)
     customer_profile: list[CustomerProfileRecord] = Field(default_factory=list)
 
 
@@ -103,7 +104,8 @@ class ReviewCheck(BaseModel):
     # A short factual line built from the CSV rows.
     facts: str = Field(min_length=1, max_length=400)
     table: EvidenceTable | None = None
-    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=18)
+    # At most 3 fields per month (see _EVIDENCE_FIELDS), for up to 24 months.
+    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=72)
 
 
 class AssessmentLimitation(BaseModel):

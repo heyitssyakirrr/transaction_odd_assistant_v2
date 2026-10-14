@@ -23,17 +23,62 @@
       <p class="eyebrow">Transaction review</p>
       <h1>Analyse customer statements with <em>clarity and confidence</em></h1>
       <p class="upload-hero-lead">
-        Upload one or more 6-month monthly summaries, one CSV per account. Linked
-        customer profile history is joined automatically. Accounts are analysed
-        one at a time, and you can page through each report as soon as it is ready.
+        Upload 12-month monthly summaries, one CSV per account, or read accounts straight
+        from the server folder. Linked customer profile history is joined automatically.
+        Accounts are analysed one at a time, and you can page through each report as soon
+        as it is ready.
       </p>
     </section>
 
     <section class="card upload-card">
       <div class="upload-card-head">
         <p class="eyebrow">New analysis</p>
-        <h2>Upload transaction statement</h2>
+        <h2>Choose the accounts</h2>
       </div>
+
+      <div class="source-switch" role="tablist" aria-label="Where the accounts come from">
+        <button type="button" class="source-option is-active" role="tab" aria-selected="true" data-source="upload">Upload CSV files</button>
+        <button type="button" class="source-option" role="tab" aria-selected="false" data-source="folder">Read from folder</button>
+      </div>
+
+      <form id="folder-form" class="hidden">
+        <div id="folder-loading" class="loading">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Reading the folder&hellip;</span>
+        </div>
+        <div id="folder-panel" class="folder-panel hidden">
+          <div class="folder-facts">
+            <div><span>Folder</span><strong id="folder-path"></strong></div>
+            <div><span>Account files</span><strong id="folder-total"></strong></div>
+          </div>
+
+          <fieldset class="choice-group">
+            <legend>Citizenship</legend>
+            <div class="choice-row" id="citizenship-choices">
+              <label class="choice"><input type="radio" name="citizenship" value="malaysian" checked>
+                <span>Malaysian <em id="count-malaysian"></em></span></label>
+              <label class="choice"><input type="radio" name="citizenship" value="non_malaysian">
+                <span>Non-Malaysian <em id="count-non_malaysian"></em></span></label>
+              <label class="choice"><input type="radio" name="citizenship" value="all">
+                <span>All (mixed) <em id="count-all"></em></span></label>
+            </div>
+            <p class="field-hint">From CITIZEN_CD of each account's latest customer profile. Accounts with no profile are only in "All".</p>
+          </fieldset>
+
+          <label class="number-field" for="account-count">
+            <span>Number of accounts</span>
+            <input id="account-count" type="number" min="1" step="1" inputmode="numeric">
+          </label>
+          <p id="count-hint" class="field-hint"></p>
+          <p id="folder-unreadable" class="folder-warning hidden"></p>
+        </div>
+
+        <div id="folder-error" class="error hidden" role="alert"></div>
+        <button id="folder-submit" type="submit" disabled>
+          <span id="folder-submit-label">Start analysis</span>
+          <span aria-hidden="true">&rarr;</span>
+        </button>
+      </form>
 
       <form id="analysis-form">
         <label id="file-field" class="file-field" for="file">
@@ -44,7 +89,7 @@
         </label>
 
         <p class="upload-note">
-          Expected columns: acct_num, year_month, txn_count_monthly, pct_burst,
+          12 consecutive months, one row each. Expected columns: acct_num, year_month, txn_count_monthly, pct_burst,
           total_amount, avg_amount, std_amount, max_amount,  pct_trx_gap,
           monthly_debit, monthly_credit, debit_count_monthly, credit_count_monthly,
           monthly_avg_debit, monthly_avg_credit.
@@ -72,5 +117,6 @@
   </main>
 
   <script src="/static/upload.js"></script>
+  <script src="/static/folder.js"></script>
 </body>
 </html>

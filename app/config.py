@@ -60,6 +60,16 @@ class Settings:
         "CUSTOMER_INFO_PARQUET_PATH",
         str(BASE_DIR / "data" / "customer_info.parquet"), 
     )
+    # Server folder of account Parquet files (one account per file, same 15 columns as the
+    # CSV) for the "Read from folder" option; blank hides the option. Staff cannot change it.
+    account_folder_path: str = os.getenv("ACCOUNT_FOLDER_PATH", "").strip()
+    # CITIZEN_CD value in customer_info that means Malaysian, for the citizenship filter.
+    malaysian_citizen_cd: str = os.getenv("MALAYSIAN_CITIZEN_CD", "MY").strip()
+    # The risk the bank's rule-based program gave every account in the folder, written to
+    # the batch results CSV to compare with ours. Never sent to the LLM. Blank leaves it out.
+    folder_expected_risk: str = os.getenv("FOLDER_EXPECTED_RISK", "high").strip().lower()
+    # One CSV per batch, a row per finished account: risk found, expected risk, report link.
+    batch_results_directory: str = os.getenv("BATCH_RESULTS_DIRECTORY", str(BASE_DIR / "data" / "batches"))
     # CSV with columns CODE, D_CUST_OCCUPAT -- maintained by compliance,
     # loaded and cached at analysis time (see app/core/reference_data.py).
     occupation_code_csv_path: str = os.getenv(
@@ -81,6 +91,8 @@ class Settings:
     # at least this many consecutive zero-transaction months before a month with
     # transactions. This is an internal review rule, not a bank policy.
     dormancy_min_zero_months: int = int(os.getenv("DORMANCY_MIN_ZERO_MONTHS", "3"))
+    # Every account file must hold exactly this many consecutive months (one row each).
+    review_months: int = int(os.getenv("REVIEW_MONTHS", "12"))
     # Burst and gaps: a one-transaction month this many days or more after the previous
     # transaction is listed to the LLM as a long gap. Context only, never a risk level.
     review_long_gap_days: int = int(os.getenv("REVIEW_LONG_GAP_DAYS", "60"))
@@ -151,6 +163,7 @@ class Settings:
             "LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS": self.llm_profile_context_max_response_tokens,
             "LLM_SUMMARY_MAX_RESPONSE_TOKENS": self.llm_summary_max_response_tokens,
             "DORMANCY_MIN_ZERO_MONTHS": self.dormancy_min_zero_months,
+            "REVIEW_MONTHS": self.review_months,
             "REVIEW_LONG_GAP_DAYS": self.review_long_gap_days,
             "REVIEW_UNUSUAL_TIMES_USUAL": self.review_unusual_times_usual,
             "REVIEW_MIN_AMOUNT": self.review_min_amount,
@@ -174,6 +187,10 @@ class Settings:
             raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
         if not 0 < self.llm_top_p <= 1:
             raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1")
+        if self.folder_expected_risk not in {"", "low", "medium", "high"}:
+            raise ValueError("FOLDER_EXPECTED_RISK must be low, medium, high or blank")
+        if not 1 <= self.review_months <= 24:
+            raise ValueError("REVIEW_MONTHS must be between 1 and 24")
         if not 0 < self.review_layering_max_difference_pct < 100:
             raise ValueError("REVIEW_LAYERING_MAX_DIFFERENCE_PCT must be between 0 and 100")
         if self.llm_repetition_penalty < 0:
@@ -205,6 +222,18 @@ class Settings:
     @property
     def customer_info_path(self) -> Path:
         path = Path(self.customer_info_parquet_path)
+        return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def account_folder(self) -> Path | None:
+        if not self.account_folder_path:
+            return None
+        path = Path(self.account_folder_path)
+        return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def batch_results_path(self) -> Path:
+        path = Path(self.batch_results_directory)
         return path if path.is_absolute() else BASE_DIR / path
 
     @property

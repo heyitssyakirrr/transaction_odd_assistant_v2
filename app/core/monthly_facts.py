@@ -38,6 +38,11 @@ def _amount_phrase(row: dict[str, Any]) -> str:
     )
 
 
+def months_label(rows: list[dict[str, Any]]) -> str:
+    """The review period in words, e.g. "12 months": the file decides how many months there are."""
+    return _count_label(len(rows), "month")
+
+
 def _share(part: Decimal, whole: Decimal) -> str:
     return f"{(part / whole * 100).quantize(Decimal('0.1'))}%" if whole else "0.0%"
 
@@ -160,7 +165,8 @@ def unusual_transaction_note(rows: list[dict[str, Any]], screening: Screening) -
                 f"this evidence: the amount, the month and {compare}.\n")
     top = _amount(_largest_single(rows), "max_amount")
     if not top:
-        return ("\nUNUSUAL TRANSACTION NOTE: There were no transactions in the six months. activity_insight says so.\n")
+        return (f"\nUNUSUAL TRANSACTION NOTE: There were no transactions in the {months_label(rows)}. "
+                "activity_insight says so.\n")
     reason = (f"below the RM {_money(screening.min_amount)} minimum the screening reviews" if top < screening.min_amount
               else f"{_times(top, usual)} times the usual largest of RM {_money(usual)}, under "
                    f"{_number(screening.unusual_times_usual)} times")
@@ -197,7 +203,7 @@ def layering_note(rows: list[dict[str, Any]], screening: Screening) -> str:
 
 
 def _largest_single(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """The month with the largest single transaction of the six (the earliest on a tie)."""
+    """The month with the largest single transaction of all the months (the earliest on a tie)."""
     return max(rows, key=lambda row: _amount(row, "max_amount"))
 
 
@@ -221,7 +227,7 @@ def amount_facts(rows: list[dict[str, Any]], usual: AccountUsual) -> str:
         )
     top_amount = _amount(_largest_single(rows), "max_amount")
     lines.append(
-        f"LARGEST_IN_SIX_MONTHS|largest_single={_money(top_amount)}|months_with_this_amount={','.join(_months_with(rows, top_amount))}|"
+        f"LARGEST_IN_ALL_MONTHS|largest_single={_money(top_amount)}|months_with_this_amount={','.join(_months_with(rows, top_amount))}|"
         f"times_usual_largest={_times(top_amount, usual.largest_single)}"
     )
     return "\n".join(lines)
@@ -253,18 +259,18 @@ def activity_months_context(rows: list[dict[str, Any]], months: list[str]) -> st
     return "; ".join(f"{row['year_month']}: {_amount_phrase(row)}{_vs_usual_largest(row, usual)}" for row in selected) + "."
 
 
-def activity_six_month_context(rows: list[dict[str, Any]]) -> str:
+def activity_all_months_context(rows: list[dict[str, Any]]) -> str:
     totals = [_amount(row, "total_amount") for row in rows]
     largest = _largest_single(rows)
     return (
-        f"Six-month totals range {_rm(min(totals))} to {_rm(max(totals))}; largest single transaction "
+        f"Monthly totals over {months_label(rows)} range {_rm(min(totals))} to {_rm(max(totals))}; largest single transaction "
         f"{_rm(_amount(largest, 'max_amount'))} in {largest['year_month']}{_vs_usual_largest(largest, account_usual(rows))}."
     )
 
 
 # --- Activity after an inactive period -------------------------------------
-# Whether this pattern exists is arithmetic on the six rows, so the code decides
-# it. The model still judges the overall risk. Wording stays observational: six
+# Whether this pattern exists is arithmetic on the monthly rows, so the code decides
+# it. The model still judges the overall risk. Wording stays observational: the
 # rows cannot establish formal dormancy or that the account was ever active.
 # No reference amount: the amount is stated, and the AI judges what it means.
 
@@ -290,13 +296,15 @@ class InactivityRun:
     later_active_months: int
     later_transactions: int
     later_total: Decimal
+    # How many months the review covers, for "12-month view only".
+    months_reviewed: int = 0
 
 
 def find_inactivity_run(rows: list[dict[str, Any]], *, min_zero_months: int) -> InactivityRun | None:
     """Return the most recent run of ``min_zero_months`` or more zero-count months
     immediately followed by a month with transactions, or None.
 
-    Rows are the six consecutive months in order (guaranteed by the CSV loader).
+    Rows are consecutive months in order (guaranteed by the loader).
     """
     for index in range(len(rows) - 1, 0, -1):
         if rows[index]["txn_count_monthly"] <= 0:
@@ -324,6 +332,7 @@ def find_inactivity_run(rows: list[dict[str, Any]], *, min_zero_months: int) -> 
             total=total, debit=debit, credit=credit, largest_single=largest, direction=direction,
             later_active_months=len(later), later_transactions=sum(row["txn_count_monthly"] for row in later),
             later_total=sum((_amount(row, "total_amount") for row in later), Decimal(0)),
+            months_reviewed=len(rows),
         )
     return None
 
@@ -391,7 +400,7 @@ def dormancy_rationale(run: InactivityRun) -> str:
         f"{run.later_transactions} transactions, total {_rm(run.later_total)}."
         if run.later_active_months else ""
     )
-    caveat = "Six-month view only; not a formal dormancy status."
+    caveat = f"{run.months_reviewed}-month view only; not a formal dormancy status."
     for parts in ((pattern, since, _staff_check(run), caveat), (pattern, _staff_check(run), caveat),
                   (pattern, _staff_check(run)), (pattern,)):
         text = " ".join(part for part in parts if part)
@@ -400,10 +409,10 @@ def dormancy_rationale(run: InactivityRun) -> str:
     return pattern[:_RATIONALE_LIMIT]
 
 
-def no_inactivity_rationale(min_zero_months: int) -> str:
+def no_inactivity_rationale(min_zero_months: int, months_reviewed: int) -> str:
     return (
         f"No run of {min_zero_months} or more consecutive zero-transaction months "
-        "followed by activity in this six-month review."
+        f"followed by activity in this {months_reviewed}-month review."
     )
 
 
@@ -413,7 +422,7 @@ def no_inactivity_rationale(min_zero_months: int) -> str:
 #   transacted more than 3 times that month ("burst"). Shown as a percentage.
 # - pct_trx_gap: average gap in days between transactions in the month. A gap
 #   needs two transactions, so in a one-transaction month it measures back to
-#   the previous transaction, which may fall before the six-month window.
+#   the previous transaction, which may fall before the review window.
 # The model judges what the timing means; these helpers only lay the values out.
 
 GapBasis = Literal["in_month", "since_previous", "no_activity"]
@@ -669,9 +678,13 @@ def _burst_month_phrase(row: dict[str, Any]) -> str:
 
 
 def burst_gap_pair_facts(rows: list[dict[str, Any]], months: list[str]) -> str:
-    """Exact values for the given months, as a short factual line."""
+    """Exact values for the given months, as a short factual line: full figures for up to three
+    months, the burst share per month for more, so the line stays short with 12 months."""
     by_month = {row["year_month"]: row for row in rows}
-    return "; ".join(_burst_month_phrase(by_month[month]) for month in months) + "."
+    selected = [by_month[month] for month in months if month in by_month]
+    if len(selected) > 3:
+        return "Months: " + ", ".join(f"{row['year_month']} (burst {_burst_share(row)}%)" for row in selected) + "."
+    return "; ".join(_burst_month_phrase(row) for row in selected) + "."
 
 
 def burst_gap_evidence_months(rows: list[dict[str, Any]]) -> list[str]:
@@ -693,7 +706,7 @@ def burst_gap_evidence_months(rows: list[dict[str, Any]]) -> list[str]:
     return sorted(months)
 
 
-def burst_gap_six_month_context(rows: list[dict[str, Any]]) -> str:
+def burst_gap_all_months_context(rows: list[dict[str, Any]]) -> str:
     burst = burst_guide_months(rows)
     in_month = [row for row in rows if gap_basis(row) == "in_month"]
     since_previous = [row for row in rows if gap_basis(row) == "since_previous"]
@@ -729,7 +742,7 @@ def allowed_burst_gap_numbers(rows: list[dict[str, Any]]) -> set[Decimal]:
 
 
 # --- Evidence tables ----------------------------------------------------------
-# Every check shows all six months so staff see the context; the months the model
+# Every check shows every month so staff see the context; the months the model
 # selected are highlighted. Values are formatted once here, so the page and the
 # HTML report always show identical figures.
 
@@ -860,14 +873,18 @@ def pattern_problem(
 
 
 def _selected_facts(check: str, rows: list[dict[str, Any]], selected: list[dict[str, Any]]) -> str:
-    """What the rows actually show for the selected months, for a mismatch message."""
+    """What the rows actually show for the selected months, for a mismatch message. Short per month
+    when more than three are selected, so the message (also read by the summary) stays readable."""
     if check == "burst_and_gaps":
+        if len(selected) > 3:
+            return ", ".join(f"{row['year_month']} (burst {_burst_share(row)}%)" for row in selected)
         return "; ".join(_burst_month_phrase(row) for row in selected)
     largest = _largest_single(rows)
     return "; ".join(
         f"{row['year_month']} total {_rm(_amount(row, 'total_amount'))}, largest single {_rm(_amount(row, 'max_amount'))}"
         for row in selected
-    ) + f" (largest single in six months: {_rm(_amount(largest, 'max_amount'))} in {largest['year_month']})"
+    ) + (f" (largest single in {months_label(rows)}: {_rm(_amount(largest, 'max_amount'))} "
+         f"in {largest['year_month']})")
 
 
 # --- Numbers a model sentence may quote ------------------------------------------

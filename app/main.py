@@ -9,6 +9,7 @@ from app.adapters.llm_client import OpenAICompatibleClient
 from app.api.routes import UploadAnalyser, build_router
 from app.config import Settings
 from app.core.analysis_service import AnalysisService
+from app.core.batch_results import BatchResultsLog
 from app.core.batch_runner import BatchRunner
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.report_store import ReportStore
@@ -53,8 +54,11 @@ llm_queue = LlmWorkQueue(
 service = AnalysisService(llm_client, settings, llm_queue)
 
 report_store = ReportStore(settings.report_directory_path)
-analyser = UploadAnalyser(service, report_store, settings.customer_info_path)
-batch_runner = BatchRunner(analyser.analyse_for_batch, max_kept_batches=settings.batch_keep_recent)
+analyser = UploadAnalyser(service, report_store, settings.customer_info_path, settings.review_months)
+results_log = BatchResultsLog(settings.batch_results_path)
+batch_runner = BatchRunner(
+    analyser.analyse_for_batch, max_kept_batches=settings.batch_keep_recent, on_file_done=results_log.record,
+)
 
 app = FastAPI(
     title="Transaction Due-Diligence Assistant",
@@ -67,7 +71,7 @@ app.mount(
     name="static",
 )
 
-app.include_router(build_router(analyser, batch_runner, report_store, settings.batch_max_files))
+app.include_router(build_router(analyser, batch_runner, report_store, results_log, settings))
 
 
 @app.middleware("http")

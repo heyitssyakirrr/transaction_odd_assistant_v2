@@ -64,6 +64,7 @@ const els = {
   batchFile: document.querySelector("#batch-file"),
   batchFileStatus: document.querySelector("#batch-file-status"),
   batchProgress: document.querySelector("#batch-progress"),
+  batchResultsLink: document.querySelector("#batch-results-link"),
   batchPlaceholder: document.querySelector("#batch-placeholder"),
   batchPlaceholderText: document.querySelector("#batch-placeholder-text"),
   prevReport: document.querySelector("#prev-report"),
@@ -72,7 +73,8 @@ const els = {
 
 // Batch mode: /results?batch=<id>&page=<n>. One report per page; the batch is polled
 // until every file has finished, and a page is drawn once its report is ready.
-const batchState = { id: null, data: null, page: 1, shown: null };
+// Reports are fetched one at a time (the poll carries statuses only) and kept, so paging back is instant.
+const batchState = { id: null, data: null, page: 1, shown: null, reports: new Map(), loading: null };
 
 init();
 
@@ -141,11 +143,21 @@ function showBatchPage() {
     : `${counts.done} ready \u00b7 ${counts.analysing} analysing \u00b7 ${counts.queued} waiting \u00b7 ${counts.failed} failed. `
       + "Files are analysed one at a time.";
   els.batchProgress.classList.remove("hidden");
+  if (data.results_csv) {
+    els.batchResultsLink.href = `/v1/accounts/batches/${encodeURIComponent(data.batch_id)}/results.csv`;
+    els.batchResultsLink.textContent = data.finished ? "Download results CSV" : "Download results so far (CSV)";
+    els.batchResultsLink.classList.remove("hidden");
+  }
 
-  if (file.status === "done" && file.result) {
+  if (file.status === "done") {
+    const report = batchState.reports.get(page);
+    if (!report) {
+      loadReport(page);
+      return;
+    }
     const key = `${page}:done`;
     if (batchState.shown !== key) {  // draw once, so polling does not reset the page
-      renderResult(file.result);
+      renderResult(report);
       batchState.shown = key;
     }
     els.batchPlaceholder.classList.add("hidden");
@@ -157,6 +169,27 @@ function showBatchPage() {
   els.result.classList.add("hidden");
   els.batchPlaceholderText.textContent = placeholderText(file);
   els.batchPlaceholder.classList.remove("hidden");
+}
+
+async function loadReport(page) {
+  if (batchState.loading === page) return;
+  batchState.loading = page;
+  els.result.classList.add("hidden");
+  els.batchPlaceholderText.textContent = "Loading this report…";
+  els.batchPlaceholder.classList.remove("hidden");
+  try {
+    const response = await fetch(
+      `/v1/accounts/batches/${encodeURIComponent(batchState.id)}/files/${page}`);
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(body?.detail || `Could not load this report (HTTP ${response.status}).`);
+    batchState.reports.set(page, body);
+  } catch (error) {
+    els.batchPlaceholderText.textContent = error.message || "Could not load this report.";
+    return;
+  } finally {
+    batchState.loading = null;
+  }
+  if (batchState.page === page) showBatchPage();
 }
 
 function placeholderText(file) {

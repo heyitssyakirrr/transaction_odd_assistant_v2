@@ -16,10 +16,10 @@ from app.config import Settings
 from app.core.call_timing import CallMeasure
 from app.core.llm_work_queue import LlmWorkQueue
 from app.core.monthly_facts import (
-    PATTERN_LABELS, InactivityRun, Screening, activity_months_context, activity_six_month_context,
-    allowed_burst_gap_numbers, burst_gap_evidence_months, burst_gap_pair_facts, burst_gap_six_month_context,
+    PATTERN_LABELS, InactivityRun, Screening, activity_all_months_context, activity_months_context,
+    allowed_burst_gap_numbers, burst_gap_evidence_months, burst_gap_all_months_context, burst_gap_pair_facts,
     calendar_numbers, canonical_pattern, check_table, dormancy_rationale, find_inactivity_run, burst_guide_months,
-    has_in_month_gap, layering_context, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
+    has_in_month_gap, layering_context, months_label, no_inactivity_rationale, numbers_in_text, pattern_problem, quotable_numbers,
     RiskSignals, layering_months, risk_because, risk_signals, screening_risk, unmatched_month_name, unquotable_number,
     unusual_transaction_months,
 )
@@ -49,7 +49,7 @@ _CHECK_TITLES: dict[ReviewCheckName, str] = {
     "money_in_and_out": "Layering (money in and money out)",
     "burst_and_gaps": "Burst and gaps",
 }
-# CSV fields attached as evidence for the months the model selected (at most 18 items: 6 burst months x 3 fields).
+# CSV fields attached as evidence for the months selected (at most 3 per month: 36 items for 12 months).
 _EVIDENCE_FIELDS: dict[ReviewCheckName, tuple[str, ...]] = {
     "activity_and_amount_change": ("txn_count_monthly", "total_amount", "max_amount"),
     "money_in_and_out": ("monthly_credit", "monthly_debit"),
@@ -63,20 +63,21 @@ def _sentence_issue(text: str) -> str:
     """Why an explanation does not count as one, in plain words for staff."""
     return "Is a label, not a sentence: the AI wrote a pattern name or a few words instead of an explanation."
 _SAYS_NO_INACTIVITY = re.compile(r"\bno (?:inactive|quiet|dormant) period\b", re.IGNORECASE)
-# "No activity in the six months" when transactions exist (seen for one-transaction accounts).
+# "No activity in the six/12 months" when transactions exist (seen for one-transaction accounts).
 # Words the summary is told not to use when nothing was found (the risk is low); shown as an issue if used.
 _SUSPICION_WORDS = re.compile(r"money laundering|suspicious|suspicion|red flag", re.IGNORECASE)
 _FIT_VERDICTS = ("Fits the occupation:", "Does not fit the occupation:")
 _SAYS_NO_ACTIVITY = re.compile(
-    r"\bno (?:activity|transactions?|debit or credit flow|flow)\b[^.]{0,30}\bsix months\b", re.IGNORECASE)
+    r"\bno (?:activity|transactions?|debit or credit flow|flow)\b[^.]{0,30}\b(?:six|twelve|\d+)[- ]months?\b",
+    re.IGNORECASE)
 _SUMMARY_FIELD_NAMES = {
     "headline": "Headline", "point_1": "Point 1", "point_2": "Point 2", "point_3": "Point 3",
     "why_it_matters": "Why it matters", "occupation_fit": "Fit with occupation", "verify_1": "Verify 1", "verify_2": "Verify 2", "risk_reason": "Risk reason",
 }
 # Summary lines kept even when they are not a sentence: the summary cannot be shown without them.
 _SUMMARY_REQUIRED_FIELDS = ("headline", "risk_reason")
-# Burst and gaps may select any of the six months (Qwen often lists every quiet month).
-_MAX_BURST_MONTHS = 6
+# ReviewCheck.facts allows 400 characters; facts built from many months are cut at a word.
+_FACTS_LIMIT = 400
 
 # Phrases that mean the model gave no real answer. Judgement words are allowed: the
 # output supports the reviewer, who makes the decision.
@@ -313,7 +314,7 @@ class AnalysisService:
             found = _sentence_issues(key, text, retry_allowed=not final_attempt)
             found += self._text_issues(text, allowed_numbers, active_months, figures="the AI was given")
             if active_months and _SAYS_NO_ACTIVITY.search(text):
-                found.append("Says there was no activity in the six months, but transactions were recorded.")
+                found.append(f"Says there was no activity in the {months_label(monthly)}, but transactions were recorded.")
             issues[name] = self._log_issues(case_id, name, found)
         return self._with_issues(raw, issues)
 
@@ -362,7 +363,8 @@ class AnalysisService:
         updates: dict[str, Any] = {"burst_gaps_months": _NO_MONTHS, "burst_gaps_pattern": "none"}
         if raw.burst_gaps_outcome == "pattern_found":
             months = self._split_months(
-                raw.burst_gaps_months or "", "burst_gaps_months", min_count=1, max_count=_MAX_BURST_MONTHS)
+                # Any of the months may be selected (Qwen often lists every quiet month).
+                raw.burst_gaps_months or "", "burst_gaps_months", min_count=1, max_count=len(monthly))
             self._validate_transaction_months(months, self._known_months(catalog), "burst_and_gaps")
             pattern = canonical_pattern("burst_and_gaps", raw.burst_gaps_pattern)
             updates = {"burst_gaps_months": ",".join(months), "burst_gaps_pattern": pattern}
@@ -474,13 +476,13 @@ class AnalysisService:
         if not insight:
             issues = [*issues, "No AI description was produced; the finding and figures below are from the CSV."]
         if name == "activity_and_amount_change":
-            facts = activity_months_context(monthly, months) if months else activity_six_month_context(monthly)
+            facts = activity_months_context(monthly, months) if months else activity_all_months_context(monthly)
         else:
             facts = layering_context(monthly, months)
         return ReviewCheck(
             check=name, title=_CHECK_TITLES[name], outcome="pattern_found" if months else "no_pattern_found",
             pattern=_pattern_label(_SCREENED_PATTERNS[name]) if months else None, months=months,
-            insight=insight or None, issues=issues, facts=facts, table=self._table(name, monthly, months),
+            insight=insight or None, issues=issues, facts=_cap(facts, _FACTS_LIMIT), table=self._table(name, monthly, months),
             evidence=self._evidence_for_months(name, months, catalog),
         )
 
@@ -499,7 +501,7 @@ class AnalysisService:
             if run is None:
                 return ReviewCheck(
                     check=name, title=_CHECK_TITLES[name], outcome="no_pattern_found",
-                    facts=no_inactivity_rationale(self._settings.dormancy_min_zero_months),
+                    facts=no_inactivity_rationale(self._settings.dormancy_min_zero_months, len(monthly)),
                     table=self._table(name, monthly, []),
                 )
             run_months = self._run_months(run, monthly)
@@ -518,12 +520,13 @@ class AnalysisService:
             )
         if name == "burst_and_gaps":
             months = [] if raw.burst_gaps_outcome != "pattern_found" else raw.burst_gaps_months.split(",")
-            facts = burst_gap_pair_facts(monthly, months) if months else burst_gap_six_month_context(monthly)
+            facts = burst_gap_pair_facts(monthly, months) if months else burst_gap_all_months_context(monthly)
             evidence_months = months or burst_gap_evidence_months(monthly)
             return ReviewCheck(
                 check=name, title=_CHECK_TITLES[name], outcome=raw.burst_gaps_outcome,
                 pattern=_pattern_label(raw.burst_gaps_pattern), months=months,
-                insight=raw.burst_gaps_insight.strip() or None, issues=raw.issues.get(name, []), facts=facts,
+                insight=raw.burst_gaps_insight.strip() or None, issues=raw.issues.get(name, []),
+                facts=_cap(facts, _FACTS_LIMIT),
                 table=self._table(name, monthly, months),
                 evidence=self._evidence_for_months(name, evidence_months, catalog),
             )
@@ -696,7 +699,7 @@ class AnalysisService:
         decision: Decision = (
             "no_further_review_suggested" if complete and risk_level == "low" else "further_review_suggested"
         )
-        limitations = self._static_limitations()
+        limitations = self._static_limitations(len(request.monthly_summary))
         unverified = [check.title for check in checks if check.outcome == "not_verified"]
         if unverified:
             limitations.append(AssessmentLimitation(limitation=(
@@ -916,9 +919,10 @@ class AnalysisService:
         return [catalog[item_id] for item_id in ids]
 
     @staticmethod
-    def _static_limitations() -> list[AssessmentLimitation]:
+    def _static_limitations(months: int) -> list[AssessmentLimitation]:
         return [
-            AssessmentLimitation(limitation="Assessment uses only six monthly aggregates and factual linked customer-profile records."),
+            AssessmentLimitation(limitation=f"Assessment uses only {months} monthly aggregates and factual linked "
+                                            "customer-profile records."),
             AssessmentLimitation(limitation="LLM output is decision support and requires authorised human review."),
         ]
 

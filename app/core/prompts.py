@@ -6,7 +6,7 @@ from typing import Any
 from app.core.monthly_facts import (
     InactivityRun, RiskSignals, Screening, account_usual, account_usual_line, amount_facts, burst_gap_facts,
     burst_gap_note, findings_lines, inactivity_run_fact, risk_because, screening_risk, inactivity_summary_fact, layering_facts, layering_note,
-    profile_activity_focus, summary_month_lines, unusual_transaction_note,
+    months_label, profile_activity_focus, summary_month_lines, unusual_transaction_note,
 )
 
 
@@ -59,7 +59,7 @@ Definitions:
   A month is a burst month only when its burst_share is 25.0% or more. A burst_share below 25.0% is not a burst.
 - avg_gap_days: average number of days between transactions in the month. When gap_basis=since_previous the month has
   one transaction, and avg_gap_days is the number of days back to the previous transaction, which may be before the
-  six months shown. A large value there means a long quiet period before that transaction.
+  months shown. A large value there means a long quiet period before that transaction.
 - BURST_GUIDE: the burst months (burst_share 25.0% or more), already worked out from the BURST lines. "no month"
   means there is no burst.
 - GAP_GUIDE: the one-transaction months that came a long time after the previous transaction, already worked out.
@@ -92,7 +92,7 @@ OVERALL_SUMMARY_SYSTEM_PROMPT = """You are a senior AML due-diligence analyst wr
 staff read first. Staff use it to decide what to do next, so it must be specific, accurate, easy to read, and explain
 why each finding matters.
 
-Use only INPUT FACTS: the six MONTH rows, the FINDINGS and RISK_LEVEL lines, the evidence of each review check (CHECK
+Use only INPUT FACTS: the MONTH rows, the FINDINGS and RISK_LEVEL lines, the evidence of each review check (CHECK
 lines) and the customer profile. The screening found the FINDINGS and set RISK_LEVEL; explain them, never change them.
 Do not invent counterparties, payment purposes, source of funds or anything outside INPUT FACTS. Amounts are in RM:
 write RM 1,234.56, never $. Copy every month and amount exactly as written; do not calculate.
@@ -217,7 +217,8 @@ def _monthly_rows_input(monthly_summary: list[dict[str, Any]]) -> str:
         "|".join(str(row.get(field, "")) for field in _TRANSACTION_FIELDS)
         for row in monthly_summary
     )
-    return "INPUT FACTS — six monthly rows, oldest to newest. Do not copy them into the response.\n" + "\n".join(rows)
+    return (f"INPUT FACTS — {months_label(monthly_summary)} of monthly rows, oldest to newest. Do not copy them into "
+            "the response.\n" + "\n".join(rows))
 
 
 def activity_money_prompt(monthly_summary: list[dict[str, Any]], screening: Screening) -> str:
@@ -295,7 +296,8 @@ def overall_summary_input(
 ) -> str:
     """Call 4 input: the CSV rows, the screening's findings and risk, each check's evidence, and the profile."""
     return "\n".join((
-        "INPUT FACTS — six monthly rows from the CSV, oldest to newest. Amounts are already formatted; copy them exactly.",
+        f"INPUT FACTS — {months_label(monthly_summary)} of monthly rows, oldest to newest. Amounts are already "
+        "formatted; copy them exactly.",
         *summary_month_lines(monthly_summary),
         *findings_lines(signals),
         inactivity_summary_fact(inactivity_run, min_zero_months),

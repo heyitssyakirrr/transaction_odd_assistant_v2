@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 import pandas as pd
@@ -33,47 +34,66 @@ _REQUIRED_COLUMNS = [
 ]
 
 
-def parse_monthly_summary_csv(csv_content: str) -> list[MonthlySummaryRow]:
-    """Parse the analyst-uploaded 6-row monthly summary CSV for one account.
+def parse_monthly_summary_csv(csv_content: str, expected_months: int) -> list[MonthlySummaryRow]:
+    """Parse an analyst-uploaded monthly summary CSV for one account (``expected_months`` rows).
 
     Pure parsing: column presence/type validation and row construction only.
     No derived metrics, no scoring -- that's the LLM's job downstream.
     """
     reader = csv.DictReader(io.StringIO(csv_content))
-    fieldnames = [(name or "").strip().lower() for name in (reader.fieldnames or [])]
-    missing = [col for col in _REQUIRED_COLUMNS if col not in fieldnames]
-    if missing:
-        raise SummaryCsvError(f"CSV is missing required column(s): {', '.join(missing)}")
+    _check_columns(reader.fieldnames or [])
+    return _monthly_rows(reader, expected_months)
 
+
+def read_monthly_summary_parquet(path: Path, expected_months: int) -> list[MonthlySummaryRow]:
+    """Read one account's monthly summary from a Parquet file with the same 15 columns as the CSV.
+    Blocking I/O: call it from a thread."""
+    try:
+        table = pd.read_parquet(path)
+    except Exception as exc:  # pyarrow raises its own error types
+        raise SummaryCsvError(f"Could not read {path.name}: {exc}") from exc
+    _check_columns(list(table.columns))
+    return _monthly_rows(table.to_dict("records"), expected_months)
+
+
+def _check_columns(names: list[Any]) -> None:
+    present = {str(name or "").strip().lower() for name in names}
+    missing = [col for col in _REQUIRED_COLUMNS if col not in present]
+    if missing:
+        raise SummaryCsvError(f"The file is missing required column(s): {', '.join(missing)}")
+
+
+def _monthly_rows(records: Iterable[dict[Any, Any]], expected_months: int) -> list[MonthlySummaryRow]:
+    """Rows for one account, checked the same way for CSV and Parquet: valid values, one account,
+    exactly ``expected_months`` consecutive calendar months."""
     rows: list[MonthlySummaryRow] = []
-    for row_number, raw_row in enumerate(reader, start=1):
-        row = {(key or "").strip().lower(): value for key, value in raw_row.items()}
+    for row_number, raw_row in enumerate(records, start=1):
+        row = {str(key or "").strip().lower(): value for key, value in raw_row.items()}
         try:
             rows.append(
                 MonthlySummaryRow(
-                    acct_num=str(row["acct_num"]).strip(),
-                    year_month=str(row["year_month"]).strip(),
-                    txn_count_monthly=int(row["txn_count_monthly"]),
-                    pct_burst=float(row["pct_burst"]),
-                    total_amount=_decimal(row["total_amount"]),
-                    avg_amount=_decimal(row["avg_amount"]),
-                    std_amount=_decimal(row["std_amount"]),
-                    max_amount=_decimal(row["max_amount"]),
-                    #day_gaps=float(raw_row["day_gaps"]),
-                    pct_trx_gap=float(row["pct_trx_gap"]),
-                    monthly_debit=_decimal(row["monthly_debit"]),
-                    monthly_credit=_decimal(row["monthly_credit"]),
-                    debit_count_monthly=int(row["debit_count_monthly"]),
-                    credit_count_monthly=int(row["credit_count_monthly"]),
-                    monthly_avg_debit=_decimal(row["monthly_avg_debit"]),
-                    monthly_avg_credit=_decimal(row["monthly_avg_credit"]),
+                    acct_num=_text(row["acct_num"]),
+                    year_month=_text(row["year_month"]),
+                    txn_count_monthly=_int(row["txn_count_monthly"]),
+                    pct_burst=_float(row["pct_burst"], 4),
+                    total_amount=_money(row["total_amount"]),
+                    avg_amount=_money(row["avg_amount"]),
+                    std_amount=_money(row["std_amount"]),
+                    max_amount=_money(row["max_amount"]),
+                    pct_trx_gap=_float(row["pct_trx_gap"], 2),
+                    monthly_debit=_money(row["monthly_debit"]),
+                    monthly_credit=_money(row["monthly_credit"]),
+                    debit_count_monthly=_int(row["debit_count_monthly"]),
+                    credit_count_monthly=_int(row["credit_count_monthly"]),
+                    monthly_avg_debit=_money(row["monthly_avg_debit"]),
+                    monthly_avg_credit=_money(row["monthly_avg_credit"]),
                 )
             )
         except (KeyError, ValueError, InvalidOperation, TypeError) as exc:
             raise SummaryCsvError(f"Row {row_number}: {exc}") from exc
 
     if not rows:
-        raise SummaryCsvError("The CSV contains no monthly summary rows.")
+        raise SummaryCsvError("The file contains no monthly summary rows.")
 
     acct_nums = {row.acct_num for row in rows}
     if len(acct_nums) != 1:
@@ -82,17 +102,17 @@ def parse_monthly_summary_csv(csv_content: str) -> list[MonthlySummaryRow]:
         )
 
     rows = sorted(rows, key=lambda row: row.year_month)
-    if len(rows) != 6:
-        raise SummaryCsvError(f"Expected exactly 6 monthly rows; found {len(rows)}.")
-    expected_months = [_month_start(rows[0].year_month)]
-    for _ in range(5):
-        current = expected_months[-1]
-        expected_months.append(
+    if len(rows) != expected_months:
+        raise SummaryCsvError(f"Expected exactly {expected_months} monthly rows; found {len(rows)}.")
+    expected = [_month_start(rows[0].year_month)]
+    for _ in range(expected_months - 1):
+        current = expected[-1]
+        expected.append(
             current.replace(year=current.year + 1, month=1)
             if current.month == 12 else current.replace(month=current.month + 1)
         )
-    if [row.year_month for row in rows] != [month.strftime("%Y%m") for month in expected_months]:
-        raise SummaryCsvError("The 6 monthly rows must be consecutive calendar months.")
+    if [row.year_month for row in rows] != [month.strftime("%Y%m") for month in expected]:
+        raise SummaryCsvError(f"The {expected_months} monthly rows must be consecutive calendar months.")
     return rows
 
 
@@ -159,9 +179,38 @@ def generate_case_id(acct_num: str) -> str:
 
 def _decimal(value: Any) -> Decimal:
     try:
-        return Decimal(str(value).replace(",", "").strip())
+        number = Decimal(str(value).replace(",", "").strip())
     except (InvalidOperation, AttributeError) as exc:
         raise ValueError(f"invalid numeric value '{value}'") from exc
+    if not number.is_finite():  # an empty Parquet cell arrives as NaN
+        raise ValueError(f"invalid numeric value '{value}'")
+    return number
+
+
+# Values are rounded the same way whatever the source, so a CSV ("200", "2134.8333333333335") and a
+# Parquet file (200.0, 2134.833333333333) give the AI exactly the same figures.
+def _money(value: Any) -> Decimal:
+    """An amount in RM, to the cent."""
+    return _decimal(value).quantize(Decimal("0.01"))
+
+
+def _float(value: Any, places: int) -> float:
+    """A rate: pct_burst to 4 places (0.1% steps when shown as a percentage), gaps in days to 2."""
+    return float(_decimal(value).quantize(Decimal(1).scaleb(-places)))
+
+
+def _int(value: Any) -> int:
+    """A count; 12.0 from a Parquet float column is 12, 12.5 is an error."""
+    number = _decimal(value)
+    if number != number.to_integral_value():
+        raise ValueError(f"invalid count '{value}'")
+    return int(number)
+
+
+def _text(value: Any) -> str:
+    """An identifier such as acct_num or year_month; 202604.0 from a Parquet float column is 202604."""
+    text = str(value).strip()
+    return text[:-2] if re.fullmatch(r"\d+\.0", text) else text
 
 
 def _month_start(year_month: str) -> datetime:
