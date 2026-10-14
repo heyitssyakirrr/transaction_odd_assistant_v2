@@ -2,9 +2,11 @@
 
 The folder is fixed in .env (ACCOUNT_FOLDER_PATH); staff choose only a range of accounts and
 which citizenship. A scan reads each file's account number from its Parquet footer (no data),
-several files at a time, and three columns of customer_info. The result is kept until a file
-in the folder or customer_info changes, so opening the folder tab again, or starting a run,
-does not scan again. The full monthly rows are read only when an account's turn comes.
+several files at a time, and four columns of customer_info. Accounts without a usable
+occupation (no profile, no code, or a code not in the occupation list) are left out: the
+summary's occupation judgement needs one. The result is kept until a file in the folder,
+customer_info or the occupation list changes, so opening the folder tab again, or starting a
+run, does not scan again. The full monthly rows are read only when an account's turn comes.
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from typing import Literal
 import pandas as pd
 import pyarrow.parquet as pq
 
-from app.core.reference_data import normalise_code
+from app.core.reference_data import has_occupation_label, normalise_code, occupation_code, occupation_list_size
 
 logger = logging.getLogger("app.account_folder")
 
@@ -35,19 +37,30 @@ class AccountFolderError(RuntimeError):
 class FolderAccount:
     path: Path
     acct_num: str
-    # CITIZEN_CD of the account's latest customer_info version, e.g. "MY"; None without a profile.
+    # From the account's latest customer_info version: CITIZEN_CD (e.g. "MY") and OCCUPATION_CD.
     citizen_cd: str | None
+    occupation_cd: str | None
+
+
+# Why an account is left out of every choice, as shown to staff.
+NO_PROFILE = "no customer profile"
+NO_OCCUPATION = "no occupation code"
+UNKNOWN_OCCUPATION = "occupation code not in the occupation list"
 
 
 @dataclass
 class FolderScan:
     folder: Path
+    # Accounts that can be analysed (they have a usable occupation), in file-name order.
     accounts: list[FolderAccount] = field(default_factory=list)
+    # Accounts left out, with the reason (see NO_PROFILE and the others).
+    left_out: list[tuple[FolderAccount, str]] = field(default_factory=list)
     # (file name, reason) for files whose account number could not be read.
     unreadable: list[tuple[str, str]] = field(default_factory=list)
 
     def matching(self, choice: CitizenshipChoice, malaysian_code: str) -> list[FolderAccount]:
-        """Accounts for a citizenship choice, in file-name order. Without a profile: only under "all"."""
+        """Accounts for a citizenship choice, in file-name order; an account with no citizenship
+        code is only under "all"."""
         if choice == "all":
             return list(self.accounts)
         malaysian = choice == "malaysian"
@@ -60,9 +73,9 @@ class FolderScan:
     def summary(self, malaysian_code: str) -> dict[str, object]:
         return {
             "folder": str(self.folder),
-            "total_files": len(self.accounts) + len(self.unreadable),
+            "total_files": len(self.accounts) + len(self.left_out) + len(self.unreadable),
             "counts": {choice: len(self.matching(choice, malaysian_code)) for choice in CITIZENSHIP_CHOICES},
-            "no_profile": sum(account.citizen_cd is None for account in self.accounts),
+            "left_out": dict(Counter(reason for _, reason in self.left_out)),
             # The codes behind the counts, so a code that is not the Malaysian one is visible on the page.
             "citizen_codes": dict(Counter(account.citizen_cd for account in self.accounts
                                           if account.citizen_cd is not None).most_common(6)),
@@ -77,19 +90,24 @@ _cache_lock = threading.Lock()
 _cache: tuple[tuple, FolderScan] | None = None
 
 
-def scan_folder(folder: Path, customer_info_path: Path) -> FolderScan:
-    """Every *.parquet file in ``folder`` (not subfolders), sorted by name, with its account and
-    citizenship. Reuses the previous scan when no file in the folder and not customer_info has
-    changed (same names, sizes and modification times). Blocking I/O: call it from a thread."""
+def scan_folder(folder: Path, customer_info_path: Path, occupation_list_path: Path) -> FolderScan:
+    """Every *.parquet file in ``folder`` (not subfolders), sorted by name, with its account,
+    citizenship and occupation. Reuses the previous scan when no file in the folder, customer_info
+    or the occupation list has changed (same names, sizes and modification times). Blocking I/O:
+    call it from a thread."""
     global _cache
     if not folder.is_dir():
         raise AccountFolderError(f"The account folder {folder} does not exist or is not a folder.")
+    if not occupation_list_size(occupation_list_path):
+        # Without the list every occupation would look unknown and every account would be left out.
+        raise AccountFolderError(
+            f"The occupation list was not found or is empty at {occupation_list_path} (OCCUPATION_CODE_CSV_PATH).")
     paths = sorted(folder.glob("*.parquet"), key=lambda item: item.name)
-    key = (str(folder), str(customer_info_path), _fingerprint(paths), _fingerprint([customer_info_path]))
+    key = (str(folder), _fingerprint(paths), _fingerprint([customer_info_path, occupation_list_path]))
     with _cache_lock:  # one scan at a time; a second request waits and reuses it
         if _cache is not None and _cache[0] == key:
             return _cache[1]
-        scan = _scan(folder, customer_info_path, paths)
+        scan = _scan(folder, customer_info_path, occupation_list_path, paths)
         _cache = (key, scan)
         return scan
 
@@ -106,7 +124,7 @@ def _fingerprint(paths: list[Path]) -> tuple:
     return tuple(stats)
 
 
-def _scan(folder: Path, customer_info_path: Path, paths: list[Path]) -> FolderScan:
+def _scan(folder: Path, customer_info_path: Path, occupation_list_path: Path, paths: list[Path]) -> FolderScan:
     scan = FolderScan(folder=folder)
     found: list[tuple[Path, str]] = []
 
@@ -122,12 +140,20 @@ def _scan(folder: Path, customer_info_path: Path, paths: list[Path]) -> FolderSc
                 scan.unreadable.append((path.name, problem or "unreadable"))
             else:
                 found.append((path, acct))
-    citizenship = latest_citizenship(customer_info_path, {acct for _, acct in found})
-    scan.accounts = [FolderAccount(path, acct, citizenship.get(acct)) for path, acct in found]
+    profiles = latest_profiles(customer_info_path, {acct for _, acct in found})
+    for path, acct in found:
+        citizen_cd, occupation_cd = profiles.get(acct, (None, None))
+        account = FolderAccount(path, acct, citizen_cd, occupation_cd)
+        reason = (NO_PROFILE if acct not in profiles else NO_OCCUPATION if occupation_cd is None
+                  else None if has_occupation_label(occupation_cd, occupation_list_path) else UNKNOWN_OCCUPATION)
+        if reason is None:
+            scan.accounts.append(account)
+        else:
+            scan.left_out.append((account, reason))
     logger.info(
-        "Account folder scanned: folder=%s files=%d unreadable=%d with_profile=%d citizen_codes=%s",
-        folder, len(found) + len(scan.unreadable), len(scan.unreadable), len(citizenship),
-        dict(Counter(citizenship.values()).most_common(6)),
+        "Account folder scanned: folder=%s files=%d usable=%d left_out=%s unreadable=%d citizen_codes=%s",
+        folder, len(paths), len(scan.accounts), dict(Counter(reason for _, reason in scan.left_out)),
+        len(scan.unreadable), dict(Counter(account.citizen_cd for account in scan.accounts).most_common(6)),
     )
     return scan
 
@@ -161,23 +187,27 @@ def _single_value_in_footer(parquet: pq.ParquetFile, column_index: int) -> str |
     return values.pop() if len(values) == 1 else None
 
 
-def latest_citizenship(customer_info_path: Path, acct_nums: set[str]) -> dict[str, str]:
-    """CITIZEN_CD of each account's latest profile version (by VALID_FROM_DTTM), as plain upper-case
-    text (see normalise_code); accounts with no profile or no citizenship are left out. Reads three
-    columns of customer_info, once."""
+def latest_profiles(customer_info_path: Path, acct_nums: set[str]) -> dict[str, tuple[str | None, str | None]]:
+    """(CITIZEN_CD, OCCUPATION_CD) of each account's latest profile version by VALID_FROM_DTTM, the
+    version the analysis reads too, cleaned like the analysis cleans them. Accounts not in
+    customer_info are left out. Reads four columns of customer_info, once."""
     if not acct_nums:
         return {}
     try:
-        table = pd.read_parquet(customer_info_path, columns=["ACCT_NUM", "CITIZEN_CD", "VALID_FROM_DTTM"])
+        table = pd.read_parquet(customer_info_path,
+                                columns=["ACCT_NUM", "CITIZEN_CD", "OCCUPATION_CD", "VALID_FROM_DTTM"])
     except FileNotFoundError as exc:
         raise AccountFolderError(f"customer_info parquet not found at {customer_info_path}") from exc
     except Exception as exc:  # pyarrow raises its own error types
         raise AccountFolderError(f"Could not read customer_info parquet: {exc}") from exc
     table = table.assign(ACCT_NUM=table["ACCT_NUM"].map(_identifier))
     table = table[table["ACCT_NUM"].isin(acct_nums)]
-    table = table.assign(CITIZEN_CD=table["CITIZEN_CD"].map(normalise_code)).dropna(subset=["CITIZEN_CD"])
-    latest = table.sort_values("VALID_FROM_DTTM").groupby("ACCT_NUM").tail(1)
-    return dict(zip(latest["ACCT_NUM"], latest["CITIZEN_CD"]))
+    # The analysis skips versions without a start date (load_customer_profile), so this does too.
+    latest = table.dropna(subset=["VALID_FROM_DTTM"]).sort_values("VALID_FROM_DTTM").groupby("ACCT_NUM").tail(1)
+    return {
+        acct: (normalise_code(citizen), occupation_code(occupation))
+        for acct, citizen, occupation in zip(latest["ACCT_NUM"], latest["CITIZEN_CD"], latest["OCCUPATION_CD"])
+    }
 
 
 def _identifier(value: object) -> str:

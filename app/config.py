@@ -40,7 +40,9 @@ class Settings:
     # header, and a load balancer's sticky-session cookie pins every later request to one
     # server, which then answers calls 1-3 one after another (seen in the 2026-10-12 logs).
     llm_keep_cookies: bool = os.getenv("LLM_KEEP_COOKIES", "false").lower() == "true"
-    llm_concurrency: int = int(os.getenv("LLM_CONCURRENCY", "3"))
+    # Most LLM calls in flight at once, across all accounts. Each account sends up to 3 at once
+    # (calls 1-3), so set it to BATCH_ACCOUNT_CONCURRENCY x 3; less makes accounts wait in the app.
+    llm_concurrency: int = int(os.getenv("LLM_CONCURRENCY", "9"))
     # Set this to the model's confirmed total context window. Zero disables
     # local preflight validation when the platform does not expose that value.
     llm_context_window_tokens: int = int(os.getenv("LLM_CONTEXT_WINDOW_TOKENS", "0"))
@@ -56,6 +58,8 @@ class Settings:
     batch_max_files: int = int(os.getenv("BATCH_MAX_FILES", "20"))
     # Finished batches kept in memory for the results page (cleared on restart).
     batch_keep_recent: int = int(os.getenv("BATCH_KEEP_RECENT", "20"))
+    # Accounts of a batch analysed at the same time (one per LLM pod keeps every pod busy).
+    batch_account_concurrency: int = int(os.getenv("BATCH_ACCOUNT_CONCURRENCY", "3"))
     customer_info_parquet_path: str = os.getenv(
         "CUSTOMER_INFO_PARQUET_PATH",
         str(BASE_DIR / "data" / "customer_info.parquet"), 
@@ -158,6 +162,7 @@ class Settings:
             "LLM_QUEUE_ENQUEUE_TIMEOUT_SECONDS": self.llm_queue_enqueue_timeout_seconds,
             "BATCH_MAX_FILES": self.batch_max_files,
             "BATCH_KEEP_RECENT": self.batch_keep_recent,
+            "BATCH_ACCOUNT_CONCURRENCY": self.batch_account_concurrency,
             "MAX_RESPONSE_TOKENS": self.max_response_tokens,
             "LLM_TRANSACTION_MAX_RESPONSE_TOKENS": self.llm_transaction_max_response_tokens,
             "LLM_PROFILE_CONTEXT_MAX_RESPONSE_TOKENS": self.llm_profile_context_max_response_tokens,
@@ -223,6 +228,11 @@ class Settings:
     def customer_info_path(self) -> Path:
         path = Path(self.customer_info_parquet_path)
         return path if path.is_absolute() else BASE_DIR / path
+
+    @property
+    def llm_calls_needed(self) -> int:
+        """LLM_CONCURRENCY at which no account's calls wait in the app: 3 calls per account at once."""
+        return self.batch_account_concurrency * 3
 
     @property
     def account_folder(self) -> Path | None:

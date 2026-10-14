@@ -5,7 +5,7 @@
 // five, from 6 to 10 the next five. They are queued as one batch and followed on the
 // same results page as an upload.
 
-const SECONDS_PER_ACCOUNT = 80; // rough guide from UAT runs, for the time estimate only
+const SECONDS_PER_ACCOUNT = 80; // rough guide from UAT runs (one account at a time), for the estimate only
 const DEFAULT_RANGE_SIZE = 5;   // a small first run; change "To account" for more
 
 const folderEls = {
@@ -20,6 +20,7 @@ const folderEls = {
   end: document.querySelector("#range-end"),
   countHint: document.querySelector("#count-hint"),
   citizenCodes: document.querySelector("#citizen-codes"),
+  leftOut: document.querySelector("#left-out"),
   unreadable: document.querySelector("#folder-unreadable"),
   error: document.querySelector("#folder-error"),
   submit: document.querySelector("#folder-submit"),
@@ -58,15 +59,21 @@ async function loadFolder() {
     if (!response.ok) throw new Error(body?.detail || `Could not read the folder (HTTP ${response.status}).`);
     folderState.summary = body;
     folderEls.path.textContent = body.folder;
-    folderEls.total.textContent = `${body.total_files} (${body.review_months} months each expected)`;
+    folderEls.total.textContent = `${body.total_files} (${body.review_months} months each expected), `
+      + `${body.counts.all} with an occupation`;
     for (const [choice, count] of Object.entries(body.counts)) {
       document.querySelector(`#count-${choice}`).textContent = `(${count})`;
     }
     const codes = Object.entries(body.citizen_codes || {});
     folderEls.citizenCodes.textContent = (codes.length
       ? `Codes found: ${codes.map(([code, count]) => `${code} ${count}`).join(" · ")}. Malaysian = ${body.malaysian_code}.`
-      : "No citizenship code was found for these accounts in customer_info.")
-      + (body.no_profile ? ` ${body.no_profile} account(s) have no customer profile.` : "");
+      : "No citizenship code was found for these accounts in customer_info.");
+    // Accounts without a usable occupation are not in any choice: the summary judges fit with it.
+    const leftOut = Object.entries(body.left_out || {});
+    folderEls.leftOut.textContent = leftOut.length
+      ? `Left out (not in any choice): ${leftOut.map(([reason, count]) => `${count} with ${reason}`).join(" · ")}.`
+      : "";
+    folderEls.leftOut.classList.toggle("hidden", !leftOut.length);
     if (body.unreadable.length) {
       folderEls.unreadable.textContent = `${body.unreadable.length} file(s) could not be read and are left out: `
         + body.unreadable.slice(0, 5).map((item) => `${item.file} (${item.reason})`).join("; ")
@@ -105,7 +112,8 @@ function updateRange(reset) {
   } else {
     const count = end - start + 1;
     folderEls.countHint.textContent = `Matching files ${start} to ${end} of ${available}, by file name: `
-      + `${count} account${count === 1 ? "" : "s"}, about ${duration(count * SECONDS_PER_ACCOUNT)} at one account at a time.`;
+      + `${count} account${count === 1 ? "" : "s"}, about ${duration(estimateSeconds(count))} `
+      + `with ${accountsAtOnce()} account${accountsAtOnce() === 1 ? "" : "s"} at a time.`;
   }
   clearFolderError();
 }
@@ -115,6 +123,16 @@ function chosenRange() {
     start: Number.parseInt(folderEls.start.value, 10),
     end: Number.parseInt(folderEls.end.value, 10),
   };
+}
+
+function accountsAtOnce() {
+  return Math.max(1, folderState.summary?.accounts_at_once ?? 1);
+}
+
+// Accounts run in rounds of accountsAtOnce(); a round takes about one account's time. A rough guide:
+// shared pods make each account a little slower than when it runs alone.
+function estimateSeconds(count) {
+  return Math.ceil(count / accountsAtOnce()) * SECONDS_PER_ACCOUNT;
 }
 
 function duration(seconds) {

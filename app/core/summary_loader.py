@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 
 from app.core.models import CustomerProfileRecord, MonthlySummaryRow
-from app.core.reference_data import normalise_code
+from app.core.reference_data import normalise_code, occupation_code
 
 logger = logging.getLogger("app.summary_loader")
 
@@ -157,7 +157,7 @@ def load_customer_profile(parquet_path: Path, acct_num: str) -> list[CustomerPro
             CustomerProfileRecord(
                 acct_num=str(row.get("ACCT_NUM")),
                 customer_num=str(row.get("CUSTOMER_NUM")),
-                occupation_cd=_optional_code(row.get("OCCUPATION_CD")),
+                occupation_cd=occupation_code(row.get("OCCUPATION_CD")),
                 # Same cleaning as the folder filter, so b'MY' / 'MY\x00' reads as Malaysia for the AI too.
                 citizen_cd=normalise_code(row.get("CITIZEN_CD")),
                 indv_org_type=_optional_str(row.get("INDV_ORG_TYPE")),
@@ -242,18 +242,3 @@ def _optional_str(value: Any) -> str | None:
     text = str(value).strip()
     return text or None
 
-
-def _optional_code(value: Any) -> str | None:
-    """Preserve reference-code semantics when Parquet exposes nullable numerics.
-
-    Pandas may represent a code such as 12 as 12.0 when the column contains
-    nulls. The occupation reference CSV stores `12`, so normalise only this
-    numeric artefact while leaving genuine string codes (including leading
-    zeroes) unchanged.
-    """
-    text = _optional_str(value)
-    if text is None:
-        return None
-    if re.fullmatch(r"[+-]?\d+\.0+", text):
-        return text.split(".", 1)[0]
-    return text

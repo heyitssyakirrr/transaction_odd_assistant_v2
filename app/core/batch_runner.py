@@ -1,9 +1,11 @@
-"""Runs a batch of accounts one at a time, in order.
+"""Runs batches of accounts, a few accounts at a time, started in order.
 
 A batch is either uploaded CSV files or accounts read from the server folder. Files wait
-here, in the application, and one worker analyses one account at a time. Each account's
-calls still go through the shared LLM queue, so the number of calls in flight to the
-loader can never exceed LLM_CONCURRENCY.
+here, in the application; BATCH_ACCOUNT_CONCURRENCY workers each analyse one account at a
+time, taking the next file in order when they finish. Running several accounts at once keeps
+all the LLM pods busy: one account alone leaves the others idle, above all during its summary
+call. Each account's calls still go through the shared LLM queue, so the number of calls in
+flight to the loader can never exceed LLM_CONCURRENCY (set it to accounts x 3).
 
 A folder file is read only when its turn comes, so a batch of 400 accounts holds no file
 contents in memory. The status poll returns statuses only; each finished report is fetched
@@ -66,6 +68,8 @@ class Batch:
     expected_risk: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     results_csv: str | None = None
+    # How many accounts the runner analyses at once, for the results page's wording.
+    accounts_at_once: int = 1
 
     def as_dict(self) -> dict[str, Any]:
         """Statuses only: a report is fetched with file_result, once, when its page is shown."""
@@ -80,6 +84,7 @@ class Batch:
             "counts": counts,
             "finished": counts["queued"] == counts["analysing"] == 0,
             "results_csv": self.results_csv,
+            "accounts_at_once": self.accounts_at_once,
             "files": [
                 {"position": index, "filename": item.filename, "status": item.status, "error": item.error}
                 for index, item in enumerate(self.files, start=1)
@@ -93,61 +98,79 @@ class Batch:
         return self.files[position - 1].result
 
 
-class BatchRunner:
-    """One worker, so accounts are analysed strictly one after another across all batches."""
+@dataclass(frozen=True)
+class _Job:
+    batch: Batch
+    position: int
+    item: BatchFile
 
-    def __init__(self, analyse: Analyse, *, max_kept_batches: int, on_file_done: FileDone | None = None) -> None:
+
+class BatchRunner:
+    """``account_workers`` workers share one queue of files, so accounts start in upload/list order
+    and at most ``account_workers`` are analysed at once, across all batches."""
+
+    def __init__(
+        self, analyse: Analyse, *, max_kept_batches: int, on_file_done: FileDone | None = None,
+        account_workers: int = 1,
+    ) -> None:
         if max_kept_batches < 1:
             raise ValueError("max_kept_batches must be at least 1")
+        if account_workers < 1:
+            raise ValueError("account_workers must be at least 1")
         self._analyse = analyse
         self._on_file_done = on_file_done
         self._max_kept = max_kept_batches
+        self._account_workers = account_workers
         self._batches: OrderedDict[str, Batch] = OrderedDict()
-        self._queue: asyncio.Queue[Batch] = asyncio.Queue()
-        self._worker: asyncio.Task[None] | None = None
+        self._queue: asyncio.Queue[_Job] = asyncio.Queue()
+        self._workers: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
-        if self._worker is None:
-            self._worker = asyncio.create_task(self._run(), name="batch-runner")
-            logger.info("Batch runner started: one account at a time")
+        if not self._workers:
+            self._workers = [asyncio.create_task(self._run(number), name=f"batch-worker-{number}")
+                             for number in range(1, self._account_workers + 1)]
+            logger.info("Batch runner started: %d account(s) at a time", self._account_workers)
 
     async def close(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
-            self._worker = None
+        for worker in self._workers:
+            worker.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        if self._workers:
             logger.info("Batch runner stopped")
+        self._workers = []
 
     def submit(self, files: list[BatchFile], *, source: BatchSource = "upload",
                expected_risk: str | None = None) -> Batch:
-        batch = Batch(batch_id=uuid4().hex, files=files, source=source, expected_risk=expected_risk or None)
+        batch = Batch(batch_id=uuid4().hex, files=files, source=source, expected_risk=expected_risk or None,
+                      accounts_at_once=self._account_workers)
         self._batches[batch.batch_id] = batch
         while len(self._batches) > self._max_kept:
             self._batches.popitem(last=False)
-        self._queue.put_nowait(batch)
-        logger.info("Batch queued: batch=%s source=%s files=%d batches_waiting=%d",
+        for position, item in enumerate(files, start=1):
+            self._queue.put_nowait(_Job(batch, position, item))
+        logger.info("Batch queued: batch=%s source=%s files=%d files_waiting=%d",
                     batch.batch_id, source, len(files), self._queue.qsize())
         return batch
 
     def get(self, batch_id: str) -> Batch | None:
         return self._batches.get(batch_id)
 
-    async def _run(self) -> None:
+    async def _run(self, worker: int) -> None:
         while True:
-            batch = await self._queue.get()
+            job = await self._queue.get()
             try:
-                for position, item in enumerate(batch.files, start=1):
-                    if item.status == "queued":
-                        await self._analyse_file(batch, position, item)
-                    elif item.status == "failed":  # rejected at upload: still recorded in the results CSV
-                        await self._file_done(batch, position, item)
+                if job.item.status == "queued":
+                    await self._analyse_file(worker, job)
+                elif job.item.status == "failed":  # rejected at upload: still recorded in the results CSV
+                    await self._file_done(job)
             finally:
                 self._queue.task_done()
 
-    async def _analyse_file(self, batch: Batch, position: int, item: BatchFile) -> None:
+    async def _analyse_file(self, worker: int, job: _Job) -> None:
+        batch, position, item = job.batch, job.position, job.item
         item.status = "analysing"
-        logger.info("Batch file started: batch=%s file=%d/%d name=%s",
-                    batch.batch_id, position, len(batch.files), item.filename)
+        logger.info("Batch file started: batch=%s worker=%d file=%d/%d name=%s",
+                    batch.batch_id, worker, position, len(batch.files), item.filename)
         try:
             item.result = await self._analyse(item)
         except FileAnalysisError as exc:
@@ -157,14 +180,15 @@ class BatchRunner:
             item.fail("An unexpected error occurred while analysing this file.")
         else:
             item.status, item.content = "done", None
-        logger.info("Batch file finished: batch=%s file=%d/%d name=%s status=%s",
-                    batch.batch_id, position, len(batch.files), item.filename, item.status)
-        await self._file_done(batch, position, item)
+        logger.info("Batch file finished: batch=%s worker=%d file=%d/%d name=%s status=%s",
+                    batch.batch_id, worker, position, len(batch.files), item.filename, item.status)
+        await self._file_done(job)
 
-    async def _file_done(self, batch: Batch, position: int, item: BatchFile) -> None:
+    async def _file_done(self, job: _Job) -> None:
         if self._on_file_done is None:
             return
         try:
-            await self._on_file_done(batch, position, item)
+            await self._on_file_done(job.batch, job.position, job.item)
         except Exception:  # the results CSV must never stop the analysis
-            logger.exception("Could not record a finished file: batch=%s name=%s", batch.batch_id, item.filename)
+            logger.exception("Could not record a finished file: batch=%s name=%s",
+                             job.batch.batch_id, job.item.filename)

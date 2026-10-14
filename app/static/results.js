@@ -141,7 +141,7 @@ function showBatchPage() {
   els.batchProgress.textContent = data.finished
     ? `All ${data.total} files finished: ${counts.done} ready, ${counts.failed} failed.`
     : `${counts.done} ready \u00b7 ${counts.analysing} analysing \u00b7 ${counts.queued} waiting \u00b7 ${counts.failed} failed. `
-      + "Files are analysed one at a time.";
+      + atATime(data.accounts_at_once);
   els.batchProgress.classList.remove("hidden");
   if (data.results_csv) {
     els.batchResultsLink.href = `/v1/accounts/batches/${encodeURIComponent(data.batch_id)}/results.csv`;
@@ -195,7 +195,12 @@ async function loadReport(page) {
 function placeholderText(file) {
   if (file.status === "failed") return `This file could not be analysed: ${file.error}`;
   if (file.status === "analysing") return "Analysing this account now. This usually takes a few minutes; the report appears here when it is ready.";
-  return "Waiting in the queue. Files are analysed one at a time, so this one starts after the files before it.";
+  return `Waiting in the queue. ${atATime(batchState.data?.accounts_at_once)} This one starts when the files before it have started.`;
+}
+
+function atATime(accounts) {
+  const count = Math.max(1, accounts ?? 1);
+  return count === 1 ? "Files are analysed one at a time." : `Files are analysed ${count} at a time, in order.`;
 }
 
 function showBatchError(message) {

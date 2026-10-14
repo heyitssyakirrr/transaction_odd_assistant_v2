@@ -12,6 +12,7 @@ the payload stays small regardless of how large the CSV grows.
 
 import csv
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -93,6 +94,34 @@ def normalise_code(value: object) -> str | None:
         pass
     text = str(value).replace("\x00", "").strip().upper()
     return text or None
+
+
+def occupation_code(value: object) -> str | None:
+    """An occupation code as the reference CSV writes it. Keeps leading zeros ("012"); a nullable
+    numeric column's 12.0 becomes "12"; bytes and NUL/space padding are cleaned like normalise_code."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", errors="replace")
+    try:
+        if value != value:  # NaN
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).replace("\x00", "").strip()
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    return text or None
+
+
+def has_occupation_label(code: str | None, csv_path: Path | str) -> bool:
+    """True when the code is in the occupation reference CSV, so the AI is given a real occupation."""
+    return code is not None and code in _load_occupation_map(str(csv_path))
+
+
+def occupation_list_size(csv_path: Path | str) -> int:
+    """How many codes the occupation reference CSV holds; 0 when it is missing or unreadable."""
+    return len(_load_occupation_map(str(csv_path)))
 
 
 def resolve_citizenship(code: str | None) -> str | None:

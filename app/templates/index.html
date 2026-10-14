@@ -25,8 +25,8 @@
       <p class="upload-hero-lead">
         Upload 12-month monthly summaries, one CSV per account, or read accounts straight
         from the server folder. Linked customer profile history is joined automatically.
-        Accounts are analysed one at a time, and you can page through each report as soon
-        as it is ready.
+        Accounts are analysed a few at a time, in order, and you can page through each report
+        as soon as it is ready.
       </p>
     </section>
 
@@ -62,8 +62,9 @@
               <label class="choice"><input type="radio" name="citizenship" value="all">
                 <span>All (mixed) <em id="count-all"></em></span></label>
             </div>
-            <p class="field-hint">From CITIZEN_CD of each account's latest customer profile. Accounts with no profile are only in "All".</p>
+            <p class="field-hint">From CITIZEN_CD of each account's latest customer profile. Only accounts with an occupation are listed.</p>
             <p id="citizen-codes" class="field-hint"></p>
+            <p id="left-out" class="field-hint hidden"></p>
           </fieldset>
 
           <div class="range-fields">

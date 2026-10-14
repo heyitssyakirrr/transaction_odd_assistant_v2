@@ -179,7 +179,8 @@ def build_router(
         if folder is None:
             raise HTTPException(status_code=404, detail="Reading from a folder is not set up (ACCOUNT_FOLDER_PATH).")
         try:
-            return await asyncio.to_thread(scan_folder, folder, settings.customer_info_path)
+            return await asyncio.to_thread(
+                scan_folder, folder, settings.customer_info_path, settings.occupation_code_path)
         except AccountFolderError as exc:
             logger.error("Account folder scan failed: %s", exc)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -188,7 +189,8 @@ def build_router(
     async def folder_summary() -> dict:
         """What the folder holds: files, and how many accounts match each citizenship choice."""
         return {**(await scan()).summary(settings.malaysian_citizen_cd), "review_months": settings.review_months,
-                "malaysian_code": settings.malaysian_citizen_cd}
+                "malaysian_code": settings.malaysian_citizen_cd,
+                "accounts_at_once": settings.batch_account_concurrency}
 
     @router.post("/folder-batches", status_code=202)
     async def create_folder_batch(request: FolderBatchRequest) -> dict:

@@ -38,11 +38,18 @@ if not settings.llm_base_url:
     )
 else:
     logger.info(
-        "LLM loader configured: %s (model=%s, concurrency=%s, helper_id=%s)",
+        "LLM loader configured: %s (model=%s, concurrency=%s, accounts_at_once=%s, helper_id=%s)",
         settings.chat_url,
         settings.llm_model,
         settings.llm_concurrency,
+        settings.batch_account_concurrency,
         "set" if settings.helper_id else "not set",
+    )
+if settings.llm_concurrency < settings.llm_calls_needed:
+    logger.warning(
+        "LLM_CONCURRENCY=%d is below BATCH_ACCOUNT_CONCURRENCY x 3 = %d: accounts will wait in the app "
+        "for an LLM slot instead of keeping every pod busy. Set LLM_CONCURRENCY=%d.",
+        settings.llm_concurrency, settings.llm_calls_needed, settings.llm_calls_needed,
     )
 
 llm_client = OpenAICompatibleClient(settings)
@@ -58,6 +65,7 @@ analyser = UploadAnalyser(service, report_store, settings.customer_info_path, se
 results_log = BatchResultsLog(settings.batch_results_path)
 batch_runner = BatchRunner(
     analyser.analyse_for_batch, max_kept_batches=settings.batch_keep_recent, on_file_done=results_log.record,
+    account_workers=settings.batch_account_concurrency,
 )
 
 app = FastAPI(

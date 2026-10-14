@@ -1,8 +1,9 @@
 """One CSV per batch with a row per finished account, written as each account finishes.
 
 It answers the folder test directly: the rule-based program called every account high risk;
-what did this assessment find? Rows are appended as accounts finish, so the results of a
-long run survive an application restart. The expected risk is written here only; it is
+what did this assessment find? Rows are appended as accounts finish (several accounts run at
+once, so rows are in finishing order; position and list_position give the list order), so the
+results of a long run survive an application restart. The expected risk is written here only; it is
 never part of what the LLM sees.
 """
 from __future__ import annotations
@@ -23,6 +24,8 @@ COLUMNS = (
 class BatchResultsLog:
     def __init__(self, directory: Path) -> None:
         self._directory = directory
+        # Several accounts can finish at the same moment; one row is written at a time.
+        self._write_lock = asyncio.Lock()
 
     def path_for(self, batch: Batch) -> Path:
         return self._directory / f"{batch.created_at.strftime('%Y%m%d-%H%M%S')}-{batch.batch_id[:12]}.csv"
@@ -36,7 +39,8 @@ class BatchResultsLog:
         batch.results_csv = path.name
 
     async def record(self, batch: Batch, position: int, item: BatchFile) -> None:
-        await asyncio.to_thread(self._append, batch, position, item)
+        async with self._write_lock:
+            await asyncio.to_thread(self._append, batch, position, item)
 
     def _append(self, batch: Batch, position: int, item: BatchFile) -> None:
         with self.path_for(batch).open("a", newline="", encoding="utf-8") as handle:
