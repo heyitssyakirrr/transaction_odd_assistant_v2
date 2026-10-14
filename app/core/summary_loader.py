@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 
 from app.core.models import CustomerProfileRecord, MonthlySummaryRow
+from app.core.reference_data import normalise_code
 
 logger = logging.getLogger("app.summary_loader")
 
@@ -157,7 +158,8 @@ def load_customer_profile(parquet_path: Path, acct_num: str) -> list[CustomerPro
                 acct_num=str(row.get("ACCT_NUM")),
                 customer_num=str(row.get("CUSTOMER_NUM")),
                 occupation_cd=_optional_code(row.get("OCCUPATION_CD")),
-                citizen_cd=_optional_str(row.get("CITIZEN_CD")),
+                # Same cleaning as the folder filter, so b'MY' / 'MY\x00' reads as Malaysia for the AI too.
+                citizen_cd=normalise_code(row.get("CITIZEN_CD")),
                 indv_org_type=_optional_str(row.get("INDV_ORG_TYPE")),
                 last_maint_dt=_coerce_datetime(row.get("LAST_MAINT_DT")),
                 valid_from_dttm=valid_from,

@@ -8,12 +8,15 @@ the full monthly rows are read only when an account's turn comes.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import pandas as pd
 import pyarrow.parquet as pq
+
+from app.core.reference_data import normalise_code
 
 logger = logging.getLogger("app.account_folder")
 
@@ -45,6 +48,7 @@ class FolderScan:
         if choice == "all":
             return list(self.accounts)
         malaysian = choice == "malaysian"
+        malaysian_code = normalise_code(malaysian_code) or ""
         return [
             account for account in self.accounts
             if account.citizen_cd is not None and (account.citizen_cd == malaysian_code) == malaysian
@@ -56,6 +60,9 @@ class FolderScan:
             "total_files": len(self.accounts) + len(self.unreadable),
             "counts": {choice: len(self.matching(choice, malaysian_code)) for choice in CITIZENSHIP_CHOICES},
             "no_profile": sum(account.citizen_cd is None for account in self.accounts),
+            # The codes behind the counts, so a code that is not the Malaysian one is visible on the page.
+            "citizen_codes": dict(Counter(account.citizen_cd for account in self.accounts
+                                          if account.citizen_cd is not None).most_common(6)),
             "unreadable": [{"file": name, "reason": reason} for name, reason in self.unreadable],
         }
 
@@ -75,8 +82,9 @@ def scan_folder(folder: Path, customer_info_path: Path) -> FolderScan:
     citizenship = latest_citizenship(customer_info_path, {acct for _, acct in found})
     scan.accounts = [FolderAccount(path, acct, citizenship.get(acct)) for path, acct in found]
     logger.info(
-        "Account folder scanned: folder=%s files=%d unreadable=%d with_profile=%d",
+        "Account folder scanned: folder=%s files=%d unreadable=%d with_profile=%d citizen_codes=%s",
         folder, len(found) + len(scan.unreadable), len(scan.unreadable), len(citizenship),
+        dict(Counter(citizenship.values()).most_common(6)),
     )
     return scan
 
@@ -94,8 +102,9 @@ def _account_number(path: Path) -> str:
 
 
 def latest_citizenship(customer_info_path: Path, acct_nums: set[str]) -> dict[str, str]:
-    """CITIZEN_CD of each account's latest profile version (by VALID_FROM_DTTM); accounts with no
-    profile or no citizenship are left out. Reads three columns of customer_info, once."""
+    """CITIZEN_CD of each account's latest profile version (by VALID_FROM_DTTM), as plain upper-case
+    text (see normalise_code); accounts with no profile or no citizenship are left out. Reads three
+    columns of customer_info, once."""
     if not acct_nums:
         return {}
     try:
@@ -105,9 +114,10 @@ def latest_citizenship(customer_info_path: Path, acct_nums: set[str]) -> dict[st
     except Exception as exc:  # pyarrow raises its own error types
         raise AccountFolderError(f"Could not read customer_info parquet: {exc}") from exc
     table = table.assign(ACCT_NUM=table["ACCT_NUM"].map(_identifier))
-    table = table[table["ACCT_NUM"].isin(acct_nums)].dropna(subset=["CITIZEN_CD"])
+    table = table[table["ACCT_NUM"].isin(acct_nums)]
+    table = table.assign(CITIZEN_CD=table["CITIZEN_CD"].map(normalise_code)).dropna(subset=["CITIZEN_CD"])
     latest = table.sort_values("VALID_FROM_DTTM").groupby("ACCT_NUM").tail(1)
-    return {acct: str(code).strip() for acct, code in zip(latest["ACCT_NUM"], latest["CITIZEN_CD"]) if str(code).strip()}
+    return dict(zip(latest["ACCT_NUM"], latest["CITIZEN_CD"]))
 
 
 def _identifier(value: object) -> str:

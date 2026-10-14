@@ -16,6 +16,7 @@ const folderEls = {
   total: document.querySelector("#folder-total"),
   count: document.querySelector("#account-count"),
   countHint: document.querySelector("#count-hint"),
+  citizenCodes: document.querySelector("#citizen-codes"),
   unreadable: document.querySelector("#folder-unreadable"),
   error: document.querySelector("#folder-error"),
   submit: document.querySelector("#folder-submit"),
@@ -57,6 +58,11 @@ async function loadFolder() {
     for (const [choice, count] of Object.entries(body.counts)) {
       document.querySelector(`#count-${choice}`).textContent = `(${count})`;
     }
+    const codes = Object.entries(body.citizen_codes || {});
+    folderEls.citizenCodes.textContent = (codes.length
+      ? `Codes found: ${codes.map(([code, count]) => `${code} ${count}`).join(" · ")}. Malaysian = ${body.malaysian_code}.`
+      : "No citizenship code was found for these accounts in customer_info.")
+      + (body.no_profile ? ` ${body.no_profile} account(s) have no customer profile.` : "");
     if (body.unreadable.length) {
       folderEls.unreadable.textContent = `${body.unreadable.length} file(s) could not be read and are left out: `
         + body.unreadable.slice(0, 5).map((item) => `${item.file} (${item.reason})`).join("; ")

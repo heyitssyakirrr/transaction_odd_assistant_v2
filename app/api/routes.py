@@ -178,7 +178,8 @@ def build_router(
     @router.get("/folder")
     async def folder_summary() -> dict:
         """What the folder holds: files, and how many accounts match each citizenship choice."""
-        return {**(await scan()).summary(settings.malaysian_citizen_cd), "review_months": settings.review_months}
+        return {**(await scan()).summary(settings.malaysian_citizen_cd), "review_months": settings.review_months,
+                "malaysian_code": settings.malaysian_citizen_cd}
 
     @router.post("/folder-batches", status_code=202)
     async def create_folder_batch(request: FolderBatchRequest) -> dict:

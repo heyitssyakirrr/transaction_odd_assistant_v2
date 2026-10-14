@@ -78,6 +78,23 @@ def resolve_occupation(code: str | None, csv_path: Path | str) -> str | None:
     return _load_occupation_map(str(csv_path)).get(code, f"Unmapped occupation code ({code})")
 
 
+def normalise_code(value: object) -> str | None:
+    """A reference code as plain upper-case text, however the warehouse stored it: bytes (b'MY'),
+    fixed-width padding with NUL characters or spaces ('MY\x00', 'MY '), or lower case ('my').
+    Logged 2026-10-14: production customer_info held 'MY' accounts that compared unequal to "MY"."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", errors="replace")
+    try:
+        if value != value:  # NaN
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).replace("\x00", "").strip().upper()
+    return text or None
+
+
 def resolve_citizenship(code: str | None) -> str | None:
     if code is None:
         return None
