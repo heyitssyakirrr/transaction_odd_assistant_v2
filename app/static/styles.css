@@ -535,6 +535,9 @@ button:disabled { cursor: wait; opacity: .65; }
 
 .section-hint { margin: -6px 0 14px; font-size: 13px; color: var(--muted); }
 
+/* Shown first in a report, under the batch progress line: a divider below instead of above. */
+.section.timing-section { margin: 0 0 28px; padding: 0 0 24px; border-top: 0; border-bottom: 1px solid var(--line); }
+
 .timing-totals { display: flex; flex-wrap: wrap; gap: 12px 32px; margin-bottom: 12px; }
 .timing-totals div { display: flex; flex-direction: column; gap: 2px; }
 .timing-totals span {

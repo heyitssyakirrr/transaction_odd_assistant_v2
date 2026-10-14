@@ -40,6 +40,13 @@
     </div>
 
     <div id="result" class="hidden">
+      <section id="timing-section" class="section timing-section hidden">
+        <h3>Processing time</h3>
+        <p class="section-hint">LLM time runs from when the app sent the call to the LLM until the answer arrived, including a format retry. Time waiting in the app's own queue is shown separately and is not counted. A wait inside the LLM server cannot be seen on its own and is part of LLM time: a call with a much lower speed than the others most likely waited there.</p>
+        <div id="timing-totals" class="timing-totals"></div>
+        <div id="timing-table"></div>
+      </section>
+
       <div class="results-meta">
         <div>
           <p class="eyebrow">Case</p>
@@ -98,13 +105,6 @@
       <section id="customer-profile-section" class="section hidden">
         <h3 id="customer-profile-title">Customer profile vs activity</h3>
         <div id="customer-profile-context"></div>
-      </section>
-
-      <section id="timing-section" class="section hidden">
-        <h3>Processing time</h3>
-        <p class="section-hint">LLM time runs from when the app sent the call to the LLM until the answer arrived, including a format retry. Time waiting in the app's own queue is shown separately and is not counted. A wait inside the LLM server cannot be seen on its own and is part of LLM time: a call with a much lower speed than the others most likely waited there.</p>
-        <div id="timing-totals" class="timing-totals"></div>
-        <div id="timing-table"></div>
       </section>
 
       <section class="section">
