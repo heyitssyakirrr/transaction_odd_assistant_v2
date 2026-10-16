@@ -9,6 +9,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent # change based on where u put 
 _DEFAULT_LLM_STOP_SEQUENCES = ("<|im_end|>", "<|endoftext|>", "assistant:", "system:", "user:")
 
 
+def _optional_float(name: str, default: str) -> float | None:
+    """A number from .env; blank means "do not send this parameter"."""
+    value = os.getenv(name, default).strip()
+    return float(value) if value else None
+
+
+def _stop_sequences(raw: str) -> tuple[str, ...]:
+    """Comma-separated stop sequences; blank uses the Qwen defaults, "none" sends none."""
+    if raw.strip().lower() == "none":
+        return ()
+    return tuple(value.strip() for value in raw.split(",") if value.strip()) or _DEFAULT_LLM_STOP_SEQUENCES
+
+
 def _load_dotenv(path: Path) -> None:
     """Small dependency-free dotenv loader; existing environment wins."""
     env_path = Path(path)
@@ -120,10 +133,22 @@ class Settings:
     llm_flow_max_response_tokens: int = int(os.getenv("LLM_FLOW_MAX_RESPONSE_TOKENS", "260"))
     llm_profile_max_response_tokens: int = int(os.getenv("LLM_PROFILE_MAX_RESPONSE_TOKENS", "220"))
     llm_synthesis_max_response_tokens: int = int(os.getenv("LLM_SYNTHESIS_MAX_RESPONSE_TOKENS", "260"))
-    # Qwen's low-variance sampling defaults. Set only parameters accepted by
-    # the bank's OpenAI-compatible loader.
-    llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0"))
-    llm_top_p: float = float(os.getenv("LLM_TOP_P", "0.001"))
+    # Name of the output-limit field in the request body. The Foundry gateway takes
+    # max_tokens (per the platform team); set max_completion_tokens if it ever asks for that.
+    llm_max_tokens_param: str = os.getenv("LLM_MAX_TOKENS_PARAM", "max_tokens").strip()
+    # Highest output limit any call may request; 0 = no cap. 700 protects Qwen from long
+    # runaway answers. Foundry (gpt-6-luna) needs room for its hidden reasoning: set 0 or 16000.
+    llm_output_token_cap: int = int(os.getenv("LLM_OUTPUT_TOKEN_CAP", "700"))
+    # Reasoning models (gpt-6-luna) think before answering, and those hidden tokens count
+    # against the output limit. This many tokens are added to every call's own limit
+    # (LLM_TRANSACTION_MAX_RESPONSE_TOKENS etc.) so the answer is not cut off. 0 for Qwen.
+    llm_reasoning_extra_tokens: int = int(os.getenv("LLM_REASONING_EXTRA_TOKENS", "0"))
+    # Sent as reasoning_effort (low / medium / high) when set; blank = the model's default.
+    llm_reasoning_effort: str = os.getenv("LLM_REASONING_EFFORT", "").strip().lower()
+    # Qwen's low-variance sampling defaults. Leave blank in .env to not send the
+    # parameter at all: Foundry reasoning models reject temperature and top_p with a 400.
+    llm_temperature: float | None = _optional_float("LLM_TEMPERATURE", "0")
+    llm_top_p: float | None = _optional_float("LLM_TOP_P", "0.001")
     # This is a vLLM/Qwen extension rather than a portable OpenAI parameter.
     # Leave disabled unless the bank loader is confirmed to accept it.
     llm_repetition_penalty: float = float(os.getenv("LLM_REPETITION_PENALTY", "0"))
@@ -138,13 +163,13 @@ class Settings:
     llm_format_retry_enabled: bool = os.getenv("LLM_FORMAT_RETRY_ENABLED", "true").lower() == "true"
     # Use commas, not pipes: Qwen's native special tokens themselves contain
     # pipes. Literal assistant: prevents the loader from starting a duplicate
-    # assistant turn after a complete object.
-    llm_stop_sequences: tuple[str, ...] = tuple(
-        value.strip() for value in os.getenv("LLM_STOP_SEQUENCES", "").split(",") if value.strip()
-    ) or _DEFAULT_LLM_STOP_SEQUENCES
+    # assistant turn after a complete object. "none" sends no stop sequences
+    # (Foundry reasoning models reject "stop").
+    llm_stop_sequences: tuple[str, ...] = _stop_sequences(os.getenv("LLM_STOP_SEQUENCES", ""))
     # Every answer is one flat JSON object, so its first } is its end. Stopping there
     # stops Qwen from repeating the object or explaining it until the token limit, which
     # saves time. The loader drops the stop text, so the client adds the } back.
+    # Foundry: false (it is sent as a stop sequence, which reasoning models reject).
     llm_stop_after_json_object: bool = os.getenv("LLM_STOP_AFTER_JSON_OBJECT", "true").lower() == "true"
     report_directory: str = os.getenv("REPORT_DIRECTORY", str(BASE_DIR / "data" / "reports"))
     # Application logs are persisted separately from generated staff reports.
@@ -188,10 +213,18 @@ class Settings:
             raise ValueError("LLM_CONTEXT_WINDOW_TOKENS must be zero or greater")
         if self.llm_context_safety_margin_tokens < 0:
             raise ValueError("LLM_CONTEXT_SAFETY_MARGIN_TOKENS must be zero or greater")
-        if not 0 <= self.llm_temperature <= 2:
-            raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
-        if not 0 < self.llm_top_p <= 1:
-            raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1")
+        if self.llm_temperature is not None and not 0 <= self.llm_temperature <= 2:
+            raise ValueError("LLM_TEMPERATURE must be between 0 and 2, or blank to not send it")
+        if self.llm_top_p is not None and not 0 < self.llm_top_p <= 1:
+            raise ValueError("LLM_TOP_P must be greater than 0 and no greater than 1, or blank to not send it")
+        if self.llm_max_tokens_param not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("LLM_MAX_TOKENS_PARAM must be max_tokens or max_completion_tokens")
+        if self.llm_output_token_cap < 0:
+            raise ValueError("LLM_OUTPUT_TOKEN_CAP must be zero (no cap) or greater")
+        if self.llm_reasoning_extra_tokens < 0:
+            raise ValueError("LLM_REASONING_EXTRA_TOKENS must be zero or greater")
+        if self.llm_reasoning_effort not in {"", "minimal", "low", "medium", "high"}:
+            raise ValueError("LLM_REASONING_EFFORT must be minimal, low, medium, high or blank")
         if self.folder_expected_risk not in {"", "low", "medium", "high"}:
             raise ValueError("FOLDER_EXPECTED_RISK must be low, medium, high or blank")
         if not 1 <= self.review_months <= 24:

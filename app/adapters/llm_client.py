@@ -22,7 +22,6 @@ logger = logging.getLogger("app.llm_client")
 _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 1
 _BACKOFF_BASE_SECONDS = 0.75
-_QWEN_ASSESSMENT_TOKEN_CAP = 700
 
 
 class LlmServiceError(RuntimeError):
@@ -105,9 +104,14 @@ class OpenAICompatibleClient:
         payload = await self._post_with_retries(body, headers)
 
         choice = (payload.get("choices") or [{}])[0]
-        completion_tokens = (payload.get("usage") or {}).get("completion_tokens")
+        usage = payload.get("usage") or {}
+        completion_tokens = usage.get("completion_tokens")
+        # Reasoning models report their hidden thinking inside completion_tokens.
+        reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
         logger.info(
-            "LLM completion: finish_reason=%s completion_tokens=%s", choice.get("finish_reason"), completion_tokens,
+            "LLM completion: finish_reason=%s prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s",
+            choice.get("finish_reason"), usage.get("prompt_tokens"), completion_tokens,
+            reasoning_tokens if reasoning_tokens is not None else "-",
         )
         if measure is not None and isinstance(completion_tokens, int):
             measure.add_tokens(completion_tokens)
@@ -121,8 +125,11 @@ class OpenAICompatibleClient:
         merged = _merged_objects_at_start(content) if isinstance(content, str) else None
         if choice.get("finish_reason") == "length":
             if merged is None:
+                hint = (" The model used the whole limit thinking (reasoning_tokens="
+                        f"{reasoning_tokens}); raise LLM_REASONING_EXTRA_TOKENS." if reasoning_tokens else "")
                 raise LlmOutputTruncatedError(
                     "LLM output reached MAX_RESPONSE_TOKENS and was rejected; it was not used as an assessment."
+                    + hint
                 )
             logger.warning("LLM output hit the token limit after a complete JSON object; extra text ignored.")
         if merged is not None:
@@ -160,24 +167,25 @@ class OpenAICompatibleClient:
         max_response_tokens: int | None = None,
         stop_after_object: bool = False,
     ) -> dict[str, Any]:
-        requested_tokens = max_response_tokens or self._settings.max_response_tokens
-        output_tokens = min(requested_tokens, _QWEN_ASSESSMENT_TOKEN_CAP)
-        if requested_tokens > _QWEN_ASSESSMENT_TOKEN_CAP:
-            logger.warning(
-                "LLM response-token request clamped for Qwen assessment: requested=%d cap=%d",
-                requested_tokens, _QWEN_ASSESSMENT_TOKEN_CAP,
-            )
+        output_tokens = self._output_tokens(max_response_tokens)
+        # Only the system and user roles are used: the Foundry gateway takes instructions
+        # in "system" (not "developer").
         body: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, ensure_ascii=False, default=str)},
             ],
-            "temperature": self._settings.llm_temperature,
-            "top_p": self._settings.llm_top_p,
-            "max_tokens": output_tokens,
+            self._settings.llm_max_tokens_param: output_tokens,
             "stream": False,
         }
+        # A blank setting means the model does not accept the parameter: leave it out.
+        if self._settings.llm_temperature is not None:
+            body["temperature"] = self._settings.llm_temperature
+        if self._settings.llm_top_p is not None:
+            body["top_p"] = self._settings.llm_top_p
+        if self._settings.llm_reasoning_effort:
+            body["reasoning_effort"] = self._settings.llm_reasoning_effort
         if self._settings.llm_repetition_penalty:
             body["repetition_penalty"] = self._settings.llm_repetition_penalty
         stop = list(self._settings.llm_stop_sequences)
@@ -201,6 +209,15 @@ class OpenAICompatibleClient:
             elif protocol == "json_object":
                 body["response_format"] = {"type": "json_object"}
         return body
+
+    def _output_tokens(self, max_response_tokens: int | None) -> int:
+        """The call's own answer limit, plus room for hidden reasoning, within the cap."""
+        requested = (max_response_tokens or self._settings.max_response_tokens) + self._settings.llm_reasoning_extra_tokens
+        cap = self._settings.llm_output_token_cap
+        if cap and requested > cap:
+            logger.warning("LLM output-token request clamped: requested=%d cap=%d (LLM_OUTPUT_TOKEN_CAP)", requested, cap)
+            return cap
+        return requested
 
     async def _post_with_retries(self, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         last_error: Exception | None = None
@@ -282,11 +299,12 @@ class OpenAICompatibleClient:
         serialized = json.dumps(body["messages"], ensure_ascii=False, separators=(",", ":"))
         request_bytes = len(serialized.encode("utf-8"))
         estimated_tokens = _estimate_tokens(serialized)
+        output_tokens = body[self._settings.llm_max_tokens_param]
         budget = None
         if self._settings.llm_context_window_tokens:
             budget = (
                 self._settings.llm_context_window_tokens
-                - body["max_tokens"]
+                - output_tokens
                 - self._settings.llm_context_safety_margin_tokens
             )
         logger.info(
@@ -295,7 +313,7 @@ class OpenAICompatibleClient:
             estimated_tokens,
             self._settings.llm_structured_output_protocol,
             budget if budget is not None else "unconfigured",
-            body["max_tokens"],
+            output_tokens,
         )
         if budget is not None and estimated_tokens > budget:
             logger.error(

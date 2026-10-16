@@ -45,6 +45,16 @@ else:
         settings.batch_account_concurrency,
         "set" if settings.helper_id else "not set",
     )
+    # What each request carries, so a 400 for an unsupported parameter is easy to trace.
+    logger.info(
+        "LLM request parameters: %s (cap=%s, +%d reasoning), temperature=%s, top_p=%s, stop=%s, "
+        "reasoning_effort=%s, structured_output=%s",
+        settings.llm_max_tokens_param, settings.llm_output_token_cap or "none", settings.llm_reasoning_extra_tokens,
+        "not sent" if settings.llm_temperature is None else settings.llm_temperature,
+        "not sent" if settings.llm_top_p is None else settings.llm_top_p,
+        "sent" if settings.llm_stop_sequences or settings.llm_stop_after_json_object else "not sent",
+        settings.llm_reasoning_effort or "not sent", settings.llm_structured_output_protocol,
+    )
 if settings.llm_concurrency < settings.llm_calls_needed:
     logger.warning(
         "LLM_CONCURRENCY=%d is below BATCH_ACCOUNT_CONCURRENCY x 3 = %d: accounts will wait in the app "
